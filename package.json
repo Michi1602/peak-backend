@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "main": "stripe-server.js",
   "scripts": {
-    "start": "node stripe-server.js"
+    "start": "node stripe-server.js",
+    "build": "npm install"
+  },
+  "engines": {
+    "node": "22.x"
   },
   "dependencies": {
     "express": "^4.18.2",
