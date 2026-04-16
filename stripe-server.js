@@ -46,8 +46,8 @@ app.post('/create-checkout', async (req, res) => {
           plan: plan,
         }
       },
-      success_url: `${FRONTEND_URL}/success.html?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${FRONTEND_URL}?cancelled=true`,
+      success_url: `https://lambent-palmier-f397c7.netlify.app?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `https://lambent-palmier-f397c7.netlify.app?cancelled=true`,
       metadata: {
         userName: userData?.name || '',
         userGoal: userData?.goal || '',
