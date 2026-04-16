@@ -12,7 +12,7 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://lambent-palmier-f397c7.netlify.app';
 
 // ── CORS ──────────────────────────────────────────────────────────────
-app.use(cors({ origin: FRONTEND_URL }));
+app.use(cors());
 
 // Raw body for Stripe webhooks — must come before express.json()
 app.use('/webhook', express.raw({ type: 'application/json' }));
