@@ -1,0 +1,15 @@
+{
+  "name": "peak-backend",
+  "version": "1.0.0",
+  "main": "stripe-server.js",
+  "scripts": {
+    "start": "node stripe-server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "stripe": "^14.0.0",
+    "@supabase/supabase-js": "^2.43.0",
+    "resend": "^3.2.0",
+    "cors": "^2.8.5"
+  }
+}
