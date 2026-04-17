@@ -189,7 +189,7 @@ async function sendEmail(to, type, data) {
 
   try {
     await resend.emails.send({
-      from: 'PEAK <hello@peak.app>',
+      from: 'PEAK <hello@mj-performance.net>',
       to,
       subject: email.subject,
       html: email.html,
