@@ -1,0 +1,24 @@
+{
+  "name": "PEAK — Your AI Life Coach",
+  "short_name": "PEAK",
+  "description": "Your personal AI coach for nutrition, fitness and recovery",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F9F9F7",
+  "theme_color": "#2D6A4F",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
