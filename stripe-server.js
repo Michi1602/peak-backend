@@ -9,7 +9,7 @@ const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://lambent-palmier-f397c7.netlify.app';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://peak-frontend.vercel.app';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://peak-backend-u52q.onrender.com';
 const FROM_EMAIL = 'PEAK <hello@mj-performance.net>';
 
@@ -135,7 +135,26 @@ app.get('/imprint', (req, res) => {
 app.post('/create-checkout', async (req, res) => {
   try {
     const { email, plan, userData } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
     const priceId = plan === 'annual' ? process.env.STRIPE_PRICE_ANNUAL : process.env.STRIPE_PRICE_MONTHLY;
+    if (!priceId) {
+      console.error('❌ Missing STRIPE_PRICE_* env var for plan:', plan);
+      return res.status(500).json({ error: 'Server misconfiguration: price not set' });
+    }
+
+    // Consolidated metadata — attached to BOTH session and subscription
+    // so the webhook can read it regardless of which event fires.
+    const sharedMetadata = {
+      userName: userData?.name || '',
+      userGoal: userData?.goal || '',
+      userSport: userData?.sport || '',
+      plan: plan || 'monthly',
+    };
+
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       payment_method_types: ['card'],
@@ -143,15 +162,17 @@ app.post('/create-checkout', async (req, res) => {
       line_items: [{ price: priceId, quantity: 1 }],
       subscription_data: {
         trial_period_days: 7,
-        metadata: { userName: userData?.name || '', userGoal: userData?.goal || '', userSport: userData?.sport || '', plan }
+        metadata: sharedMetadata,
       },
       success_url: `${FRONTEND_URL}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${FRONTEND_URL}?cancelled=true`,
-      metadata: { userName: userData?.name || '', userGoal: userData?.goal || '', userSport: userData?.sport || '', plan, password: userData?.password || '' }
+      metadata: sharedMetadata,
     });
+
+    console.log(`✅ Checkout session created for ${email} (plan: ${plan})`);
     res.json({ url: session.url, sessionId: session.id });
   } catch (err) {
-    console.error('Checkout error:', err.message);
+    console.error('❌ Checkout error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -163,36 +184,109 @@ app.post('/webhook', async (req, res) => {
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
+    console.error('❌ Webhook signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const email = session.customer_email;
-    const name = session.metadata?.userName || '';
-    const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    await supabase.from('users').upsert({
-      email, name,
-      stripe_customer_id: session.customer,
-      stripe_subscription_id: session.subscription,
-      plan: session.metadata?.plan || 'monthly',
-      goal: session.metadata?.userGoal || '',
-      sport: session.metadata?.userSport || '',
-      trial_end: trialEnd.toISOString(),
-      status: 'trial',
-      unsubscribed: false,
-      created_at: new Date().toISOString(),
-    });
-    await sendEmail(email, 'welcome', { name });
-  } else if (event.type === 'customer.subscription.deleted') {
-    const customer = await stripe.customers.retrieve(event.data.object.customer);
-    await supabase.from('users').update({ status: 'cancelled' }).eq('email', customer.email);
-  } else if (event.type === 'invoice.payment_succeeded') {
-    if (event.data.object.billing_reason === 'subscription_cycle') {
-      const customer = await stripe.customers.retrieve(event.data.object.customer);
-      await supabase.from('users').update({ status: 'active' }).eq('email', customer.email);
+  console.log(`🔔 Webhook received: ${event.type}`);
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+
+      // Email can live in different places depending on Stripe's flow.
+      // Try in order: customer_email → customer_details.email → fetch customer object.
+      let email = session.customer_email || session.customer_details?.email || null;
+      if (!email && session.customer) {
+        try {
+          const customer = await stripe.customers.retrieve(session.customer);
+          email = customer.email;
+        } catch (err) {
+          console.error('❌ Could not fetch customer from Stripe:', err.message);
+        }
+      }
+
+      if (!email) {
+        console.error('❌ No email found for checkout session', session.id);
+        return res.status(200).json({ received: true, warning: 'no email' });
+      }
+
+      const meta = session.metadata || {};
+      const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+      const userRow = {
+        email,
+        name: meta.userName || '',
+        stripe_customer_id: session.customer || null,
+        stripe_subscription_id: session.subscription || null,
+        plan: meta.plan || 'monthly',
+        goal: meta.userGoal || '',
+        sport: meta.userSport || '',
+        trial_start: new Date().toISOString(),
+        trial_end: trialEnd.toISOString(),
+        status: 'trial',
+        unsubscribed: false,
+        // NOTE: created_at intentionally omitted — Supabase default handles it,
+        // and we don't want to overwrite it if the user already exists.
+      };
+
+      const { data, error } = await supabase
+        .from('users')
+        .upsert(userRow, { onConflict: 'email' })
+        .select();
+
+      if (error) {
+        console.error('❌ Supabase upsert failed for', email, ':', error.message);
+        // Return 200 anyway — we don't want Stripe to retry indefinitely
+        // on DB issues. We log it and handle manually.
+        return res.status(200).json({ received: true, db_error: error.message });
+      }
+
+      console.log(`✅ User upserted: ${email} (rows: ${data?.length || 0})`);
+
+      try {
+        await sendEmail(email, 'welcome', { name: meta.userName || '' });
+      } catch (err) {
+        console.error('❌ Welcome email failed for', email, ':', err.message);
+      }
+    } else if (event.type === 'customer.subscription.deleted') {
+      const sub = event.data.object;
+      let email = null;
+      try {
+        const customer = await stripe.customers.retrieve(sub.customer);
+        email = customer.email;
+      } catch (err) {
+        console.error('❌ Could not fetch customer for cancellation:', err.message);
+      }
+      if (email) {
+        const { error } = await supabase.from('users').update({ status: 'cancelled' }).eq('email', email);
+        if (error) console.error('❌ Supabase update (cancelled) failed:', error.message);
+        else console.log(`✅ User cancelled: ${email}`);
+      }
+    } else if (event.type === 'invoice.payment_succeeded') {
+      const invoice = event.data.object;
+      if (invoice.billing_reason === 'subscription_cycle') {
+        let email = invoice.customer_email || null;
+        if (!email && invoice.customer) {
+          try {
+            const customer = await stripe.customers.retrieve(invoice.customer);
+            email = customer.email;
+          } catch (err) {
+            console.error('❌ Could not fetch customer for renewal:', err.message);
+          }
+        }
+        if (email) {
+          const { error } = await supabase.from('users').update({ status: 'active' }).eq('email', email);
+          if (error) console.error('❌ Supabase update (active) failed:', error.message);
+          else console.log(`✅ User renewed: ${email}`);
+        }
+      }
     }
+  } catch (err) {
+    console.error('❌ Webhook handler error:', err.message, err.stack);
+    // Still return 200 so Stripe doesn't retry
   }
+
   res.json({ received: true });
 });
 
