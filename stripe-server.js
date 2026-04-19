@@ -177,6 +177,49 @@ app.post('/create-checkout', async (req, res) => {
   }
 });
 
+// ── USER PROFILE (auth-protected) ─────────────────────────────────────
+// Frontend calls this after Supabase auth to load full profile data
+// (plan, goal, sport, trial_end, status, etc.).
+// Uses the user's access token to validate identity, then looks up the
+// profile row via service role (bypasses RLS, safe because we verified first).
+app.get('/user/profile', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    // Validate token by asking Supabase who this is
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    const user = userData.user;
+
+    // Load profile row by id (matches auth.users.id now)
+    const { data: profile, error: profileErr } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (profileErr) {
+      console.error('❌ Profile fetch failed for', user.email, ':', profileErr.message);
+      return res.status(500).json({ error: 'Failed to load profile' });
+    }
+
+    if (!profile) {
+      // Edge case: auth user exists but no public.users row (shouldn't happen
+      // in normal flow, but handle gracefully rather than crashing)
+      return res.status(404).json({ error: 'Profile not found', email: user.email });
+    }
+
+    res.json({ profile });
+  } catch (err) {
+    console.error('❌ /user/profile error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── WEBHOOK ───────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -214,7 +257,48 @@ app.post('/webhook', async (req, res) => {
       const meta = session.metadata || {};
       const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
+      // ── STEP 1: Create or find Auth user ────────────────────────────
+      // Service role bypasses the "Allow signups" toggle, so we can create
+      // auth users even with signups disabled for public registration.
+      let authUserId = null;
+      try {
+        // Try to create new auth user. If already exists, catch & look up by email.
+        const { data: created, error: createErr } = await supabase.auth.admin.createUser({
+          email,
+          email_confirm: true, // User confirmed via Stripe payment, no need to re-verify
+          user_metadata: {
+            name: meta.userName || '',
+            source: 'stripe_checkout',
+          },
+        });
+
+        if (createErr) {
+          // "User already registered" is fine — look up the existing one
+          if (createErr.message?.toLowerCase().includes('already')) {
+            const { data: existing, error: listErr } = await supabase.auth.admin.listUsers();
+            if (listErr) throw listErr;
+            const match = existing?.users?.find(u => u.email?.toLowerCase() === email.toLowerCase());
+            if (match) {
+              authUserId = match.id;
+              console.log(`ℹ️  Existing auth user found: ${email} (${authUserId})`);
+            } else {
+              throw new Error('Auth user reported as existing but not found in list');
+            }
+          } else {
+            throw createErr;
+          }
+        } else {
+          authUserId = created.user.id;
+          console.log(`✅ Auth user created: ${email} (${authUserId})`);
+        }
+      } catch (err) {
+        console.error('❌ Auth user creation failed for', email, ':', err.message);
+        return res.status(200).json({ received: true, auth_error: err.message });
+      }
+
+      // ── STEP 2: Upsert profile row in public.users, keyed by auth id ──
       const userRow = {
+        id: authUserId,
         email,
         name: meta.userName || '',
         stripe_customer_id: session.customer || null,
@@ -226,26 +310,46 @@ app.post('/webhook', async (req, res) => {
         trial_end: trialEnd.toISOString(),
         status: 'trial',
         unsubscribed: false,
-        // NOTE: created_at intentionally omitted — Supabase default handles it,
-        // and we don't want to overwrite it if the user already exists.
       };
 
       const { data, error } = await supabase
         .from('users')
-        .upsert(userRow, { onConflict: 'email' })
+        .upsert(userRow, { onConflict: 'id' })
         .select();
 
       if (error) {
         console.error('❌ Supabase upsert failed for', email, ':', error.message);
-        // Return 200 anyway — we don't want Stripe to retry indefinitely
-        // on DB issues. We log it and handle manually.
         return res.status(200).json({ received: true, db_error: error.message });
       }
 
-      console.log(`✅ User upserted: ${email} (rows: ${data?.length || 0})`);
+      console.log(`✅ User profile upserted: ${email} (rows: ${data?.length || 0})`);
+
+      // ── STEP 3: Generate a magic link + send branded welcome email ──
+      // We generate the magic link with Supabase admin and embed it in our
+      // own welcome email, so the user gets one email with everything.
+      let magicLink = null;
+      try {
+        const { data: linkData, error: linkErr } = await supabase.auth.admin.generateLink({
+          type: 'magiclink',
+          email,
+          options: {
+            redirectTo: `${FRONTEND_URL}/`,
+          },
+        });
+        if (linkErr) {
+          console.error('❌ Magic link generation failed:', linkErr.message);
+        } else {
+          magicLink = linkData?.properties?.action_link || null;
+        }
+      } catch (err) {
+        console.error('❌ Magic link exception:', err.message);
+      }
 
       try {
-        await sendEmail(email, 'welcome', { name: meta.userName || '' });
+        await sendEmail(email, 'welcome', {
+          name: meta.userName || '',
+          magicLink,
+        });
       } catch (err) {
         console.error('❌ Welcome email failed for', email, ':', err.message);
       }
@@ -449,7 +553,7 @@ async function sendEmail(to, type, data) {
         </td></tr>
 
         <tr><td align="center" style="padding:0 40px 56px;">
-          ${emailButton(FRONTEND_URL, 'Open my plan')}
+          ${emailButton(data?.magicLink || FRONTEND_URL, 'Open my plan')}
         </td></tr>
 
         <tr><td>${emailFooter(to)}</td></tr>
