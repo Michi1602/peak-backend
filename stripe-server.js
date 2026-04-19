@@ -306,8 +306,21 @@ function emailFooter(email) {
 }
 
 async function sendEmail(to, type, data) {
-  const { data: user } = await supabase.from('users').select('unsubscribed').eq('email', to).single().catch(() => ({ data: null }));
-  if (user?.unsubscribed) return;
+  // Check if user has unsubscribed. Wrap in try/catch because .single()
+  // throws if 0 rows match, which is fine right after signup (race condition).
+  let unsubscribed = false;
+  try {
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('unsubscribed')
+      .eq('email', to)
+      .maybeSingle();
+    if (error) console.error('Unsubscribe-check error:', error.message);
+    unsubscribed = user?.unsubscribed === true;
+  } catch (err) {
+    console.error('Unsubscribe-check exception:', err.message);
+  }
+  if (unsubscribed) return;
 
   const logo = `<div style="text-align:center;margin-bottom:28px"><span style="font-family:Georgia,serif;font-size:32px;font-weight:700;color:#1C1C1A">PEAK<span style="color:#2D6A4F">.</span></span></div>`;
 
