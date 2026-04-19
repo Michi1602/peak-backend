@@ -291,18 +291,98 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ── EMAIL ─────────────────────────────────────────────────────────────
+// Design tokens — kept close to app brand (Barlow Condensed + Signal Red)
+// Using table layout + inline styles for Outlook/Gmail compatibility.
+const BRAND = {
+  ink: '#0E0E0E',      // near-black, matches app --bg
+  ink2: '#333333',     // body text
+  dim: '#666666',      // secondary text
+  faint: '#999999',    // footer/meta
+  border: '#E5E5E5',   // subtle divider
+  red: '#E8001A',      // Signal Red — matches app --red
+  rdk: '#A50013',      // darker red for hover/emphasis
+  white: '#FFFFFF',
+  light: '#F7F7F7',    // soft background for panels
+};
+
+// Fonts — Barlow from Google Fonts falls back gracefully in Outlook
+const FONT_BODY = `'Barlow', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif`;
+const FONT_HEAD = `'Barlow Condensed', 'Barlow', -apple-system, 'Segoe UI', Arial, sans-serif`;
+
+function emailHeader() {
+  // Black header bar with PEAK logo — red underline like in the app
+  return `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
+    <tr>
+      <td align="center" style="padding:32px 20px 28px;">
+        <div style="display:inline-block;text-align:center;">
+          <div style="font-family:${FONT_HEAD};font-weight:900;font-size:32px;letter-spacing:7px;color:${BRAND.white};line-height:1;">PEAK</div>
+          <div style="width:60px;height:2px;background:${BRAND.red};margin:6px auto 4px;"></div>
+          <div style="font-family:${FONT_BODY};font-size:9px;font-weight:700;letter-spacing:3px;color:#888;text-transform:uppercase;">by MJ Performance</div>
+        </div>
+      </td>
+    </tr>
+  </table>`;
+}
+
+function emailButton(href, label) {
+  // Bulletproof button — works in Outlook via VML fallback concept (simplified)
+  return `
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto;">
+    <tr>
+      <td align="center" bgcolor="${BRAND.red}" style="background:${BRAND.red};">
+        <a href="${href}" target="_blank" style="display:inline-block;font-family:${FONT_HEAD};font-size:13px;font-weight:900;letter-spacing:3px;text-transform:uppercase;color:${BRAND.white};text-decoration:none;padding:16px 36px;background:${BRAND.red};">${label}</a>
+      </td>
+    </tr>
+  </table>`;
+}
+
 function emailFooter(email) {
   const unsub = `${BACKEND_URL}/unsubscribe?email=${encodeURIComponent(email)}`;
-  return `<div style="margin-top:40px;padding-top:20px;border-top:1px solid #E8E8E3;font-size:12px;color:#999;line-height:1.8">
-    <p>Du erhältst diese E-Mail, weil du dich bei PEAK registriert hast. · You're receiving this because you signed up for PEAK.</p>
-    <p>
-      <a href="${BACKEND_URL}/impressum" style="color:#999">Impressum</a> &nbsp;·&nbsp;
-      <a href="${BACKEND_URL}/datenschutz" style="color:#999">Datenschutz</a> &nbsp;·&nbsp;
-      <a href="${BACKEND_URL}/privacy" style="color:#999">Privacy Policy</a> &nbsp;·&nbsp;
-      <a href="${unsub}" style="color:#999">Abmelden / Unsubscribe</a>
-    </p>
-    <p>${COMPANY.name} · ${COMPANY.address}</p>
-  </div>`;
+  return `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
+    <tr>
+      <td style="padding:28px 30px 32px;font-family:${FONT_BODY};font-size:11px;line-height:1.7;color:#888;text-align:center;">
+        <p style="margin:0 0 10px;">Du erhältst diese E-Mail, weil du dich bei PEAK registriert hast.<br>You're receiving this because you signed up for PEAK.</p>
+        <p style="margin:0 0 14px;">
+          <a href="${BACKEND_URL}/impressum" style="color:#AAA;text-decoration:none;">Impressum</a>
+          <span style="color:#555;"> · </span>
+          <a href="${BACKEND_URL}/datenschutz" style="color:#AAA;text-decoration:none;">Datenschutz</a>
+          <span style="color:#555;"> · </span>
+          <a href="${BACKEND_URL}/privacy" style="color:#AAA;text-decoration:none;">Privacy</a>
+          <span style="color:#555;"> · </span>
+          <a href="${unsub}" style="color:#AAA;text-decoration:none;">Unsubscribe</a>
+        </p>
+        <p style="margin:0;color:#666;font-size:10px;letter-spacing:0.5px;">${COMPANY.name} · ${COMPANY.address}</p>
+      </td>
+    </tr>
+  </table>`;
+}
+
+// Shared wrapper — produces a full valid HTML email document
+function emailShell(innerHTML) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light only">
+<meta name="supported-color-schemes" content="light only">
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;700&family=Barlow+Condensed:wght@700;900&display=swap" rel="stylesheet">
+<title>PEAK</title>
+</head>
+<body style="margin:0;padding:0;background:${BRAND.light};font-family:${FONT_BODY};">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};">
+    <tr>
+      <td align="center" style="padding:0;">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;background:${BRAND.white};">
+          ${innerHTML}
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
 }
 
 async function sendEmail(to, type, data) {
@@ -322,53 +402,114 @@ async function sendEmail(to, type, data) {
   }
   if (unsubscribed) return;
 
-  const logo = `<div style="text-align:center;margin-bottom:28px"><span style="font-family:Georgia,serif;font-size:32px;font-weight:700;color:#1C1C1A">PEAK<span style="color:#2D6A4F">.</span></span></div>`;
+  const name = data?.name || '';
+  const greeting = name ? name : 'athlete';
 
   const templates = {
     welcome: {
-      subject: '🌱 Welcome to PEAK — Your plan is ready',
-      html: `<div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:40px 20px">${logo}
-        <h1 style="font-size:26px;color:#1C1C1A">Welcome to PEAK${data.name ? ', ' + data.name : ''}! 🎉</h1>
-        <p style="color:#6B6B68;line-height:1.7">Your personalised plan is live. This is the start of something real.</p>
-        <div style="background:#EAF4EE;border-radius:12px;padding:20px;margin:24px 0">
-          <p style="margin:0 0 8px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:#2D6A4F">What's waiting for you</p>
-          <ul style="color:#1C1C1A;line-height:2;margin:0;padding-left:20px">
-            <li>AI meal plan matched to your goal and taste</li>
-            <li>Personalised workout programme for your sport</li>
-            <li>Recovery protocol — sleep, hydration, stress tools</li>
-            <li>Barcode scanner + live shopping mode</li>
-          </ul>
-        </div>
-        <p style="color:#6B6B68;line-height:1.7"><strong style="color:#1C1C1A">Your free trial runs 7 days.</strong> No charge until Day 8. We remind you on Day 5 and Day 6.</p>
-        <div style="text-align:center;margin:28px 0">
-          <a href="${FRONTEND_URL}" style="display:inline-block;background:#2D6A4F;color:#fff;font-size:15px;font-weight:700;padding:14px 28px;border-radius:12px;text-decoration:none">Open my plan →</a>
-        </div>
-        ${emailFooter(to)}</div>`
+      subject: 'Welcome to PEAK — your plan is ready',
+      html: emailShell(`
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">Welcome${name ? ', ' + name : ''}</p>
+          <h1 style="margin:0 0 20px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            Your plan is<br>live.
+          </h1>
+          <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            System over motivation. This is where it starts — your AI-built nutrition, training and recovery protocol, tuned to your goal.
+          </p>
+        </td></tr>
+
+        <tr><td style="padding:0 40px 8px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:1px solid ${BRAND.border};">
+            <tr><td style="padding:24px 0 8px;">
+              <p style="margin:0 0 16px;font-family:${FONT_HEAD};font-size:11px;font-weight:900;letter-spacing:3px;color:${BRAND.ink};text-transform:uppercase;">Inside PEAK</p>
+            </td></tr>
+            <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;AI nutrition plan, matched to your goal and taste
+            </td></tr>
+            <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;Personalised programme for your sport
+            </td></tr>
+            <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;Recovery protocol — sleep, hydration, stress
+            </td></tr>
+            <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:24px;">
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;Barcode scanner and shopping mode
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td style="padding:8px 40px 36px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};">
+            <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
+              <strong style="color:${BRAND.ink};">7-day free trial.</strong> No charge until Day 8. We'll remind you on Day 5 and Day 6.
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td align="center" style="padding:0 40px 56px;">
+          ${emailButton(FRONTEND_URL, 'Open my plan')}
+        </td></tr>
+
+        <tr><td>${emailFooter(to)}</td></tr>
+      `)
     },
+
     day5: {
-      subject: '⏰ 2 days left on your free trial',
-      html: `<div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:40px 20px">${logo}
-        <h1 style="font-size:26px;color:#1C1C1A">${data.name ? data.name + ', your' : 'Your'} trial ends in 2 days</h1>
-        <p style="color:#6B6B68;line-height:1.7">Your 7-day free trial ends in <strong>2 days</strong>. Your meal plan, workouts and recovery protocol will pause unless you continue.</p>
-        <div style="text-align:center;margin:28px 0">
-          <a href="${FRONTEND_URL}" style="display:inline-block;background:#2D6A4F;color:#fff;font-size:15px;font-weight:700;padding:14px 28px;border-radius:12px;text-decoration:none">Continue my journey →</a>
-        </div>
-        <p style="color:#6B6B68;font-size:13px">To cancel: open PEAK → Settings → Subscription → Cancel. 10 seconds, no phone calls.</p>
-        ${emailFooter(to)}</div>`
+      subject: 'Two days left on your PEAK trial',
+      html: emailShell(`
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">48 hours left</p>
+          <h1 style="margin:0 0 20px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${name ? name + ',<br>' : ''}your trial<br>ends soon.
+          </h1>
+          <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            Two days remain on your free 7-day trial. Your nutrition plan, training programme and recovery protocol will pause unless you continue.
+          </p>
+        </td></tr>
+
+        <tr><td align="center" style="padding:0 40px 24px;">
+          ${emailButton(FRONTEND_URL, 'Continue my journey')}
+        </td></tr>
+
+        <tr><td style="padding:0 40px 48px;">
+          <p style="margin:0;font-family:${FONT_BODY};font-size:12px;line-height:1.6;color:${BRAND.faint};text-align:center;">
+            To cancel: open PEAK → Settings → Subscription → Cancel. 10 seconds, no phone calls.
+          </p>
+        </td></tr>
+
+        <tr><td>${emailFooter(to)}</td></tr>
+      `)
     },
+
     day6: {
-      subject: '🔔 Last day of your free trial — tomorrow you\'ll be charged',
-      html: `<div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:40px 20px">${logo}
-        <div style="background:#FEF0EC;border-radius:12px;padding:14px 18px;margin-bottom:20px">
-          <p style="margin:0;color:#C0392B;font-weight:600">⏰ Your free trial ends tomorrow</p>
-        </div>
-        <h1 style="font-size:26px;color:#1C1C1A">Your free trial ends tomorrow</h1>
-        <p style="color:#6B6B68;line-height:1.7">This is your 24-hour notice. Tomorrow your PEAK subscription begins.</p>
-        <p style="color:#6B6B68;line-height:1.7"><strong>To cancel:</strong> Open PEAK → Settings → Subscription → Cancel trial. Done in 10 seconds.</p>
-        <div style="text-align:center;margin:28px 0">
-          <a href="${FRONTEND_URL}" style="display:inline-block;background:#2D6A4F;color:#fff;font-size:15px;font-weight:700;padding:14px 28px;border-radius:12px;text-decoration:none">Keep my plan →</a>
-        </div>
-        ${emailFooter(to)}</div>`
+      subject: 'Final day — your PEAK trial ends tomorrow',
+      html: emailShell(`
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">Final 24 hours</p>
+          <h1 style="margin:0 0 20px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${name ? name + ',<br>' : ''}tomorrow<br>it begins.
+          </h1>
+          <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            Your free trial ends tomorrow. Your PEAK subscription begins automatically — no action needed to continue.
+          </p>
+
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};margin-bottom:32px;">
+            <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
+              <strong style="color:${BRAND.ink};">To cancel:</strong> Open PEAK → Settings → Subscription → Cancel trial. Done in 10 seconds.
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td align="center" style="padding:0 40px 56px;">
+          ${emailButton(FRONTEND_URL, 'Keep my plan')}
+        </td></tr>
+
+        <tr><td>${emailFooter(to)}</td></tr>
+      `)
     }
   };
 
