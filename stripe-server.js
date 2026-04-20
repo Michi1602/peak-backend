@@ -269,6 +269,7 @@ app.post('/ai/generate', async (req, res) => {
       return res.status(500).json({ error: 'AI service not configured' });
     }
 
+    const modelName = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
     const tokens = Math.min(Math.max(parseInt(max_tokens) || 800, 100), 2000);
 
     const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -279,7 +280,7 @@ app.post('/ai/generate', async (req, res) => {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-3-5-sonnet-20241022',
+        model: modelName,
         max_tokens: tokens,
         messages: [{ role: 'user', content: prompt }],
       }),
@@ -287,7 +288,7 @@ app.post('/ai/generate', async (req, res) => {
 
     if (!r.ok) {
       const errText = await r.text();
-      console.error(`❌ Anthropic API ${r.status} for ${userEmail}:`, errText.slice(0, 300));
+      console.error(`❌ Anthropic API ${r.status} (model=${modelName}) for ${userEmail}:`, errText.slice(0, 400));
       return res.status(502).json({ error: 'AI service error' });
     }
 
