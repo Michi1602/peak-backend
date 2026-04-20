@@ -132,6 +132,116 @@ app.get('/imprint', (req, res) => {
 });
 
 // ── CREATE CHECKOUT SESSION ───────────────────────────────────────────
+// ── CHECK IF EMAIL ALREADY HAS AN ACCOUNT ─────────────────────────────
+// Called from Step 7 before redirecting to Stripe Checkout.
+// Returns { exists: true/false, hasSubscription: true/false }
+app.post('/auth/check-email', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Check if a user profile exists for this email in our DB
+    const { data: profile, error: profileErr } = await supabase
+      .from('users')
+      .select('id, email, status, stripe_customer_id')
+      .eq('email', normalizedEmail)
+      .maybeSingle();
+
+    if (profileErr) {
+      console.error('❌ check-email DB error:', profileErr.message);
+      return res.status(500).json({ error: 'Lookup failed' });
+    }
+
+    const exists = !!profile;
+    const hasSubscription = !!(profile && profile.stripe_customer_id);
+
+    console.log(`ℹ️  check-email: ${normalizedEmail} → exists=${exists}, sub=${hasSubscription}`);
+    res.json({ exists, hasSubscription });
+  } catch (err) {
+    console.error('❌ check-email error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── SEND MAGIC LINK (for "login instead of new signup" flow) ──────────
+// Called when user realizes they already have an account and wants to log in.
+app.post('/auth/send-login-link', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const { data, error } = await supabase.auth.admin.generateLink({
+      type: 'magiclink',
+      email: email.toLowerCase().trim(),
+      options: { redirectTo: `${FRONTEND_URL}/` },
+    });
+
+    if (error) {
+      console.error('❌ generateLink failed:', error.message);
+      return res.status(500).json({ error: 'Could not generate link' });
+    }
+
+    // Send the magic link via email
+    const magicLink = data?.properties?.action_link;
+    if (!magicLink) {
+      return res.status(500).json({ error: 'No link generated' });
+    }
+
+    await resend.emails.send({
+      from: FROM_EMAIL,
+      to: email,
+      subject: 'Your PEAK login link',
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:500px;margin:40px auto;padding:30px;background:#fff;">
+          <h2 style="color:#0E0E0E;font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;">YOUR LOGIN LINK</h2>
+          <p style="color:#333;line-height:1.6;">Click the button below to sign in to PEAK.</p>
+          <p style="margin:24px 0;"><a href="${magicLink}" style="display:inline-block;background:#E8001A;color:#fff;padding:14px 28px;text-decoration:none;font-weight:700;letter-spacing:2px;text-transform:uppercase;">Sign in</a></p>
+          <p style="color:#888;font-size:12px;">This link expires in 1 hour. If you didn't request this, you can ignore this email.</p>
+        </div>
+      `,
+    });
+
+    console.log(`✅ Login link sent to ${email}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('❌ send-login-link error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── OPEN STRIPE CUSTOMER PORTAL ───────────────────────────────────────
+// Generates a one-time portal session URL for the given email.
+// User is redirected there to manage/cancel their subscription.
+app.post('/customer-portal', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const { data: profile, error: profileErr } = await supabase
+      .from('users')
+      .select('stripe_customer_id')
+      .eq('email', email.toLowerCase().trim())
+      .maybeSingle();
+
+    if (profileErr || !profile?.stripe_customer_id) {
+      return res.status(404).json({ error: 'No subscription found for this email' });
+    }
+
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: profile.stripe_customer_id,
+      return_url: FRONTEND_URL,
+    });
+
+    console.log(`✅ Portal session created for ${email}`);
+    res.json({ url: portalSession.url });
+  } catch (err) {
+    console.error('❌ customer-portal error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/create-checkout', async (req, res) => {
   try {
     const { email, plan, userData, consent } = req.body;
@@ -464,11 +574,9 @@ function emailFooter(email) {
       <td style="padding:28px 30px 32px;font-family:${FONT_BODY};font-size:11px;line-height:1.7;color:#888;text-align:center;">
         <p style="margin:0 0 10px;">Du erhältst diese E-Mail, weil du dich bei PEAK registriert hast.<br>You're receiving this because you signed up for PEAK.</p>
         <p style="margin:0 0 14px;">
-          <a href="${BACKEND_URL}/impressum" style="color:#AAA;text-decoration:none;">Impressum</a>
+          <a href="${FRONTEND_URL}/impressum" style="color:#AAA;text-decoration:none;">Impressum</a>
           <span style="color:#555;"> · </span>
-          <a href="${BACKEND_URL}/datenschutz" style="color:#AAA;text-decoration:none;">Datenschutz</a>
-          <span style="color:#555;"> · </span>
-          <a href="${BACKEND_URL}/privacy" style="color:#AAA;text-decoration:none;">Privacy</a>
+          <a href="${FRONTEND_URL}/datenschutz" style="color:#AAA;text-decoration:none;">Datenschutz</a>
           <span style="color:#555;"> · </span>
           <a href="${unsub}" style="color:#AAA;text-decoration:none;">Unsubscribe</a>
         </p>
