@@ -242,6 +242,70 @@ app.post('/customer-portal', async (req, res) => {
   }
 });
 
+// ── AI PROXY ──────────────────────────────────────────────────────────
+// Frontend can't call Anthropic directly (CORS + API key must stay server-side).
+// This endpoint proxies requests. Max tokens clamped 100-2000 to prevent abuse.
+app.post('/ai/generate', async (req, res) => {
+  try {
+    const { prompt, max_tokens } = req.body;
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({ error: 'prompt required' });
+    }
+
+    // Optional auth check: log who's calling for monitoring
+    const authHeader = req.headers.authorization;
+    let userEmail = 'anonymous';
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const token = authHeader.slice(7);
+        const { data } = await supabase.auth.getUser(token);
+        if (data?.user?.email) userEmail = data.user.email;
+      } catch (_) { /* ignore, treat as anonymous onboarding */ }
+    }
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      console.error('❌ ANTHROPIC_API_KEY not set');
+      return res.status(500).json({ error: 'AI service not configured' });
+    }
+
+    const tokens = Math.min(Math.max(parseInt(max_tokens) || 800, 100), 2000);
+
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: tokens,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error(`❌ Anthropic API ${r.status} for ${userEmail}:`, errText.slice(0, 300));
+      return res.status(502).json({ error: 'AI service error' });
+    }
+
+    const data = await r.json();
+    const text = data?.content?.[0]?.text;
+    if (!text) {
+      console.error('❌ Empty Anthropic response for', userEmail);
+      return res.status(502).json({ error: 'Empty AI response' });
+    }
+
+    console.log(`✅ AI call OK for ${userEmail} (${tokens} tokens, ${text.length} chars)`);
+    res.json({ text });
+  } catch (err) {
+    console.error('❌ /ai/generate error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/create-checkout', async (req, res) => {
   try {
     const { email, plan, tier, userData, consent } = req.body;
