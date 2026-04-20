@@ -134,10 +134,16 @@ app.get('/imprint', (req, res) => {
 // ── CREATE CHECKOUT SESSION ───────────────────────────────────────────
 app.post('/create-checkout', async (req, res) => {
   try {
-    const { email, plan, userData } = req.body;
+    const { email, plan, userData, consent } = req.body;
 
     if (!email) {
       return res.status(400).json({ error: 'Email is required' });
+    }
+
+    // GDPR hard guard: block checkout if consent flags are not set
+    if (!consent || consent.healthData !== true || consent.terms !== true) {
+      console.warn(`⚠️ Checkout blocked for ${email}: missing GDPR consent`);
+      return res.status(400).json({ error: 'Consent required' });
     }
 
     const priceId = plan === 'annual' ? process.env.STRIPE_PRICE_ANNUAL : process.env.STRIPE_PRICE_MONTHLY;
@@ -148,11 +154,15 @@ app.post('/create-checkout', async (req, res) => {
 
     // Consolidated metadata — attached to BOTH session and subscription
     // so the webhook can read it regardless of which event fires.
+    const consentAt = consent.at || new Date().toISOString();
     const sharedMetadata = {
       userName: userData?.name || '',
       userGoal: userData?.goal || '',
       userSport: userData?.sport || '',
       plan: plan || 'monthly',
+      consentHealthData: 'true',
+      consentTerms: 'true',
+      consentAt: consentAt,
     };
 
     const session = await stripe.checkout.sessions.create({
@@ -169,7 +179,7 @@ app.post('/create-checkout', async (req, res) => {
       metadata: sharedMetadata,
     });
 
-    console.log(`✅ Checkout session created for ${email} (plan: ${plan})`);
+    console.log(`✅ Checkout session created for ${email} (plan: ${plan}, consent at: ${consentAt})`);
     res.json({ url: session.url, sessionId: session.id });
   } catch (err) {
     console.error('❌ Checkout error:', err.message);
@@ -310,6 +320,11 @@ app.post('/webhook', async (req, res) => {
         trial_end: trialEnd.toISOString(),
         status: 'trial',
         unsubscribed: false,
+        // GDPR consent record — Art. 9(2)(a) GDPR requires documented consent
+        // for processing health data. We store the fact + timestamp.
+        consent_health_data: meta.consentHealthData === 'true',
+        consent_terms: meta.consentTerms === 'true',
+        consent_at: meta.consentAt || new Date().toISOString(),
       };
 
       const { data, error } = await supabase
