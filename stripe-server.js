@@ -269,7 +269,7 @@ app.post('/ai/generate', async (req, res) => {
       return res.status(500).json({ error: 'AI service not configured' });
     }
 
-    const modelName = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+    const modelName = process.env.ANTHROPIC_MODEL || 'claude-opus-4-7';
     const tokens = Math.min(Math.max(parseInt(max_tokens) || 800, 100), 2000);
 
     const r = await fetch('https://api.anthropic.com/v1/messages', {
