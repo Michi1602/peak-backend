@@ -244,32 +244,44 @@ app.post('/customer-portal', async (req, res) => {
 
 app.post('/create-checkout', async (req, res) => {
   try {
-    const { email, plan, userData, consent } = req.body;
+    const { email, plan, tier, userData, consent } = req.body;
 
     if (!email) {
       return res.status(400).json({ error: 'Email is required' });
     }
 
-    // GDPR hard guard: block checkout if consent flags are not set
     if (!consent || consent.healthData !== true || consent.terms !== true) {
       console.warn(`⚠️ Checkout blocked for ${email}: missing GDPR consent`);
       return res.status(400).json({ error: 'Consent required' });
     }
 
-    const priceId = plan === 'annual' ? process.env.STRIPE_PRICE_ANNUAL : process.env.STRIPE_PRICE_MONTHLY;
+    // Pick price based on tier + interval
+    const normalizedTier = tier === 'basic' ? 'basic' : 'premium';
+    const normalizedPlan = plan === 'annual' ? 'annual' : 'monthly';
+
+    let priceId;
+    if (normalizedTier === 'basic' && normalizedPlan === 'annual') {
+      priceId = process.env.STRIPE_PRICE_BASIC_ANNUAL;
+    } else if (normalizedTier === 'basic' && normalizedPlan === 'monthly') {
+      priceId = process.env.STRIPE_PRICE_BASIC_MONTHLY;
+    } else if (normalizedTier === 'premium' && normalizedPlan === 'annual') {
+      priceId = process.env.STRIPE_PRICE_PREMIUM_ANNUAL || process.env.STRIPE_PRICE_ANNUAL;
+    } else {
+      priceId = process.env.STRIPE_PRICE_PREMIUM_MONTHLY || process.env.STRIPE_PRICE_MONTHLY;
+    }
+
     if (!priceId) {
-      console.error('❌ Missing STRIPE_PRICE_* env var for plan:', plan);
+      console.error('❌ Missing Stripe price env var for', normalizedTier, normalizedPlan);
       return res.status(500).json({ error: 'Server misconfiguration: price not set' });
     }
 
-    // Consolidated metadata — attached to BOTH session and subscription
-    // so the webhook can read it regardless of which event fires.
     const consentAt = consent.at || new Date().toISOString();
     const sharedMetadata = {
       userName: userData?.name || '',
       userGoal: userData?.goal || '',
       userSport: userData?.sport || '',
-      plan: plan || 'monthly',
+      plan: normalizedPlan,
+      tier: normalizedTier,
       consentHealthData: 'true',
       consentTerms: 'true',
       consentAt: consentAt,
@@ -289,7 +301,7 @@ app.post('/create-checkout', async (req, res) => {
       metadata: sharedMetadata,
     });
 
-    console.log(`✅ Checkout session created for ${email} (plan: ${plan}, consent at: ${consentAt})`);
+    console.log(`✅ Checkout: ${email} (${normalizedTier}/${normalizedPlan})`);
     res.json({ url: session.url, sessionId: session.id });
   } catch (err) {
     console.error('❌ Checkout error:', err.message);
@@ -424,6 +436,7 @@ app.post('/webhook', async (req, res) => {
         stripe_customer_id: session.customer || null,
         stripe_subscription_id: session.subscription || null,
         plan: meta.plan || 'monthly',
+        tier: meta.tier === 'basic' ? 'basic' : 'premium',
         goal: meta.userGoal || '',
         sport: meta.userSport || '',
         trial_start: new Date().toISOString(),
