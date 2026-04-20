@@ -9,15 +9,15 @@ const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://peak-frontend.vercel.app';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://peak-mj-performance.app';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://peak-backend-u52q.onrender.com';
-const FROM_EMAIL = 'PEAK <hello@mj-performance.net>';
+const FROM_EMAIL = 'PEAK <support@mj-performance.net>';
 
 const COMPANY = {
   name: 'MJ Performance',
   address: 'Am Hasel 6, 85139 Wettstetten',
-  email: 'hello@mj-performance.net',
-  website: 'https://mj-performance.net',
+  email: 'support@mj-performance.net',
+  website: 'https://peak-mj-performance.app',
   owner: 'Michael Jahn',
 };
 
