@@ -417,6 +417,59 @@ app.get('/user/profile', async (req, res) => {
   }
 });
 
+// ── PROFILE UPDATE (auth-protected) ────────────────────────────────────
+// Whitelist: only allow users to update their own editable fields.
+app.post('/user/update-profile', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    const user = userData.user;
+
+    // Whitelist of editable fields. Anything not in this list is silently ignored.
+    // NO access to: id, email, stripe_*, plan, tier, trial_*, status, consent_*, created_at
+    const ALLOWED = [
+      'name','age','gender','weight','dweight','height','sleep',
+      'job','commute','stress',
+      'sport','level','sessions','dur','equip',
+      'al','di','cu','cook','budget','goal',
+    ];
+    const updates = {};
+    for (const k of ALLOWED) {
+      if (req.body[k] !== undefined) updates[k] = req.body[k];
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    updates.updated_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from('users')
+      .update(updates)
+      .eq('id', user.id)
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      console.error('❌ Profile update failed for', user.email, ':', error.message);
+      return res.status(500).json({ error: 'Failed to update profile' });
+    }
+
+    console.log(`✅ Profile updated for ${user.email} (${Object.keys(updates).length - 1} fields)`);
+    res.json({ profile: data });
+  } catch (err) {
+    console.error('❌ /user/update-profile error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── WEBHOOK ───────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
