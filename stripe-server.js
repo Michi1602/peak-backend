@@ -381,26 +381,46 @@ app.post('/create-checkout', async (req, res) => {
             // Code restricted to premium tier
             voucherError = 'This code is only valid for Premium';
           } else {
-            appliedPromoCode = promo.id;
-            sharedMetadata.voucherCode = code;
+            // ─── ABUSE CHECK: has this email already redeemed this code? ───
+            const normalizedEmail = (email || '').trim().toLowerCase();
+            let abuseFound = false;
+            try {
+              const { data: prior } = await supabase
+                .from('voucher_redemptions')
+                .select('id')
+                .eq('voucher_code', code)
+                .eq('email', normalizedEmail)
+                .limit(1);
+              if (prior && prior.length > 0) {
+                voucherError = 'This voucher has already been used with this email';
+                abuseFound = true;
+              }
+            } catch (e) {
+              console.warn('Voucher abuse check failed (fail-open):', e.message);
+            }
 
-            // Check voucher type via promotion code metadata (fall back to coupon metadata)
-            const voucherType = promo.metadata?.type || promo.coupon?.metadata?.type || 'discount';
-            const metaSrc = promo.metadata?.type ? promo.metadata : (promo.coupon?.metadata || {});
-            if (voucherType === 'trial_extend') {
-              trialDays = parseInt(metaSrc.trial_days, 10) || 28;
-              appliedPromoCode = null; // no coupon — only trial extension
-              sharedMetadata.voucherType = 'trial_extend';
-              console.log(`🎟 Trial extended to ${trialDays} days for ${email} via ${code}`);
-            } else if (voucherType === 'trial_full') {
-              // Full free trial period (e.g. 3 months) then paid. Applied as
-              // 100% off coupon + extended trial.
-              trialDays = parseInt(metaSrc.trial_days, 10) || 90;
-              sharedMetadata.voucherType = 'trial_full';
-              console.log(`🎁 Full free trial ${trialDays} days for ${email} via ${code}`);
-            } else {
-              sharedMetadata.voucherType = 'discount';
-              console.log(`💸 Discount voucher ${code} applied for ${email}`);
+            if (!abuseFound) {
+              appliedPromoCode = promo.id;
+              sharedMetadata.voucherCode = code;
+
+              // Check voucher type via promotion code metadata (fall back to coupon metadata)
+              const voucherType = promo.metadata?.type || promo.coupon?.metadata?.type || 'discount';
+              const metaSrc = promo.metadata?.type ? promo.metadata : (promo.coupon?.metadata || {});
+              if (voucherType === 'trial_extend') {
+                trialDays = parseInt(metaSrc.trial_days, 10) || 28;
+                appliedPromoCode = null; // no coupon — only trial extension
+                sharedMetadata.voucherType = 'trial_extend';
+                console.log(`🎟 Trial extended to ${trialDays} days for ${email} via ${code}`);
+              } else if (voucherType === 'trial_full') {
+                // Full free trial period (e.g. 3 months) then paid. Applied as
+                // 100% off coupon + extended trial.
+                trialDays = parseInt(metaSrc.trial_days, 10) || 90;
+                sharedMetadata.voucherType = 'trial_full';
+                console.log(`🎁 Full free trial ${trialDays} days for ${email} via ${code}`);
+              } else {
+                sharedMetadata.voucherType = 'discount';
+                console.log(`💸 Discount voucher ${code} applied for ${email}`);
+              }
             }
           }
         }
@@ -453,7 +473,7 @@ app.post('/create-checkout', async (req, res) => {
 // before they commit to checkout.
 app.post('/voucher/validate', async (req, res) => {
   try {
-    const { code, plan, tier } = req.body;
+    const { code, plan, tier, email } = req.body;
     if (!code || typeof code !== 'string') {
       return res.status(400).json({ error: 'Code required' });
     }
@@ -474,6 +494,24 @@ app.post('/voucher/validate', async (req, res) => {
     }
     if (premiumOnly && tier && tier !== 'premium') {
       return res.status(400).json({ valid: false, error: 'This code is only valid for Premium', requiresPremium: true });
+    }
+    // ─── ABUSE CHECK: email already redeemed this code? ─────────────────
+    if (email && typeof email === 'string') {
+      const normalizedEmail = email.trim().toLowerCase();
+      try {
+        const { data: prior, error } = await supabase
+          .from('voucher_redemptions')
+          .select('id')
+          .eq('voucher_code', normalizedCode)
+          .eq('email', normalizedEmail)
+          .limit(1);
+        if (!error && prior && prior.length > 0) {
+          return res.status(409).json({ valid: false, error: 'This code has already been used with this email', alreadyUsed: true });
+        }
+      } catch (e) {
+        console.warn('Voucher abuse check (email) failed:', e.message);
+        // Fail-open: allow validation to continue if DB check fails
+      }
     }
     const type = promo.metadata?.type || promo.coupon?.metadata?.type || 'discount';
     const metaSrc = promo.metadata?.type ? promo.metadata : (promo.coupon?.metadata || {});
@@ -812,6 +850,86 @@ app.post('/webhook', async (req, res) => {
         });
       } catch (err) {
         console.error('❌ Welcome email failed for', email, ':', err.message);
+      }
+
+      // ── STEP 4: Voucher redemption tracking + fingerprint abuse check ──
+      // If a voucher was used, record the redemption. Also check if the
+      // card fingerprint has been used for this voucher before — if yes,
+      // cancel the subscription (abuse detected).
+      if (meta.voucherCode) {
+        const voucherCode = meta.voucherCode;
+        let cardFingerprint = null;
+        try {
+          // Fetch payment method via subscription → default_payment_method → card.fingerprint
+          if (session.subscription) {
+            const sub = await stripe.subscriptions.retrieve(session.subscription, {
+              expand: ['default_payment_method'],
+            });
+            const pm = sub.default_payment_method;
+            if (pm && pm.card && pm.card.fingerprint) {
+              cardFingerprint = pm.card.fingerprint;
+            } else if (sub.customer) {
+              // Fallback: fetch customer's default payment method
+              const customer = await stripe.customers.retrieve(sub.customer);
+              const defaultPmId = customer.invoice_settings?.default_payment_method;
+              if (defaultPmId) {
+                const pm2 = await stripe.paymentMethods.retrieve(defaultPmId);
+                if (pm2.card && pm2.card.fingerprint) cardFingerprint = pm2.card.fingerprint;
+              }
+            }
+          }
+        } catch (err) {
+          console.warn('⚠️  Could not fetch card fingerprint for abuse check:', err.message);
+        }
+
+        // Fingerprint-based abuse check
+        let abuseDetected = false;
+        if (cardFingerprint) {
+          try {
+            const { data: prior } = await supabase
+              .from('voucher_redemptions')
+              .select('id, email')
+              .eq('voucher_code', voucherCode)
+              .eq('card_fingerprint', cardFingerprint)
+              .limit(1);
+            if (prior && prior.length > 0) {
+              abuseDetected = true;
+              console.warn(`🚨 VOUCHER ABUSE: ${email} used ${voucherCode} with card previously used by ${prior[0].email}`);
+            }
+          } catch (e) {
+            console.warn('Fingerprint abuse check failed:', e.message);
+          }
+        }
+
+        if (abuseDetected && session.subscription) {
+          // Cancel the subscription — abuse confirmed
+          try {
+            await stripe.subscriptions.cancel(session.subscription, {
+              invoice_now: false,
+              prorate: false,
+            });
+            console.log(`🛑 Subscription cancelled due to voucher abuse: ${session.subscription}`);
+            // Mark user as blocked
+            await supabase.from('users').update({ status: 'blocked_voucher_abuse' }).eq('email', email);
+          } catch (err) {
+            console.error('❌ Could not cancel subscription after abuse detection:', err.message);
+          }
+        } else {
+          // Record the redemption
+          try {
+            const { error: insErr } = await supabase.from('voucher_redemptions').insert({
+              voucher_code: voucherCode,
+              email: email.toLowerCase(),
+              card_fingerprint: cardFingerprint,
+              stripe_customer_id: session.customer || null,
+              stripe_subscription_id: session.subscription || null,
+            });
+            if (insErr) console.error('❌ Could not insert voucher redemption:', insErr.message);
+            else console.log(`📝 Voucher redemption recorded: ${voucherCode} for ${email}`);
+          } catch (err) {
+            console.error('❌ Voucher redemption insert exception:', err.message);
+          }
+        }
       }
     } else if (event.type === 'customer.subscription.deleted') {
       const sub = event.data.object;
