@@ -309,7 +309,7 @@ app.post('/ai/generate', async (req, res) => {
 
 app.post('/create-checkout', async (req, res) => {
   try {
-    const { email, plan, tier, userData, consent } = req.body;
+    const { email, plan, tier, userData, consent, voucher } = req.body;
 
     if (!email) {
       return res.status(400).json({ error: 'Email is required' });
@@ -352,25 +352,153 @@ app.post('/create-checkout', async (req, res) => {
       consentAt: consentAt,
     };
 
-    const session = await stripe.checkout.sessions.create({
+    // ─── VOUCHER HANDLING ───────────────────────────────────────────────
+    // Three voucher types, each stored as a Stripe Promotion Code with
+    // specific metadata that tells us how to apply it:
+    //   - discount (default): Stripe applies coupon automatically
+    //   - trial_extend: we read metadata.trial_days and override trial_period_days
+    //   - trial_full: 100% off for N months (Stripe coupon + longer trial)
+    let trialDays = 7;
+    let appliedPromoCode = null;
+    let voucherError = null;
+
+    if (voucher && typeof voucher === 'string' && voucher.trim()) {
+      const code = voucher.trim().toUpperCase();
+      try {
+        // Look up promotion code
+        const promos = await stripe.promotionCodes.list({ code, active: true, limit: 1 });
+        if (promos.data.length === 0) {
+          voucherError = 'Invalid or expired voucher code';
+        } else {
+          const promo = promos.data[0];
+          // Check redemption limit
+          if (promo.max_redemptions && promo.times_redeemed >= promo.max_redemptions) {
+            voucherError = 'Voucher has reached its redemption limit';
+          } else if ((promo.metadata?.annual_only === 'true' || promo.coupon?.metadata?.annual_only === 'true') && normalizedPlan !== 'annual') {
+            // Code restricted to annual plan
+            voucherError = 'This code is only valid for the annual plan';
+          } else if ((promo.metadata?.premium_only === 'true' || promo.coupon?.metadata?.premium_only === 'true') && normalizedTier !== 'premium') {
+            // Code restricted to premium tier
+            voucherError = 'This code is only valid for Premium';
+          } else {
+            appliedPromoCode = promo.id;
+            sharedMetadata.voucherCode = code;
+
+            // Check voucher type via promotion code metadata (fall back to coupon metadata)
+            const voucherType = promo.metadata?.type || promo.coupon?.metadata?.type || 'discount';
+            const metaSrc = promo.metadata?.type ? promo.metadata : (promo.coupon?.metadata || {});
+            if (voucherType === 'trial_extend') {
+              trialDays = parseInt(metaSrc.trial_days, 10) || 28;
+              appliedPromoCode = null; // no coupon — only trial extension
+              sharedMetadata.voucherType = 'trial_extend';
+              console.log(`🎟 Trial extended to ${trialDays} days for ${email} via ${code}`);
+            } else if (voucherType === 'trial_full') {
+              // Full free trial period (e.g. 3 months) then paid. Applied as
+              // 100% off coupon + extended trial.
+              trialDays = parseInt(metaSrc.trial_days, 10) || 90;
+              sharedMetadata.voucherType = 'trial_full';
+              console.log(`🎁 Full free trial ${trialDays} days for ${email} via ${code}`);
+            } else {
+              sharedMetadata.voucherType = 'discount';
+              console.log(`💸 Discount voucher ${code} applied for ${email}`);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Voucher lookup failed:', err.message);
+        voucherError = 'Could not verify voucher';
+      }
+
+      if (voucherError) {
+        return res.status(400).json({ error: voucherError });
+      }
+    }
+
+    const sessionConfig = {
       mode: 'subscription',
       payment_method_types: ['card'],
       customer_email: email,
       line_items: [{ price: priceId, quantity: 1 }],
       subscription_data: {
-        trial_period_days: 7,
+        trial_period_days: trialDays,
         metadata: sharedMetadata,
       },
       success_url: `${FRONTEND_URL}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${FRONTEND_URL}?cancelled=true`,
       metadata: sharedMetadata,
-    });
+    };
 
-    console.log(`✅ Checkout: ${email} (${normalizedTier}/${normalizedPlan})`);
+    if (appliedPromoCode) {
+      sessionConfig.discounts = [{ promotion_code: appliedPromoCode }];
+    } else {
+      // Allow manual code entry in Stripe UI as fallback
+      sessionConfig.allow_promotion_codes = true;
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionConfig);
+
+    console.log(`✅ Checkout: ${email} (${normalizedTier}/${normalizedPlan}, trial=${trialDays}d${appliedPromoCode?', promo='+appliedPromoCode:''})`);
     res.json({ url: session.url, sessionId: session.id });
   } catch (err) {
     console.error('❌ Checkout error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── VOUCHER VALIDATION (public, no auth needed) ───────────────────────
+// Frontend calls this when user types a code to show preview of discount
+// before they commit to checkout.
+app.post('/voucher/validate', async (req, res) => {
+  try {
+    const { code, plan, tier } = req.body;
+    if (!code || typeof code !== 'string') {
+      return res.status(400).json({ error: 'Code required' });
+    }
+    const normalizedCode = code.trim().toUpperCase();
+    const promos = await stripe.promotionCodes.list({ code: normalizedCode, active: true, limit: 1 });
+    if (promos.data.length === 0) {
+      return res.status(404).json({ valid: false, error: 'Invalid or expired code' });
+    }
+    const promo = promos.data[0];
+    if (promo.max_redemptions && promo.times_redeemed >= promo.max_redemptions) {
+      return res.status(410).json({ valid: false, error: 'Code has reached its redemption limit' });
+    }
+    // Annual-only / Premium-only restrictions (checked if user already chose plan/tier)
+    const annualOnly = promo.metadata?.annual_only === 'true' || promo.coupon?.metadata?.annual_only === 'true';
+    const premiumOnly = promo.metadata?.premium_only === 'true' || promo.coupon?.metadata?.premium_only === 'true';
+    if (annualOnly && plan && plan !== 'annual') {
+      return res.status(400).json({ valid: false, error: 'This code is only valid for the annual plan', requiresAnnual: true });
+    }
+    if (premiumOnly && tier && tier !== 'premium') {
+      return res.status(400).json({ valid: false, error: 'This code is only valid for Premium', requiresPremium: true });
+    }
+    const type = promo.metadata?.type || promo.coupon?.metadata?.type || 'discount';
+    const metaSrc = promo.metadata?.type ? promo.metadata : (promo.coupon?.metadata || {});
+    const response = { valid: true, type, code: normalizedCode };
+    if (annualOnly) response.annualOnly = true;
+    if (premiumOnly) response.premiumOnly = true;
+    if (type === 'trial_extend') {
+      response.trialDays = parseInt(metaSrc.trial_days, 10) || 28;
+      response.label = `${response.trialDays} days free trial`;
+    } else if (type === 'trial_full') {
+      response.trialDays = parseInt(metaSrc.trial_days, 10) || 90;
+      response.label = `${response.trialDays} days premium free`;
+    } else {
+      // Discount — fetch coupon details
+      if (promo.coupon) {
+        if (promo.coupon.percent_off) {
+          response.percentOff = promo.coupon.percent_off;
+          response.label = `${promo.coupon.percent_off}% off`;
+        } else if (promo.coupon.amount_off) {
+          response.amountOff = promo.coupon.amount_off / 100;
+          response.label = `€${response.amountOff} off`;
+        }
+      }
+    }
+    res.json(response);
+  } catch (err) {
+    console.error('❌ Voucher validation error:', err.message);
+    res.status(500).json({ valid: false, error: err.message });
   }
 });
 
