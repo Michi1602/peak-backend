@@ -211,6 +211,126 @@ app.post('/auth/send-login-link', async (req, res) => {
   }
 });
 
+// ── FREE TIER SIGNUP ──────────────────────────────────────────────────
+// Creates a user without Stripe: just auth user + profile with tier='free'.
+// Sends magic link to log them in. No payment, no Stripe customer.
+//
+// Free tier limits (enforced elsewhere):
+//   - max 3 AI plan generations (tracked via plan_generations_used)
+//   - no training progression
+//   - no recovery tools
+//   - no workout adjustments
+app.post('/auth/signup-free', async (req, res) => {
+  try {
+    const { email, userData, consent } = req.body;
+
+    if (!email) return res.status(400).json({ error: 'Email is required' });
+
+    if (!consent || consent.healthData !== true || consent.terms !== true) {
+      console.warn(`⚠️ Free signup blocked for ${email}: missing GDPR consent`);
+      return res.status(400).json({ error: 'Consent required' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Check if account already exists
+    try {
+      const { data: existing } = await supabase.auth.admin.listUsers();
+      const match = existing?.users?.find(u => u.email?.toLowerCase() === normalizedEmail);
+      if (match) {
+        // Existing account — send them a login link instead
+        console.log(`ℹ️  Free signup for existing user: ${normalizedEmail} → sending login link`);
+        const { data: linkData } = await supabase.auth.admin.generateLink({
+          type: 'magiclink',
+          email: normalizedEmail,
+          options: { redirectTo: `${FRONTEND_URL}/` },
+        });
+        const magicLink = linkData?.properties?.action_link;
+        if (magicLink) {
+          await resend.emails.send({
+            from: FROM_EMAIL,
+            to: normalizedEmail,
+            subject: 'Your PEAK login link',
+            html: `<div style="font-family:Arial,sans-serif;max-width:500px;margin:40px auto;padding:30px;background:#fff;"><h2 style="color:#0E0E0E;font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;">YOUR LOGIN LINK</h2><p style="color:#333;line-height:1.6;">You already have a PEAK account. Click below to sign in.</p><p style="margin:24px 0;"><a href="${magicLink}" style="display:inline-block;background:#E8001A;color:#fff;padding:14px 28px;text-decoration:none;font-weight:700;letter-spacing:2px;text-transform:uppercase;">Sign in</a></p><p style="color:#888;font-size:12px;">This link expires in 1 hour.</p></div>`,
+          });
+        }
+        return res.json({ success: true, existing: true });
+      }
+    } catch (e) {
+      console.warn('listUsers check failed, proceeding with signup:', e.message);
+    }
+
+    // Create new auth user (service role — bypasses signup toggle)
+    const { data: created, error: createErr } = await supabase.auth.admin.createUser({
+      email: normalizedEmail,
+      email_confirm: true,
+      user_metadata: {
+        name: userData?.name || '',
+        source: 'free_signup',
+      },
+    });
+
+    if (createErr) {
+      console.error('❌ Free auth user creation failed:', createErr.message);
+      return res.status(500).json({ error: createErr.message });
+    }
+
+    const authUserId = created.user.id;
+    const consentAt = consent.at || new Date().toISOString();
+
+    // Upsert free profile row
+    const userRow = {
+      id: authUserId,
+      email: normalizedEmail,
+      name: userData?.name || '',
+      stripe_customer_id: null,
+      stripe_subscription_id: null,
+      plan: 'free',
+      tier: 'free',
+      goal: userData?.goal || '',
+      sport: userData?.sport || '',
+      trial_start: null,
+      trial_end: null,
+      status: 'free_active',
+      unsubscribed: false,
+      plan_generations_used: 0,
+      consent_health_data: true,
+      consent_terms: true,
+      consent_at: consentAt,
+    };
+
+    const { error: upsertErr } = await supabase.from('users').upsert(userRow, { onConflict: 'id' });
+    if (upsertErr) {
+      console.error('❌ Free user upsert failed:', upsertErr.message);
+      return res.status(500).json({ error: upsertErr.message });
+    }
+
+    // Generate magic link + send welcome
+    const { data: linkData } = await supabase.auth.admin.generateLink({
+      type: 'magiclink',
+      email: normalizedEmail,
+      options: { redirectTo: `${FRONTEND_URL}/` },
+    });
+    const magicLink = linkData?.properties?.action_link || null;
+
+    try {
+      await sendEmail(normalizedEmail, 'welcome', {
+        name: userData?.name || '',
+        magicLink,
+        isFree: true,
+      });
+    } catch (err) {
+      console.error('⚠️  Free welcome email failed:', err.message);
+    }
+
+    console.log(`✅ Free signup complete: ${normalizedEmail} (${authUserId})`);
+    res.json({ success: true, userId: authUserId });
+  } catch (err) {
+    console.error('❌ signup-free error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── OPEN STRIPE CUSTOMER PORTAL ───────────────────────────────────────
 // Generates a one-time portal session URL for the given email.
 // User is redirected there to manage/cancel their subscription.
@@ -247,7 +367,7 @@ app.post('/customer-portal', async (req, res) => {
 // This endpoint proxies requests. Max tokens clamped 100-2000 to prevent abuse.
 app.post('/ai/generate', async (req, res) => {
   try {
-    const { prompt, max_tokens } = req.body;
+    const { prompt, max_tokens, purpose } = req.body;
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'prompt required' });
     }
@@ -255,12 +375,48 @@ app.post('/ai/generate', async (req, res) => {
     // Optional auth check: log who's calling for monitoring
     const authHeader = req.headers.authorization;
     let userEmail = 'anonymous';
+    let authUserId = null;
     if (authHeader && authHeader.startsWith('Bearer ')) {
       try {
         const token = authHeader.slice(7);
         const { data } = await supabase.auth.getUser(token);
         if (data?.user?.email) userEmail = data.user.email;
+        if (data?.user?.id) authUserId = data.user.id;
       } catch (_) { /* ignore, treat as anonymous onboarding */ }
+    }
+
+    // ─── FREE TIER CAP: plan-generation is limited to 3 total ──────────
+    // Only enforced when purpose === 'plan_generation' AND user is authenticated
+    // AND user is on free tier. Other purposes (training_enrich, adjustment)
+    // are NOT counted (internal follow-up calls).
+    if (purpose === 'plan_generation' && authUserId) {
+      try {
+        const { data: profile } = await supabase
+          .from('users')
+          .select('tier, plan_generations_used')
+          .eq('id', authUserId)
+          .maybeSingle();
+        if (profile?.tier === 'free') {
+          const used = profile.plan_generations_used || 0;
+          if (used >= 3) {
+            console.log(`🔒 Free-tier cap hit for ${userEmail} (used=${used})`);
+            return res.status(402).json({
+              error: 'Free plan limit reached',
+              code: 'FREE_LIMIT_REACHED',
+              used,
+              max: 3,
+            });
+          }
+          // Increment counter (we increment BEFORE the call to avoid abuse via error retries)
+          await supabase
+            .from('users')
+            .update({ plan_generations_used: used + 1 })
+            .eq('id', authUserId);
+          console.log(`📊 Free user ${userEmail}: plan_generations ${used+1}/3`);
+        }
+      } catch (e) {
+        console.warn('Free-tier cap check failed (fail-open):', e.message);
+      }
     }
 
     const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -299,7 +455,7 @@ app.post('/ai/generate', async (req, res) => {
       return res.status(502).json({ error: 'Empty AI response' });
     }
 
-    console.log(`✅ AI call OK for ${userEmail} (${tokens} tokens, ${text.length} chars)`);
+    console.log(`✅ AI call OK for ${userEmail} (${tokens} tokens, ${text.length} chars, purpose=${purpose||'unknown'})`);
     res.json({ text });
   } catch (err) {
     console.error('❌ /ai/generate error:', err.message);
@@ -1087,7 +1243,7 @@ async function sendEmail(to, type, data) {
 
   const templates = {
     welcome: {
-      subject: 'Welcome to PEAK — your plan is ready',
+      subject: data?.isFree ? 'Welcome to PEAK — your free plan is ready' : 'Welcome to PEAK — your plan is ready',
       html: emailShell(`
         <tr><td>${emailHeader()}</td></tr>
         <tr><td style="padding:48px 40px 8px;">
@@ -1096,26 +1252,26 @@ async function sendEmail(to, type, data) {
             Your plan is<br>live.
           </h1>
           <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
-            System over motivation. This is where it starts — your AI-built nutrition, training and recovery protocol, tuned to your goal.
+            System over motivation. This is where it starts — your AI-built nutrition${data?.isFree ? '' : ', training'} and recovery protocol, tuned to your goal.
           </p>
         </td></tr>
 
         <tr><td style="padding:0 40px 8px;">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:1px solid ${BRAND.border};">
             <tr><td style="padding:24px 0 8px;">
-              <p style="margin:0 0 16px;font-family:${FONT_HEAD};font-size:11px;font-weight:900;letter-spacing:3px;color:${BRAND.ink};text-transform:uppercase;">Inside PEAK</p>
+              <p style="margin:0 0 16px;font-family:${FONT_HEAD};font-size:11px;font-weight:900;letter-spacing:3px;color:${BRAND.ink};text-transform:uppercase;">${data?.isFree ? 'Your free plan includes' : 'Inside PEAK'}</p>
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
               <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;AI nutrition plan, matched to your goal and taste
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;Personalised programme for your sport
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? '1-week training preview for your sport' : 'Personalised programme for your sport'}
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;Recovery protocol — sleep, hydration, stress
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? 'Up to 3 plan regenerations' : 'Recovery protocol — sleep, hydration, stress'}
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:24px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;Barcode scanner and shopping mode
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? 'Upgrade anytime for full access' : 'Barcode scanner and shopping mode'}
             </td></tr>
           </table>
         </td></tr>
@@ -1123,7 +1279,9 @@ async function sendEmail(to, type, data) {
         <tr><td style="padding:8px 40px 36px;">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};">
             <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
-              <strong style="color:${BRAND.ink};">7-day free trial.</strong> No charge until Day 8. We'll remind you on Day 5 and Day 6.
+              ${data?.isFree
+                ? `<strong style="color:${BRAND.ink};">Free plan.</strong> No card, no charge. Upgrade any time for unlimited plans, full training progression and recovery tools.`
+                : `<strong style="color:${BRAND.ink};">7-day free trial.</strong> No charge until Day 8. We'll remind you on Day 5 and Day 6.`}
             </td></tr>
           </table>
         </td></tr>
