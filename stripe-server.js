@@ -222,7 +222,7 @@ app.post('/auth/send-login-link', async (req, res) => {
 //   - no workout adjustments
 app.post('/auth/signup-free', async (req, res) => {
   try {
-    const { email, userData, consent } = req.body;
+    const { email, userData, consent, lang } = req.body;
 
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
@@ -290,6 +290,7 @@ app.post('/auth/signup-free', async (req, res) => {
       goal: userData?.goal || '',
       goals: Array.isArray(userData?.goals) && userData.goals.length ? userData.goals : (userData?.goal ? [userData.goal] : []),
       sport: userData?.sport || '',
+      lang: (lang === 'de' || lang === 'en') ? lang : 'en',
       trial_start: null,
       trial_end: null,
       status: 'free_active',
@@ -317,8 +318,12 @@ app.post('/auth/signup-free', async (req, res) => {
     try {
       await sendEmail(normalizedEmail, 'welcome', {
         name: userData?.name || '',
+        goal: userData?.goal || '',
+        goals: Array.isArray(userData?.goals) ? userData.goals : [],
+        sport: userData?.sport || '',
         magicLink,
         isFree: true,
+        lang: lang === 'de' ? 'de' : (lang === 'en' ? 'en' : undefined),
       });
     } catch (err) {
       console.error('⚠️  Free welcome email failed:', err.message);
@@ -466,7 +471,7 @@ app.post('/ai/generate', async (req, res) => {
 
 app.post('/create-checkout', async (req, res) => {
   try {
-    const { email, plan, tier, userData, consent, voucher } = req.body;
+    const { email, plan, tier, userData, consent, voucher, lang } = req.body;
 
     if (!email) {
       return res.status(400).json({ error: 'Email is required' });
@@ -506,6 +511,7 @@ app.post('/create-checkout', async (req, res) => {
       userGoal: userData?.goal || '',
       userGoals: JSON.stringify(goalsArr).slice(0, 450), // Stripe metadata values max 500 chars
       userSport: userData?.sport || '',
+      userLang: (lang === 'de' || lang === 'en') ? lang : '',
       plan: normalizedPlan,
       tier: normalizedTier,
       consentHealthData: 'true',
@@ -767,7 +773,7 @@ app.post('/user/update-profile', async (req, res) => {
       'name','age','gender','weight','dweight','height','sleep',
       'job','commute','stress',
       'sport','level','sessions','dur','equip',
-      'al','di','cu','cook','budget','goal','goals',
+      'al','di','cu','cook','budget','goal','goals','lang',
     ];
     const updates = {};
     for (const k of ALLOWED) {
@@ -968,6 +974,7 @@ app.post('/webhook', async (req, res) => {
         goal: meta.userGoal || '',
         goals: parsedGoals,
         sport: meta.userSport || '',
+        lang: (meta.userLang === 'de' || meta.userLang === 'en') ? meta.userLang : 'en',
         trial_start: new Date().toISOString(),
         trial_end: trialEnd.toISOString(),
         status: 'trial',
@@ -1015,7 +1022,11 @@ app.post('/webhook', async (req, res) => {
       try {
         await sendEmail(email, 'welcome', {
           name: meta.userName || '',
+          goal: meta.userGoal || '',
+          goals: parsedGoals,
+          sport: meta.userSport || '',
           magicLink,
+          lang: meta.userLang === 'de' ? 'de' : (meta.userLang === 'en' ? 'en' : undefined),
         });
       } catch (err) {
         console.error('❌ Welcome email failed for', email, ':', err.message);
@@ -1235,72 +1246,238 @@ function emailShell(innerHTML) {
 }
 
 async function sendEmail(to, type, data) {
-  // Check if user has unsubscribed. Wrap in try/catch because .single()
-  // throws if 0 rows match, which is fine right after signup (race condition).
+  // Check if user has unsubscribed AND fetch language preference
   let unsubscribed = false;
+  let userLang = null;
+  let userGoal = '';
+  let userGoals = [];
+  let userSport = '';
   try {
-    const { data: user, error } = await supabase
+    const { data: user } = await supabase
       .from('users')
-      .select('unsubscribed')
+      .select('unsubscribed,goal,goals,sport,lang')
       .eq('email', to)
       .maybeSingle();
-    if (error) console.error('Unsubscribe-check error:', error.message);
     unsubscribed = user?.unsubscribed === true;
+    if (user?.goal) userGoal = user.goal;
+    if (Array.isArray(user?.goals)) userGoals = user.goals;
+    if (user?.sport) userSport = user.sport;
+    if (user?.lang === 'de' || user?.lang === 'en') userLang = user.lang;
   } catch (err) {
     console.error('Unsubscribe-check exception:', err.message);
   }
   if (unsubscribed) return;
 
+  // Language detection priority:
+  //   1. explicit data.lang
+  //   2. user.lang from DB
+  //   3. goal-text heuristic
+  //   4. fallback 'en'
+  const lang = (data?.lang === 'de' || data?.lang === 'en') ? data.lang
+    : (userLang ? userLang
+    : (userGoal && /abnehmen|aufbauen|gesundheit|energie|ausdauer|muskel|gewicht/i.test(userGoal) ? 'de'
+    : 'en'));
+  const de = lang === 'de';
+
   const name = data?.name || '';
-  const greeting = name ? name : 'athlete';
+  const sport = data?.sport || userSport || '';
+  const goal = data?.goal || userGoal || '';
+  const goalsList = Array.isArray(data?.goals) && data.goals.length ? data.goals
+                  : (Array.isArray(userGoals) && userGoals.length ? userGoals
+                  : (goal ? [goal] : []));
+
+  // Build goal headline text (visible in email):
+  // - 1 goal: "<goal>"
+  // - 2 goals: "<goal1> + <goal2>"
+  // - 3 goals: "<goal1> + 2 more"
+  let goalHeadline = '';
+  if (goalsList.length === 1) goalHeadline = goalsList[0];
+  else if (goalsList.length === 2) goalHeadline = goalsList[0] + ' + ' + goalsList[1];
+  else if (goalsList.length >= 3) goalHeadline = goalsList[0] + (de ? ' + ' + (goalsList.length - 1) + ' weitere Ziele' : ' + ' + (goalsList.length - 1) + ' more goals');
+
+  // Localised strings
+  const L = de ? {
+    welcomeSubject: (isFree) => isFree ? 'Willkommen bei PEAK — dein Gratis-Plan ist bereit' : 'Willkommen bei PEAK — dein Plan ist bereit',
+    welcomeLabel: (n) => 'Willkommen' + (n ? ', ' + n : ''),
+    welcomeH1a: 'Dein Plan',
+    welcomeH1b: 'ist live.',
+    welcomeH1FreeB: 'steht.',
+    welcomeIntro: (isFree, goal, sport) => {
+      let intro = 'System statt Motivation. Hier startet dein Weg — ';
+      if (sport && goal) intro += `dein individueller ${sport}-Plan, abgestimmt auf „${goal}".`;
+      else if (sport) intro += `dein individueller ${sport}-Plan.`;
+      else if (goal) intro += `maßgeschneidert auf dein Ziel: „${goal}".`;
+      else intro += 'KI-gestützte Ernährung, Training und Regeneration — auf dich zugeschnitten.';
+      return intro;
+    },
+    includesFree: 'Dein Gratis-Plan enthält',
+    includesPaid: 'In PEAK enthalten',
+    f1: (sport) => sport ? `KI-Ernährungsplan für dein ${sport}-Training` : 'KI-Ernährungsplan, passend zu Ziel & Geschmack',
+    f2Free: (sport) => sport ? `${sport}-Training — eine Woche zum Reinschnuppern` : 'Trainings-Vorschau für deine Sportart',
+    f2Paid: (sport) => sport ? `12-Wochen-${sport}-Programm mit Progression` : '12-Wochen-Programm für deine Sportart',
+    f3Free: '3 Plan-Updates inklusive',
+    f3Paid: 'Regeneration — Schlaf, Hydration, Mobilität',
+    f4Free: 'Jederzeit Upgrade möglich',
+    f4Paid: 'Barcode-Scanner & Shopping-Modus',
+    stepsTitle: 'Deine ersten 3 Schritte',
+    step1: 'Plan öffnen und Essensplan anschauen',
+    step2Free: 'Trainings-Tab — Woche 1 ansehen',
+    step2Paid: 'Erstes Training starten',
+    step3Free: 'Mahlzeit protokollieren für Fortschritts-Tracking',
+    step3Paid: 'Regenerations-Protokoll lesen',
+    boxFree: '<strong>Gratis-Plan.</strong> Keine Karte, keine Abbuchung. Upgrade jederzeit für unbegrenzte Pläne, volle Trainingsprogression und Regenerations-Tools.',
+    boxPaid: '<strong>7 Tage kostenlos.</strong> Erst ab Tag 8 wird abgebucht. Erinnerungen an Tag 5 und 6.',
+    ctaOpen: 'Plan öffnen',
+    day5Subject: 'Noch 2 Tage — deine PEAK-Testphase',
+    day5Label: '48 Stunden übrig',
+    day5H1: (n) => (n ? n + ',<br>' : '') + 'deine Testphase<br>endet bald.',
+    day5Body: (sport, goal) => {
+      const what = sport ? `dein ${sport}-Training, Ernährungsplan und Regenerations-Protokoll` : 'dein Ernährungsplan, Training und Regenerations-Protokoll';
+      return `Noch 2 Tage auf deiner 7-Tage-Testphase. ${what} wird pausiert, wenn du nicht weitermachst${goal ? '. Du bist auf dem Weg zu: „' + goal + '".' : '.'}`;
+    },
+    day5CTA: 'Weitermachen',
+    day5Cancel: 'Kündigen: PEAK öffnen → Einstellungen → Abonnement → Kündigen. 10 Sekunden, kein Telefonat.',
+    day6Subject: 'Letzter Tag — deine Testphase endet morgen',
+    day6Label: 'Letzte 24 Stunden',
+    day6H1: (n) => (n ? n + ',<br>' : '') + 'morgen<br>geht es los.',
+    day6Body: 'Deine kostenlose Testphase endet morgen. Dein PEAK-Abo startet automatisch — du musst nichts tun, um weiterzumachen.',
+    day6Box: '<strong>Kündigen:</strong> PEAK öffnen → Einstellungen → Abonnement → Testphase beenden. In 10 Sekunden erledigt.',
+    day6CTA: 'Plan behalten',
+  } : {
+    welcomeSubject: (isFree) => isFree ? 'Welcome to PEAK — your free plan is ready' : 'Welcome to PEAK — your plan is ready',
+    welcomeLabel: (n) => 'Welcome' + (n ? ', ' + n : ''),
+    welcomeH1a: 'Your plan is',
+    welcomeH1b: 'live.',
+    welcomeH1FreeB: 'live.',
+    welcomeIntro: (isFree, goal, sport) => {
+      let intro = 'System over motivation. This is where it starts — ';
+      if (sport && goal) intro += `your custom ${sport} plan, tuned to "${goal}".`;
+      else if (sport) intro += `your custom ${sport} programme.`;
+      else if (goal) intro += `built around your goal: "${goal}".`;
+      else intro += 'AI-built nutrition, training and recovery, tuned to you.';
+      return intro;
+    },
+    includesFree: 'Your free plan includes',
+    includesPaid: 'Inside PEAK',
+    f1: (sport) => sport ? `AI nutrition plan for your ${sport} training` : 'AI nutrition plan, matched to goal and taste',
+    f2Free: (sport) => sport ? `${sport} training — 1-week preview` : '1-week training preview for your sport',
+    f2Paid: (sport) => sport ? `12-week ${sport} programme with progression` : 'Personalised programme for your sport',
+    f3Free: '3 plan regenerations included',
+    f3Paid: 'Recovery protocol — sleep, hydration, mobility',
+    f4Free: 'Upgrade any time',
+    f4Paid: 'Barcode scanner and shopping mode',
+    stepsTitle: 'Your first 3 steps',
+    step1: 'Open your plan and check your meals',
+    step2Free: 'Open the Training tab — see Week 1',
+    step2Paid: 'Start your first training session',
+    step3Free: 'Log a meal to track progress',
+    step3Paid: 'Read your recovery protocol',
+    boxFree: '<strong>Free plan.</strong> No card, no charge. Upgrade any time for unlimited plans, full training progression and recovery tools.',
+    boxPaid: '<strong>7 days free.</strong> No charge until Day 8. Reminders on Day 5 and Day 6.',
+    ctaOpen: 'Open my plan',
+    day5Subject: 'Two days left on your PEAK trial',
+    day5Label: '48 hours left',
+    day5H1: (n) => (n ? n + ',<br>' : '') + 'your trial<br>ends soon.',
+    day5Body: (sport, goal) => {
+      const what = sport ? `your ${sport} training, nutrition plan and recovery protocol` : 'your nutrition plan, training and recovery protocol';
+      return `Two days remain on your free 7-day trial. ${what} will pause unless you continue${goal ? '. You\'re on the way to: "' + goal + '".' : '.'}`;
+    },
+    day5CTA: 'Continue my journey',
+    day5Cancel: 'To cancel: open PEAK → Settings → Subscription → Cancel. 10 seconds, no phone calls.',
+    day6Subject: 'Final day — your PEAK trial ends tomorrow',
+    day6Label: 'Final 24 hours',
+    day6H1: (n) => (n ? n + ',<br>' : '') + 'tomorrow<br>it begins.',
+    day6Body: 'Your free trial ends tomorrow. Your PEAK subscription begins automatically — no action needed to continue.',
+    day6Box: '<strong>To cancel:</strong> Open PEAK → Settings → Subscription → Cancel trial. Done in 10 seconds.',
+    day6CTA: 'Keep my plan',
+  };
+
+  // Responsive email CSS: proper mobile breakpoint + padding reduction
+  const RESPONSIVE_CSS = `<style>
+    @media only screen and (max-width: 600px) {
+      .email-pad { padding-left: 24px !important; padding-right: 24px !important; }
+      .email-pad-big { padding: 36px 24px 8px !important; }
+      .email-h1 { font-size: 32px !important; }
+      .email-cta { padding-left: 24px !important; padding-right: 24px !important; }
+    }
+  </style>`;
 
   const templates = {
     welcome: {
-      subject: data?.isFree ? 'Welcome to PEAK — your free plan is ready' : 'Welcome to PEAK — your plan is ready',
-      html: emailShell(`
+      subject: L.welcomeSubject(data?.isFree),
+      html: emailShell(RESPONSIVE_CSS + `
         <tr><td>${emailHeader()}</td></tr>
-        <tr><td style="padding:48px 40px 8px;">
-          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">Welcome${name ? ', ' + name : ''}</p>
-          <h1 style="margin:0 0 20px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
-            Your plan is<br>live.
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.welcomeLabel(name)}</p>
+          <h1 class="email-h1" style="margin:0 0 14px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${L.welcomeH1a}<br>${data?.isFree ? L.welcomeH1FreeB : L.welcomeH1b}
           </h1>
+          ${goalHeadline ? `<p style="margin:0 0 18px;font-family:${FONT_HEAD};font-size:13px;font-weight:700;letter-spacing:2px;color:${BRAND.red};text-transform:uppercase;">🎯 ${goalHeadline}</p>` : ''}
           <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
-            System over motivation. This is where it starts — your AI-built nutrition${data?.isFree ? '' : ', training'} and recovery protocol, tuned to your goal.
+            ${L.welcomeIntro(data?.isFree, goal, sport)}
           </p>
         </td></tr>
 
-        <tr><td style="padding:0 40px 8px;">
+        <tr><td class="email-pad" style="padding:0 40px 8px;">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:1px solid ${BRAND.border};">
             <tr><td style="padding:24px 0 8px;">
-              <p style="margin:0 0 16px;font-family:${FONT_HEAD};font-size:11px;font-weight:900;letter-spacing:3px;color:${BRAND.ink};text-transform:uppercase;">${data?.isFree ? 'Your free plan includes' : 'Inside PEAK'}</p>
+              <p style="margin:0 0 16px;font-family:${FONT_HEAD};font-size:11px;font-weight:900;letter-spacing:3px;color:${BRAND.ink};text-transform:uppercase;">${data?.isFree ? L.includesFree : L.includesPaid}</p>
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;AI nutrition plan, matched to your goal and taste
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${L.f1(sport)}
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? '1-week training preview for your sport' : 'Personalised programme for your sport'}
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? L.f2Free(sport) : L.f2Paid(sport)}
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? 'Up to 3 plan regenerations' : 'Recovery protocol — sleep, hydration, stress'}
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? L.f3Free : L.f3Paid}
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:24px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? 'Upgrade anytime for full access' : 'Barcode scanner and shopping mode'}
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? L.f4Free : L.f4Paid}
             </td></tr>
           </table>
         </td></tr>
 
-        <tr><td style="padding:8px 40px 36px;">
+        <tr><td class="email-pad" style="padding:8px 40px 28px;">
+          <p style="margin:0 0 14px;font-family:${FONT_HEAD};font-size:11px;font-weight:900;letter-spacing:3px;color:${BRAND.ink};text-transform:uppercase;">${L.stepsTitle}</p>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+            <tr><td style="padding:8px 0;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+                <td valign="top" style="padding-right:12px;">
+                  <div style="width:24px;height:24px;background:${BRAND.red};color:${BRAND.white};font-family:${FONT_HEAD};font-weight:900;font-size:13px;text-align:center;line-height:24px;">1</div>
+                </td>
+                <td style="font-family:${FONT_BODY};font-size:14px;line-height:1.5;color:${BRAND.ink2};padding-top:2px;">${L.step1}</td>
+              </tr></table>
+            </td></tr>
+            <tr><td style="padding:8px 0;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+                <td valign="top" style="padding-right:12px;">
+                  <div style="width:24px;height:24px;background:${BRAND.red};color:${BRAND.white};font-family:${FONT_HEAD};font-weight:900;font-size:13px;text-align:center;line-height:24px;">2</div>
+                </td>
+                <td style="font-family:${FONT_BODY};font-size:14px;line-height:1.5;color:${BRAND.ink2};padding-top:2px;">${data?.isFree ? L.step2Free : L.step2Paid}</td>
+              </tr></table>
+            </td></tr>
+            <tr><td style="padding:8px 0;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+                <td valign="top" style="padding-right:12px;">
+                  <div style="width:24px;height:24px;background:${BRAND.red};color:${BRAND.white};font-family:${FONT_HEAD};font-weight:900;font-size:13px;text-align:center;line-height:24px;">3</div>
+                </td>
+                <td style="font-family:${FONT_BODY};font-size:14px;line-height:1.5;color:${BRAND.ink2};padding-top:2px;">${data?.isFree ? L.step3Free : L.step3Paid}</td>
+              </tr></table>
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td class="email-pad" style="padding:8px 40px 36px;">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};">
             <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
-              ${data?.isFree
-                ? `<strong style="color:${BRAND.ink};">Free plan.</strong> No card, no charge. Upgrade any time for unlimited plans, full training progression and recovery tools.`
-                : `<strong style="color:${BRAND.ink};">7-day free trial.</strong> No charge until Day 8. We'll remind you on Day 5 and Day 6.`}
+              ${data?.isFree ? L.boxFree : L.boxPaid}
             </td></tr>
           </table>
         </td></tr>
 
-        <tr><td align="center" style="padding:0 40px 56px;">
-          ${emailButton(data?.magicLink || FRONTEND_URL, 'Open my plan')}
+        <tr><td class="email-cta" align="center" style="padding:0 40px 56px;">
+          ${emailButton(data?.magicLink || FRONTEND_URL, L.ctaOpen)}
         </td></tr>
 
         <tr><td>${emailFooter(to)}</td></tr>
@@ -1308,26 +1485,26 @@ async function sendEmail(to, type, data) {
     },
 
     day5: {
-      subject: 'Two days left on your PEAK trial',
-      html: emailShell(`
+      subject: L.day5Subject,
+      html: emailShell(RESPONSIVE_CSS + `
         <tr><td>${emailHeader()}</td></tr>
-        <tr><td style="padding:48px 40px 8px;">
-          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">48 hours left</p>
-          <h1 style="margin:0 0 20px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
-            ${name ? name + ',<br>' : ''}your trial<br>ends soon.
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.day5Label}</p>
+          <h1 class="email-h1" style="margin:0 0 20px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${L.day5H1(name)}
           </h1>
           <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
-            Two days remain on your free 7-day trial. Your nutrition plan, training programme and recovery protocol will pause unless you continue.
+            ${L.day5Body(sport, goal)}
           </p>
         </td></tr>
 
-        <tr><td align="center" style="padding:0 40px 24px;">
-          ${emailButton(FRONTEND_URL, 'Continue my journey')}
+        <tr><td class="email-cta" align="center" style="padding:0 40px 24px;">
+          ${emailButton(FRONTEND_URL, L.day5CTA)}
         </td></tr>
 
-        <tr><td style="padding:0 40px 48px;">
+        <tr><td class="email-pad" style="padding:0 40px 48px;">
           <p style="margin:0;font-family:${FONT_BODY};font-size:12px;line-height:1.6;color:${BRAND.faint};text-align:center;">
-            To cancel: open PEAK → Settings → Subscription → Cancel. 10 seconds, no phone calls.
+            ${L.day5Cancel}
           </p>
         </td></tr>
 
@@ -1336,27 +1513,27 @@ async function sendEmail(to, type, data) {
     },
 
     day6: {
-      subject: 'Final day — your PEAK trial ends tomorrow',
-      html: emailShell(`
+      subject: L.day6Subject,
+      html: emailShell(RESPONSIVE_CSS + `
         <tr><td>${emailHeader()}</td></tr>
-        <tr><td style="padding:48px 40px 8px;">
-          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">Final 24 hours</p>
-          <h1 style="margin:0 0 20px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
-            ${name ? name + ',<br>' : ''}tomorrow<br>it begins.
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.day6Label}</p>
+          <h1 class="email-h1" style="margin:0 0 20px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${L.day6H1(name)}
           </h1>
           <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
-            Your free trial ends tomorrow. Your PEAK subscription begins automatically — no action needed to continue.
+            ${L.day6Body}
           </p>
 
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};margin-bottom:32px;">
             <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
-              <strong style="color:${BRAND.ink};">To cancel:</strong> Open PEAK → Settings → Subscription → Cancel trial. Done in 10 seconds.
+              ${L.day6Box}
             </td></tr>
           </table>
         </td></tr>
 
-        <tr><td align="center" style="padding:0 40px 56px;">
-          ${emailButton(FRONTEND_URL, 'Keep my plan')}
+        <tr><td class="email-cta" align="center" style="padding:0 40px 56px;">
+          ${emailButton(FRONTEND_URL, L.day6CTA)}
         </td></tr>
 
         <tr><td>${emailFooter(to)}</td></tr>
@@ -1368,12 +1545,11 @@ async function sendEmail(to, type, data) {
   if (!tmpl) return;
   try {
     await resend.emails.send({ from: FROM_EMAIL, to, subject: tmpl.subject, html: tmpl.html });
-    console.log(`📧 ${type} → ${to}`);
+    console.log(`📧 ${type} → ${to} (${lang})`);
   } catch (err) {
     console.error(`Email error:`, err.message);
   }
 }
-
 // ── CRON ──────────────────────────────────────────────────────────────
 cron.schedule('0 10 * * *', async () => {
   const now = new Date();
