@@ -301,7 +301,39 @@ app.post('/auth/signup-free', async (req, res) => {
       consent_at: consentAt,
     };
 
-    const { error: upsertErr } = await supabase.from('users').upsert(userRow, { onConflict: 'id' });
+    // Before upsert: check if a profile already exists for this auth id.
+    // If yes AND it's already on a paid tier, abort — return existing state.
+    try {
+      const { data: prior } = await supabase
+        .from('users')
+        .select('tier, stripe_subscription_id')
+        .eq('id', authUserId)
+        .maybeSingle();
+      if (prior && (prior.stripe_subscription_id || (prior.tier && prior.tier !== 'free'))) {
+        console.warn(`⚠️  Free signup attempted for existing paid user: ${normalizedEmail}. Sending login link instead.`);
+        const { data: linkData } = await supabase.auth.admin.generateLink({
+          type: 'magiclink',
+          email: normalizedEmail,
+          options: { redirectTo: `${FRONTEND_URL}/` },
+        });
+        const magicLink = linkData?.properties?.action_link;
+        if (magicLink) {
+          await resend.emails.send({
+            from: FROM_EMAIL,
+            to: normalizedEmail,
+            subject: 'Your PEAK login link',
+            html: `<div style="font-family:Arial,sans-serif;max-width:500px;margin:40px auto;padding:30px;background:#fff;"><h2 style="color:#0E0E0E;font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;">YOUR LOGIN LINK</h2><p style="color:#333;line-height:1.6;">You already have a PEAK account. Click below to sign in.</p><p style="margin:24px 0;"><a href="${magicLink}" style="display:inline-block;background:#E8001A;color:#fff;padding:14px 28px;text-decoration:none;font-weight:700;letter-spacing:2px;text-transform:uppercase;">Sign in</a></p><p style="color:#888;font-size:12px;">This link expires in 1 hour.</p></div>`,
+          });
+        }
+        return res.json({ success: true, existing: true });
+      }
+    } catch (e) {
+      console.warn('Prior-profile check failed:', e.message);
+    }
+
+    const { error: upsertErr } = await supabase.from('users').upsert(userRow, {
+      onConflict: 'id',
+    });
     if (upsertErr) {
       console.error('❌ Free user upsert failed:', upsertErr.message);
       return res.status(500).json({ error: upsertErr.message });
@@ -975,6 +1007,7 @@ app.post('/webhook', async (req, res) => {
         goals: parsedGoals,
         sport: meta.userSport || '',
         lang: (meta.userLang === 'de' || meta.userLang === 'en') ? meta.userLang : 'en',
+        plan_generations_used: 0, // Reset usage counter on paid subscription
         trial_start: new Date().toISOString(),
         trial_end: trialEnd.toISOString(),
         status: 'trial',
