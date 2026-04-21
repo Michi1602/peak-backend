@@ -288,6 +288,7 @@ app.post('/auth/signup-free', async (req, res) => {
       plan: 'free',
       tier: 'free',
       goal: userData?.goal || '',
+      goals: Array.isArray(userData?.goals) && userData.goals.length ? userData.goals : (userData?.goal ? [userData.goal] : []),
       sport: userData?.sport || '',
       trial_start: null,
       trial_end: null,
@@ -497,9 +498,13 @@ app.post('/create-checkout', async (req, res) => {
     }
 
     const consentAt = consent.at || new Date().toISOString();
+    const goalsArr = Array.isArray(userData?.goals) && userData.goals.length
+      ? userData.goals
+      : (userData?.goal ? [userData.goal] : []);
     const sharedMetadata = {
       userName: userData?.name || '',
       userGoal: userData?.goal || '',
+      userGoals: JSON.stringify(goalsArr).slice(0, 450), // Stripe metadata values max 500 chars
       userSport: userData?.sport || '',
       plan: normalizedPlan,
       tier: normalizedTier,
@@ -762,7 +767,7 @@ app.post('/user/update-profile', async (req, res) => {
       'name','age','gender','weight','dweight','height','sleep',
       'job','commute','stress',
       'sport','level','sessions','dur','equip',
-      'al','di','cu','cook','budget','goal',
+      'al','di','cu','cook','budget','goal','goals',
     ];
     const updates = {};
     for (const k of ALLOWED) {
@@ -945,6 +950,13 @@ app.post('/webhook', async (req, res) => {
       }
 
       // ── STEP 2: Upsert profile row in public.users, keyed by auth id ──
+      let parsedGoals = [];
+      try {
+        if (meta.userGoals) parsedGoals = JSON.parse(meta.userGoals);
+        if (!Array.isArray(parsedGoals)) parsedGoals = [];
+      } catch (_) { parsedGoals = []; }
+      if (parsedGoals.length === 0 && meta.userGoal) parsedGoals = [meta.userGoal];
+
       const userRow = {
         id: authUserId,
         email,
@@ -954,6 +966,7 @@ app.post('/webhook', async (req, res) => {
         plan: meta.plan || 'monthly',
         tier: meta.tier === 'basic' ? 'basic' : 'premium',
         goal: meta.userGoal || '',
+        goals: parsedGoals,
         sport: meta.userSport || '',
         trial_start: new Date().toISOString(),
         trial_end: trialEnd.toISOString(),
