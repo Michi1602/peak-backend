@@ -470,6 +470,79 @@ app.post('/user/update-profile', async (req, res) => {
   }
 });
 
+// ── TRAINING STATE (auth-protected) ────────────────────────────────────
+// GET: load user's training progress (completed sessions, feedback, week)
+app.get('/user/training-state', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    const { data, error } = await supabase
+      .from('users')
+      .select('training_state')
+      .eq('id', userData.user.id)
+      .maybeSingle();
+
+    if (error) {
+      console.error('❌ training-state GET failed:', error.message);
+      return res.status(500).json({ error: 'Failed to load training state' });
+    }
+
+    res.json({ training_state: data?.training_state || null });
+  } catch (err) {
+    console.error('❌ /user/training-state GET error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST: save training state (upserts entire blob)
+app.post('/user/training-state', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    const ts = req.body.training_state;
+    if (!ts || typeof ts !== 'object') {
+      return res.status(400).json({ error: 'training_state must be an object' });
+    }
+
+    // Basic shape validation
+    const cleaned = {
+      completed: ts.completed && typeof ts.completed === 'object' ? ts.completed : {},
+      feedback: ts.feedback && typeof ts.feedback === 'object' ? ts.feedback : {},
+      currentWeek: Number.isFinite(ts.currentWeek) ? Math.max(1, Math.min(12, ts.currentWeek)) : 1
+    };
+
+    const { error } = await supabase
+      .from('users')
+      .update({ training_state: cleaned, updated_at: new Date().toISOString() })
+      .eq('id', userData.user.id);
+
+    if (error) {
+      console.error('❌ training-state POST failed:', error.message);
+      return res.status(500).json({ error: 'Failed to save training state' });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('❌ /user/training-state POST error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // ── WEBHOOK ───────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
