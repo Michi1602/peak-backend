@@ -1607,7 +1607,7 @@ app.post('/webhook', async (req, res) => {
               status: 'blocked_voucher_abuse',
               tier: 'free',
               stripe_subscription_id: null,
-              trial_ends_at: null,
+              trial_end: null,
             }).eq('email', email);
             console.log(`🔒 User downgraded to free + blocked: ${email}`);
           } catch (err) {
@@ -1654,7 +1654,7 @@ app.post('/webhook', async (req, res) => {
           status: newStatus,
           tier: 'free',
           stripe_subscription_id: null,
-          trial_ends_at: null,
+          trial_end: null,
         }).eq('email', email);
         if (error) console.error('❌ Supabase update (cancelled) failed:', error.message);
         else console.log(`✅ User cancelled + downgraded to free: ${email}`);
