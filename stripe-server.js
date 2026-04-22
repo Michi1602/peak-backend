@@ -303,6 +303,7 @@ app.post('/auth/signup-free', async (req, res) => {
       status: 'free_active',
       unsubscribed: false,
       plan_generations_used: 0,
+      plan_generations_window_start: new Date().toISOString(),
       consent_health_data: true,
       consent_terms: true,
       consent_at: consentAt,
@@ -431,37 +432,72 @@ app.post('/ai/generate', async (req, res) => {
       } catch (_) { /* ignore, treat as anonymous onboarding */ }
     }
 
-    // ─── FREE TIER CAP: plan-generation is limited to 3 total ──────────
-    // Only enforced when purpose === 'plan_generation' AND user is authenticated
-    // AND user is on free tier. Other purposes (training_enrich, adjustment)
-    // are NOT counted (internal follow-up calls).
+    // ─── MONTHLY PLAN-GENERATION LIMITS ───────────────────────────────
+    // Only enforced when purpose === 'plan_generation' AND user is authenticated.
+    // Other purposes (training_enrich, adjustment) are NOT counted (internal
+    // follow-up calls).
+    //
+    // Limits per tier (rolling 30-day window):
+    //   free    → 1 plan generation / 30 days
+    //   basic   → 5 plan generations / 30 days
+    //   premium → unlimited
+    //
+    // Window resets when 30 days pass since plan_generations_window_start.
     if (purpose === 'plan_generation' && authUserId) {
       try {
         const { data: profile } = await supabase
           .from('users')
-          .select('tier, plan_generations_used')
+          .select('tier, plan_generations_used, plan_generations_window_start')
           .eq('id', authUserId)
           .maybeSingle();
-        if (profile?.tier === 'free') {
-          const used = profile.plan_generations_used || 0;
-          if (used >= 3) {
-            console.log(`🔒 Free-tier cap hit for ${userEmail} (used=${used})`);
+
+        const tier = profile?.tier || 'free';
+        const LIMITS = { free: 1, basic: 5, premium: Infinity };
+        const limit = LIMITS[tier] != null ? LIMITS[tier] : 0;
+
+        if (limit !== Infinity) {
+          // Check + roll window if needed
+          const now = new Date();
+          let windowStart = profile?.plan_generations_window_start
+            ? new Date(profile.plan_generations_window_start)
+            : null;
+          let used = profile?.plan_generations_used || 0;
+          const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+          const isExpired = !windowStart || (now - windowStart) > THIRTY_DAYS_MS;
+
+          if (isExpired) {
+            // Reset window
+            windowStart = now;
+            used = 0;
+          }
+
+          if (used >= limit) {
+            const resetAt = new Date(windowStart.getTime() + THIRTY_DAYS_MS);
+            const daysLeft = Math.max(1, Math.ceil((resetAt - now) / (24 * 60 * 60 * 1000)));
+            console.log(`🔒 ${tier}-tier monthly cap hit for ${userEmail} (used=${used}/${limit}, reset in ${daysLeft}d)`);
             return res.status(402).json({
-              error: 'Free plan limit reached',
+              error: 'Monthly plan limit reached',
               code: 'FREE_LIMIT_REACHED',
+              tier,
               used,
-              max: 3,
+              max: limit,
+              daysUntilReset: daysLeft,
+              resetAt: resetAt.toISOString(),
             });
           }
-          // Increment counter (we increment BEFORE the call to avoid abuse via error retries)
+
+          // Increment BEFORE the call (prevents abuse via retries)
           await supabase
             .from('users')
-            .update({ plan_generations_used: used + 1 })
+            .update({
+              plan_generations_used: used + 1,
+              plan_generations_window_start: windowStart.toISOString(),
+            })
             .eq('id', authUserId);
-          console.log(`📊 Free user ${userEmail}: plan_generations ${used+1}/3`);
+          console.log(`📊 ${tier} user ${userEmail}: plan_generations ${used+1}/${limit}`);
         }
       } catch (e) {
-        console.warn('Free-tier cap check failed (fail-open):', e.message);
+        console.warn('Plan-gen cap check failed (fail-open):', e.message);
       }
     }
 
@@ -1086,6 +1122,7 @@ app.post('/webhook', async (req, res) => {
         sport: meta.userSport || '',
         lang: (meta.userLang === 'de' || meta.userLang === 'en') ? meta.userLang : 'en',
         plan_generations_used: 0, // Reset usage counter on paid subscription
+        plan_generations_window_start: new Date().toISOString(), // New window starts now
         trial_start: new Date().toISOString(),
         trial_end: trialEnd.toISOString(),
         status: 'trial',
