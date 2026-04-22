@@ -1655,9 +1655,67 @@ app.post('/webhook', async (req, res) => {
           tier: 'free',
           stripe_subscription_id: null,
           trial_end: null,
+          cancel_at: null,
         }).eq('email', email);
         if (error) console.error('❌ Supabase update (cancelled) failed:', error.message);
         else console.log(`✅ User cancelled + downgraded to free: ${email}`);
+
+        // Email C: Final — subscription has actually ended
+        // Skip if user was abuse-blocked (they shouldn't get win-back mails)
+        if (newStatus !== 'blocked_voucher_abuse') {
+          try {
+            await sendEmail(email, 'cancellation_final', {});
+            console.log(`📧 Cancellation final → ${email}`);
+          } catch (err) {
+            console.error('⚠️  cancellation_final email failed:', err.message);
+          }
+        }
+      }
+    } else if (event.type === 'customer.subscription.updated') {
+      // Detect when user initiates cancellation at period end
+      const sub = event.data.object;
+      const prev = event.data.previous_attributes || {};
+      const nowCancelling = sub.cancel_at_period_end === true;
+      const wasCancelling = prev.cancel_at_period_end === true;
+      const wasReactivated = wasCancelling && !nowCancelling;
+      const justCancelled = nowCancelling && !wasCancelling;
+
+      if (justCancelled || wasReactivated) {
+        let email = null;
+        try {
+          const customer = await stripe.customers.retrieve(sub.customer);
+          email = customer.email;
+        } catch (err) {
+          console.error('❌ Could not fetch customer for sub.updated:', err.message);
+        }
+        if (email && justCancelled) {
+          // Email A: Cancellation confirmed — premium continues until period end
+          const periodEnd = sub.cancel_at || sub.current_period_end;
+          const endDate = periodEnd ? new Date(periodEnd * 1000) : null;
+          // Mark in DB as pending cancellation + store end date for reminder cron
+          await supabase.from('users').update({
+            status: 'cancelling',
+            cancel_at: endDate ? endDate.toISOString() : null,
+          }).eq('email', email);
+
+          try {
+            const endDateStr = endDate
+              ? endDate.toLocaleDateString('de-DE', { day: '2-digit', month: 'long', year: 'numeric' })
+              : '';
+            await sendEmail(email, 'cancellation_confirmed', { endDate: endDateStr });
+            console.log(`📧 Cancellation confirmed → ${email} (ends ${endDateStr})`);
+          } catch (err) {
+            console.error('⚠️  cancellation_confirmed email failed:', err.message);
+          }
+        }
+        if (email && wasReactivated) {
+          // User clicked "Don't cancel" in portal → restore status
+          await supabase.from('users').update({
+            status: 'active',
+            cancel_at: null,
+          }).eq('email', email);
+          console.log(`✅ User un-cancelled (reactivated): ${email}`);
+        }
       }
     } else if (event.type === 'invoice.payment_succeeded') {
       const invoice = event.data.object;
@@ -1972,6 +2030,33 @@ async function sendEmail(to, type, data) {
     day6Body: 'Deine kostenlose Testphase endet morgen. Dein PEAK-Abo startet automatisch — du musst nichts tun, um weiterzumachen.',
     day6Box: '<strong>Kündigen:</strong> PEAK öffnen → Einstellungen → Abonnement → Testphase beenden. In 10 Sekunden erledigt.',
     day6CTA: 'Plan behalten',
+    // ── CANCELLATION EMAILS (DE) ──
+    cancelConfirmedSubject: 'Deine PEAK-Kündigung ist bestätigt',
+    cancelConfirmedLabel: 'Kündigung bestätigt',
+    cancelConfirmedH1a: 'Schade,',
+    cancelConfirmedH1b: 'dass du gehst.',
+    cancelConfirmedBody: (endDate) => `Deine Kündigung wurde registriert. Dein Premium-Zugang bleibt bis zum <strong>${endDate}</strong> aktiv — dann wird dein Account automatisch auf den Free-Plan umgestellt.`,
+    cancelConfirmedNote: 'Bis dahin kannst du PEAK in vollem Umfang nutzen. Deine Daten, Pläne und Fortschritte bleiben erhalten.',
+    cancelConfirmedReactivateBox: '<strong>Wieder aktivieren?</strong> Kein Problem — öffne einfach PEAK und wähle einen Plan. Dein Profil ist gespeichert.',
+    cancelConfirmedCTA: 'PEAK öffnen',
+    cancelReminderSubject: (days) => days === 3 ? 'Dein Premium endet in 3 Tagen' : 'Dein Premium endet bald',
+    cancelReminderLabel: (days) => `Noch ${days} Tage Premium`,
+    cancelReminderH1a: 'Nutze deine',
+    cancelReminderH1b: 'letzten Tage.',
+    cancelReminderBody: (endDate) => `Am <strong>${endDate}</strong> endet dein Premium-Zugang. Bis dahin: volle Power — Pläne anpassen, Workouts tracken, Rezepte checken.`,
+    cancelReminderBox: '💡 <strong>Noch nicht sicher?</strong> Du kannst jederzeit zurückkehren — dein Profil und deine Fortschritte bleiben 30 Tage erhalten.',
+    cancelReminderCTA: 'Jetzt PEAK nutzen',
+    cancelFinalSubject: 'Dein PEAK Premium ist beendet',
+    cancelFinalLabel: 'Premium beendet',
+    cancelFinalH1a: 'Jetzt bist du',
+    cancelFinalH1b: 'auf Free.',
+    cancelFinalBody: 'Dein Premium-Abo ist heute ausgelaufen. Du kannst PEAK weiter kostenlos nutzen — mit eingeschränktem Funktionsumfang.',
+    cancelFinalIncludesTitle: 'Mit Free hast du weiterhin:',
+    cancelFinalF1: 'Dein Basis-Ernährungsplan',
+    cancelFinalF2: 'Dein Basis-Trainingsplan',
+    cancelFinalF3: '1 Plan-Generierung pro 30 Tage',
+    cancelFinalReactivate: 'Premium vermissen? Upgrade ist jederzeit möglich — dein Profil ist gespeichert.',
+    cancelFinalCTA: 'Premium zurückholen',
   } : {
     welcomeSubject: (isFree) => isFree ? 'Welcome to PEAK — your free plan is ready' : 'Welcome to PEAK — your plan is ready',
     welcomeLabel: (n) => 'Welcome' + (n ? ', ' + n : ''),
@@ -2019,6 +2104,33 @@ async function sendEmail(to, type, data) {
     day6Body: 'Your free trial ends tomorrow. Your PEAK subscription begins automatically — no action needed to continue.',
     day6Box: '<strong>To cancel:</strong> Open PEAK → Settings → Subscription → Cancel trial. Done in 10 seconds.',
     day6CTA: 'Keep my plan',
+    // ── CANCELLATION EMAILS (EN) ──
+    cancelConfirmedSubject: 'Your PEAK cancellation is confirmed',
+    cancelConfirmedLabel: 'Cancellation confirmed',
+    cancelConfirmedH1a: 'Sorry to',
+    cancelConfirmedH1b: 'see you go.',
+    cancelConfirmedBody: (endDate) => `Your cancellation has been processed. Your Premium access remains active until <strong>${endDate}</strong> — then your account switches to the Free plan automatically.`,
+    cancelConfirmedNote: 'Until then, use PEAK to the fullest. Your data, plans and progress are safe.',
+    cancelConfirmedReactivateBox: '<strong>Changed your mind?</strong> No problem — open PEAK and pick a plan. Your profile is saved.',
+    cancelConfirmedCTA: 'Open PEAK',
+    cancelReminderSubject: (days) => days === 3 ? 'Your Premium ends in 3 days' : 'Your Premium ends soon',
+    cancelReminderLabel: (days) => `${days} days of Premium left`,
+    cancelReminderH1a: 'Use your',
+    cancelReminderH1b: 'final days.',
+    cancelReminderBody: (endDate) => `Your Premium access ends on <strong>${endDate}</strong>. Until then: full power — tune plans, track workouts, check recipes.`,
+    cancelReminderBox: '💡 <strong>Still deciding?</strong> You can come back anytime — your profile and progress are kept for 30 days.',
+    cancelReminderCTA: 'Use PEAK now',
+    cancelFinalSubject: 'Your PEAK Premium has ended',
+    cancelFinalLabel: 'Premium ended',
+    cancelFinalH1a: 'You\'re now',
+    cancelFinalH1b: 'on Free.',
+    cancelFinalBody: 'Your Premium subscription ended today. You can keep using PEAK for free — with a reduced feature set.',
+    cancelFinalIncludesTitle: 'With Free you still get:',
+    cancelFinalF1: 'Your basic nutrition plan',
+    cancelFinalF2: 'Your basic training plan',
+    cancelFinalF3: '1 plan generation every 30 days',
+    cancelFinalReactivate: 'Missing Premium? You can upgrade anytime — your profile is saved.',
+    cancelFinalCTA: 'Bring back Premium',
   };
 
   // Responsive email CSS: proper mobile breakpoint + padding reduction
@@ -2167,6 +2279,113 @@ async function sendEmail(to, type, data) {
 
         <tr><td>${emailFooter(to)}</td></tr>
       `)
+    },
+
+    // ── CANCELLATION EMAIL A: Confirmed (sent immediately) ──
+    cancellation_confirmed: {
+      subject: L.cancelConfirmedSubject,
+      html: emailShell(RESPONSIVE_CSS + `
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.cancelConfirmedLabel}</p>
+          <h1 class="email-h1" style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${L.cancelConfirmedH1a}<br>${L.cancelConfirmedH1b}
+          </h1>
+          <p style="margin:0 0 24px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            ${L.cancelConfirmedBody(data?.endDate || '')}
+          </p>
+          <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:14px;line-height:1.65;color:${BRAND.ink2};">
+            ${L.cancelConfirmedNote}
+          </p>
+
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};margin-bottom:32px;">
+            <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
+              ${L.cancelConfirmedReactivateBox}
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td class="email-cta" align="center" style="padding:0 40px 56px;">
+          ${emailButton(FRONTEND_URL, L.cancelConfirmedCTA)}
+        </td></tr>
+
+        <tr><td>${emailFooter(to)}</td></tr>
+      `)
+    },
+
+    // ── CANCELLATION EMAIL B: Reminder (3 days before end) ──
+    cancellation_reminder: {
+      subject: L.cancelReminderSubject(data?.daysLeft || 3),
+      html: emailShell(RESPONSIVE_CSS + `
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.cancelReminderLabel(data?.daysLeft || 3)}</p>
+          <h1 class="email-h1" style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${L.cancelReminderH1a}<br>${L.cancelReminderH1b}
+          </h1>
+          <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            ${L.cancelReminderBody(data?.endDate || '')}
+          </p>
+
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};margin-bottom:32px;">
+            <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
+              ${L.cancelReminderBox}
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td class="email-cta" align="center" style="padding:0 40px 56px;">
+          ${emailButton(FRONTEND_URL, L.cancelReminderCTA)}
+        </td></tr>
+
+        <tr><td>${emailFooter(to)}</td></tr>
+      `)
+    },
+
+    // ── CANCELLATION EMAIL C: Final (when subscription actually ends) ──
+    cancellation_final: {
+      subject: L.cancelFinalSubject,
+      html: emailShell(RESPONSIVE_CSS + `
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.cancelFinalLabel}</p>
+          <h1 class="email-h1" style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${L.cancelFinalH1a}<br>${L.cancelFinalH1b}
+          </h1>
+          <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            ${L.cancelFinalBody}
+          </p>
+        </td></tr>
+
+        <tr><td class="email-pad" style="padding:0 40px 8px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:1px solid ${BRAND.border};">
+            <tr><td style="padding:24px 0 8px;">
+              <p style="margin:0 0 16px;font-family:${FONT_HEAD};font-size:11px;font-weight:900;letter-spacing:3px;color:${BRAND.ink};text-transform:uppercase;">${L.cancelFinalIncludesTitle}</p>
+            </td></tr>
+            <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${L.cancelFinalF1}
+            </td></tr>
+            <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${L.cancelFinalF2}
+            </td></tr>
+            <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:24px;">
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${L.cancelFinalF3}
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td class="email-pad" style="padding:8px 40px 24px;">
+          <p style="margin:0;font-family:${FONT_BODY};font-size:14px;line-height:1.65;color:${BRAND.ink2};">
+            ${L.cancelFinalReactivate}
+          </p>
+        </td></tr>
+
+        <tr><td class="email-cta" align="center" style="padding:0 40px 56px;">
+          ${emailButton(FRONTEND_URL, L.cancelFinalCTA)}
+        </td></tr>
+
+        <tr><td>${emailFooter(to)}</td></tr>
+      `)
     }
   };
 
@@ -2180,13 +2399,55 @@ async function sendEmail(to, type, data) {
   }
 }
 // ── CRON ──────────────────────────────────────────────────────────────
+// Runs daily at 10:00 UTC. Handles:
+//   1. Trial day-5 + day-6 reminders (existing)
+//   2. Cancellation 3-day reminder (new) — users with status='cancelling' whose
+//      cancel_at is ~3 days away get Email B (win-back opportunity)
 cron.schedule('0 10 * * *', async () => {
   const now = new Date();
-  const { data: users } = await supabase.from('users').select('*').eq('status', 'trial').eq('unsubscribed', false);
-  for (const user of users || []) {
-    const daysLeft = Math.ceil((new Date(user.trial_end) - now) / (1000 * 60 * 60 * 24));
-    if (daysLeft === 2) await sendEmail(user.email, 'day5', { name: user.name });
-    else if (daysLeft === 1) await sendEmail(user.email, 'day6', { name: user.name });
+
+  // ── 1. TRIAL REMINDERS ──
+  try {
+    const { data: trialUsers } = await supabase
+      .from('users')
+      .select('*')
+      .eq('status', 'trial')
+      .eq('unsubscribed', false);
+    for (const user of trialUsers || []) {
+      if (!user.trial_end) continue;
+      const daysLeft = Math.ceil((new Date(user.trial_end) - now) / (1000 * 60 * 60 * 24));
+      if (daysLeft === 2) await sendEmail(user.email, 'day5', { name: user.name });
+      else if (daysLeft === 1) await sendEmail(user.email, 'day6', { name: user.name });
+    }
+  } catch (err) {
+    console.error('❌ Trial reminder cron error:', err.message);
+  }
+
+  // ── 2. CANCELLATION REMINDERS ──
+  try {
+    const { data: cancellingUsers } = await supabase
+      .from('users')
+      .select('*')
+      .eq('status', 'cancelling')
+      .eq('unsubscribed', false);
+    for (const user of cancellingUsers || []) {
+      if (!user.cancel_at) continue;
+      const daysLeft = Math.ceil((new Date(user.cancel_at) - now) / (1000 * 60 * 60 * 24));
+      // Send reminder 3 days before end
+      if (daysLeft === 3) {
+        const endDateStr = new Date(user.cancel_at).toLocaleDateString(
+          user.lang === 'de' ? 'de-DE' : 'en-GB',
+          { day: '2-digit', month: 'long', year: 'numeric' }
+        );
+        await sendEmail(user.email, 'cancellation_reminder', {
+          daysLeft: 3,
+          endDate: endDateStr,
+        });
+        console.log(`📧 Cancellation reminder → ${user.email} (${daysLeft}d left)`);
+      }
+    }
+  } catch (err) {
+    console.error('❌ Cancellation reminder cron error:', err.message);
   }
 });
 
