@@ -290,6 +290,24 @@ app.post('/auth/signup-free', async (req, res) => {
       id: authUserId,
       email: normalizedEmail,
       name: userData?.name || '',
+      age: userData?.age ? parseInt(userData.age) : null,
+      gender: userData?.gender || null,
+      weight: userData?.weight ? parseFloat(userData.weight) : null,
+      dweight: userData?.dweight ? parseFloat(userData.dweight) : null,
+      height: userData?.height ? parseFloat(userData.height) : null,
+      sleep: userData?.sleep ? parseFloat(userData.sleep) : null,
+      job: userData?.job || null,
+      commute: userData?.commute || null,
+      stress: userData?.stress ? parseFloat(userData.stress) : null,
+      level: userData?.level || null,
+      sessions: userData?.sessions ? parseInt(userData.sessions) : null,
+      dur: userData?.dur ? parseInt(userData.dur) : null,
+      equip: userData?.equip || null,
+      al: Array.isArray(userData?.al) ? userData.al : [],
+      di: Array.isArray(userData?.di) ? userData.di : [],
+      cu: Array.isArray(userData?.cu) ? userData.cu : [],
+      cook: userData?.cook || null,
+      budget: userData?.budget ? parseFloat(userData.budget) : null,
       stripe_customer_id: null,
       stripe_subscription_id: null,
       plan: 'free',
@@ -652,12 +670,38 @@ app.post('/create-checkout', async (req, res) => {
     const goalsArr = Array.isArray(userData?.goals) && userData.goals.length
       ? userData.goals
       : (userData?.goal ? [userData.goal] : []);
+    // Pack full onboarding profile into two JSON metadata fields so the webhook
+    // can restore everything after payment. Stripe limit: 500 chars per metadata value.
+    const profileBio = JSON.stringify({
+      age: userData?.age || null,
+      gender: userData?.gender || null,
+      weight: userData?.weight || null,
+      dweight: userData?.dweight || null,
+      height: userData?.height || null,
+      sleep: userData?.sleep || null,
+      job: userData?.job || null,
+      commute: userData?.commute || null,
+      stress: userData?.stress || null,
+    }).slice(0, 480);
+    const profileTrain = JSON.stringify({
+      level: userData?.level || null,
+      sessions: userData?.sessions || null,
+      dur: userData?.dur || null,
+      equip: userData?.equip || null,
+      al: Array.isArray(userData?.al) ? userData.al : [],
+      di: Array.isArray(userData?.di) ? userData.di : [],
+      cu: Array.isArray(userData?.cu) ? userData.cu : [],
+      cook: userData?.cook || null,
+      budget: userData?.budget || null,
+    }).slice(0, 480);
     const sharedMetadata = {
       userName: userData?.name || '',
       userGoal: userData?.goal || '',
       userGoals: JSON.stringify(goalsArr).slice(0, 450), // Stripe metadata values max 500 chars
       userSport: userData?.sport || '',
       userLang: (lang === 'de' || lang === 'en') ? lang : '',
+      profileBio: profileBio,
+      profileTrain: profileTrain,
       plan: normalizedPlan,
       tier: normalizedTier,
       consentHealthData: 'true',
@@ -1109,10 +1153,63 @@ app.post('/webhook', async (req, res) => {
       } catch (_) { parsedGoals = []; }
       if (parsedGoals.length === 0 && meta.userGoal) parsedGoals = [meta.userGoal];
 
+      // Unpack profile metadata blobs (set in /create-checkout)
+      let bio = {};
+      let train = {};
+      try { if (meta.profileBio) bio = JSON.parse(meta.profileBio) || {}; } catch (_) {}
+      try { if (meta.profileTrain) train = JSON.parse(meta.profileTrain) || {}; } catch (_) {}
+
+      // If this user was previously Free, we want to PRESERVE their onboarding
+      // data rather than overwrite with empty fields. Load prior row, fall back
+      // to metadata values.
+      let prior = null;
+      try {
+        const { data } = await supabase
+          .from('users')
+          .select('age,gender,weight,dweight,height,sleep,job,commute,stress,level,sessions,dur,equip,al,di,cu,cook,budget')
+          .eq('id', authUserId)
+          .maybeSingle();
+        prior = data || null;
+      } catch (_) {}
+
+      const pickNum = (meta, prior, parser) => {
+        if (meta !== null && meta !== undefined && meta !== '') return parser(meta);
+        if (prior !== null && prior !== undefined) return prior;
+        return null;
+      };
+      const pickStr = (meta, prior) => {
+        if (meta) return meta;
+        if (prior) return prior;
+        return null;
+      };
+      const pickArr = (meta, prior) => {
+        if (Array.isArray(meta) && meta.length) return meta;
+        if (Array.isArray(prior) && prior.length) return prior;
+        return [];
+      };
+
       const userRow = {
         id: authUserId,
         email,
         name: meta.userName || '',
+        age: pickNum(bio.age, prior?.age, parseInt),
+        gender: pickStr(bio.gender, prior?.gender),
+        weight: pickNum(bio.weight, prior?.weight, parseFloat),
+        dweight: pickNum(bio.dweight, prior?.dweight, parseFloat),
+        height: pickNum(bio.height, prior?.height, parseFloat),
+        sleep: pickNum(bio.sleep, prior?.sleep, parseFloat),
+        job: pickStr(bio.job, prior?.job),
+        commute: pickStr(bio.commute, prior?.commute),
+        stress: pickNum(bio.stress, prior?.stress, parseFloat),
+        level: pickStr(train.level, prior?.level),
+        sessions: pickNum(train.sessions, prior?.sessions, parseInt),
+        dur: pickNum(train.dur, prior?.dur, parseInt),
+        equip: pickStr(train.equip, prior?.equip),
+        al: pickArr(train.al, prior?.al),
+        di: pickArr(train.di, prior?.di),
+        cu: pickArr(train.cu, prior?.cu),
+        cook: pickStr(train.cook, prior?.cook),
+        budget: pickNum(train.budget, prior?.budget, parseFloat),
         stripe_customer_id: session.customer || null,
         stripe_subscription_id: session.subscription || null,
         plan: meta.plan || 'monthly',
