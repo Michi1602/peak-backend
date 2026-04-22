@@ -169,7 +169,7 @@ app.post('/auth/check-email', async (req, res) => {
 // Called when user realizes they already have an account and wants to log in.
 app.post('/auth/send-login-link', async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, lang } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
 
     const { data, error } = await supabase.auth.admin.generateLink({
@@ -189,21 +189,27 @@ app.post('/auth/send-login-link', async (req, res) => {
       return res.status(500).json({ error: 'No link generated' });
     }
 
+    // Use user's language, or fall back to DB lookup, then 'en'
+    let emailLang = (lang === 'de' || lang === 'en') ? lang : null;
+    if (!emailLang) {
+      try {
+        const { data: user } = await supabase
+          .from('users')
+          .select('lang')
+          .eq('email', email.toLowerCase().trim())
+          .maybeSingle();
+        if (user?.lang === 'de' || user?.lang === 'en') emailLang = user.lang;
+      } catch (_) {}
+    }
+    const mail = buildMagicLinkEmail(magicLink, email, emailLang || 'en');
     await resend.emails.send({
       from: FROM_EMAIL,
       to: email,
-      subject: 'Your PEAK login link',
-      html: `
-        <div style="font-family:Arial,sans-serif;max-width:500px;margin:40px auto;padding:30px;background:#fff;">
-          <h2 style="color:#0E0E0E;font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;">YOUR LOGIN LINK</h2>
-          <p style="color:#333;line-height:1.6;">Click the button below to sign in to PEAK.</p>
-          <p style="margin:24px 0;"><a href="${magicLink}" style="display:inline-block;background:#E8001A;color:#fff;padding:14px 28px;text-decoration:none;font-weight:700;letter-spacing:2px;text-transform:uppercase;">Sign in</a></p>
-          <p style="color:#888;font-size:12px;">This link expires in 1 hour. If you didn't request this, you can ignore this email.</p>
-        </div>
-      `,
+      subject: mail.subject,
+      html: mail.html,
     });
 
-    console.log(`✅ Login link sent to ${email}`);
+    console.log(`✅ Login link sent to ${email} (${emailLang || 'en'})`);
     res.json({ success: true });
   } catch (err) {
     console.error('❌ send-login-link error:', err.message);
@@ -247,11 +253,12 @@ app.post('/auth/signup-free', async (req, res) => {
         });
         const magicLink = linkData?.properties?.action_link;
         if (magicLink) {
+          const mail = buildMagicLinkEmail(magicLink, normalizedEmail, lang === 'de' ? 'de' : 'en');
           await resend.emails.send({
             from: FROM_EMAIL,
             to: normalizedEmail,
-            subject: 'Your PEAK login link',
-            html: `<div style="font-family:Arial,sans-serif;max-width:500px;margin:40px auto;padding:30px;background:#fff;"><h2 style="color:#0E0E0E;font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;">YOUR LOGIN LINK</h2><p style="color:#333;line-height:1.6;">You already have a PEAK account. Click below to sign in.</p><p style="margin:24px 0;"><a href="${magicLink}" style="display:inline-block;background:#E8001A;color:#fff;padding:14px 28px;text-decoration:none;font-weight:700;letter-spacing:2px;text-transform:uppercase;">Sign in</a></p><p style="color:#888;font-size:12px;">This link expires in 1 hour.</p></div>`,
+            subject: mail.subject,
+            html: mail.html,
           });
         }
         return res.json({ success: true, existing: true });
@@ -318,11 +325,12 @@ app.post('/auth/signup-free', async (req, res) => {
         });
         const magicLink = linkData?.properties?.action_link;
         if (magicLink) {
+          const mail = buildMagicLinkEmail(magicLink, normalizedEmail, lang === 'de' ? 'de' : 'en');
           await resend.emails.send({
             from: FROM_EMAIL,
             to: normalizedEmail,
-            subject: 'Your PEAK login link',
-            html: `<div style="font-family:Arial,sans-serif;max-width:500px;margin:40px auto;padding:30px;background:#fff;"><h2 style="color:#0E0E0E;font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;">YOUR LOGIN LINK</h2><p style="color:#333;line-height:1.6;">You already have a PEAK account. Click below to sign in.</p><p style="margin:24px 0;"><a href="${magicLink}" style="display:inline-block;background:#E8001A;color:#fff;padding:14px 28px;text-decoration:none;font-weight:700;letter-spacing:2px;text-transform:uppercase;">Sign in</a></p><p style="color:#888;font-size:12px;">This link expires in 1 hour.</p></div>`,
+            subject: mail.subject,
+            html: mail.html,
           });
         }
         return res.json({ success: true, existing: true });
@@ -1250,6 +1258,49 @@ function emailFooter(email) {
       </td>
     </tr>
   </table>`;
+}
+
+// Branded magic-link email. Matches welcome-mail design. Bilingual via lang param.
+function buildMagicLinkEmail(magicLink, email, lang) {
+  const de = lang === 'de';
+  const L = {
+    subject: de ? 'Dein PEAK Login-Link' : 'Your PEAK login link',
+    label: de ? '🔐 Login-Link' : '🔐 Login link',
+    h1a: de ? 'DEIN LINK' : 'YOUR LINK',
+    h1b: de ? 'ZU PEAK' : 'TO PEAK',
+    intro: de
+      ? 'Klick den Button unten, um dich bei PEAK einzuloggen. Kein Passwort nötig.'
+      : 'Click the button below to sign in to PEAK. No password needed.',
+    cta: de ? 'Jetzt einloggen' : 'Sign in now',
+    expire: de
+      ? 'Dieser Link ist 1 Stunde gültig. Falls du diesen Login nicht angefordert hast, ignoriere diese E-Mail.'
+      : 'This link expires in 1 hour. If you didn\'t request this login, please ignore this email.',
+    fallback: de ? 'Funktioniert der Button nicht? Kopiere diesen Link in deinen Browser:' : 'Button not working? Copy this link into your browser:'
+  };
+  const html = emailShell(`
+    <tr><td>${emailHeader()}</td></tr>
+    <tr><td style="padding:48px 40px 8px;">
+      <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.label}</p>
+      <h1 style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+        ${L.h1a}<br>${L.h1b}
+      </h1>
+      <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">${L.intro}</p>
+    </td></tr>
+    <tr><td style="padding:0 40px 32px;">
+      ${emailButton(magicLink, L.cta)}
+    </td></tr>
+    <tr><td style="padding:0 40px 32px;">
+      <p style="margin:0 0 12px;font-family:${FONT_BODY};font-size:12px;line-height:1.6;color:${BRAND.faint};">${L.fallback}</p>
+      <p style="margin:0;font-family:${FONT_BODY};font-size:11px;line-height:1.5;color:${BRAND.dim};word-break:break-all;">
+        <a href="${magicLink}" style="color:${BRAND.red};text-decoration:underline;">${magicLink}</a>
+      </p>
+    </td></tr>
+    <tr><td style="padding:0 40px 40px;">
+      <p style="margin:0;font-family:${FONT_BODY};font-size:12px;line-height:1.6;color:${BRAND.faint};">${L.expire}</p>
+    </td></tr>
+    <tr><td>${emailFooter(email)}</td></tr>
+  `);
+  return { subject: L.subject, html };
 }
 
 // Shared wrapper — produces a full valid HTML email document
