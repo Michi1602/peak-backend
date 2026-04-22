@@ -219,6 +219,223 @@ app.post('/auth/send-login-link', async (req, res) => {
 
 // ── FREE TIER SIGNUP ──────────────────────────────────────────────────
 // Creates a user without Stripe: just auth user + profile with tier='free'.
+// ── OTP LOGIN (PWA-FRIENDLY) ──────────────────────────────────────────
+// Magic links break on iOS/Android PWAs because the link opens in the
+// browser (separate storage context from the installed PWA). OTP codes
+// work in any app/browser context: user enters a 6-digit code manually.
+//
+// Flow:
+//   1. POST /auth/send-otp { email, lang }  → sends 6-digit code via email
+//   2. POST /auth/verify-otp { email, code } → returns Supabase session tokens
+//      on success. Frontend then calls supabase.auth.setSession(tokens).
+
+const crypto = require('crypto');
+
+function hashCode(code) {
+  return crypto.createHash('sha256').update(String(code)).digest('hex');
+}
+
+function generateOTP() {
+  // 6-digit, zero-padded, avoids leading-zero truncation issues
+  return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+}
+
+app.post('/auth/send-otp', async (req, res) => {
+  try {
+    const { email, lang } = req.body || {};
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+    const normalizedEmail = email.trim().toLowerCase();
+    const emailLang = (lang === 'de' || lang === 'en') ? lang : 'en';
+
+    // Rate limit: max 3 codes per email per 15 minutes
+    const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    const { count: recentCount } = await supabase
+      .from('login_codes')
+      .select('id', { count: 'exact', head: true })
+      .eq('email', normalizedEmail)
+      .gte('created_at', fifteenMinAgo);
+
+    if ((recentCount || 0) >= 3) {
+      console.warn(`🚫 OTP rate limit for ${normalizedEmail}`);
+      return res.status(429).json({
+        error: 'rate_limit',
+        message: emailLang === 'de'
+          ? 'Zu viele Anfragen. Bitte warte 15 Minuten.'
+          : 'Too many requests. Please wait 15 minutes.',
+      });
+    }
+
+    // Generate code + store hash (never store plaintext)
+    const code = generateOTP();
+    const codeHash = hashCode(code);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min validity
+
+    const { error: insertErr } = await supabase.from('login_codes').insert({
+      email: normalizedEmail,
+      code_hash: codeHash,
+      expires_at: expiresAt.toISOString(),
+    });
+    if (insertErr) {
+      console.error('❌ OTP insert failed:', insertErr.message);
+      return res.status(500).json({ error: 'Could not create code' });
+    }
+
+    // Send email with code
+    const mail = buildOtpEmail(code, normalizedEmail, emailLang);
+    try {
+      await resend.emails.send({
+        from: FROM_EMAIL,
+        to: normalizedEmail,
+        subject: mail.subject,
+        html: mail.html,
+        text: mail.text,
+      });
+    } catch (mailErr) {
+      console.error('❌ OTP mail send failed:', mailErr.message);
+      return res.status(500).json({ error: 'Could not send email' });
+    }
+
+    console.log(`📧 OTP sent to ${normalizedEmail} (expires in 10min)`);
+    res.json({ ok: true, expiresIn: 600 });
+  } catch (err) {
+    console.error('❌ /auth/send-otp error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/auth/verify-otp', async (req, res) => {
+  try {
+    const { email, code } = req.body || {};
+    if (!email || !code) {
+      return res.status(400).json({ error: 'Email and code required' });
+    }
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const normalizedCode = String(code).trim().replace(/\s/g, '');
+    if (!/^\d{6}$/.test(normalizedCode)) {
+      return res.status(400).json({ error: 'Invalid code format', code: 'INVALID_CODE' });
+    }
+
+    // Load most recent unused, non-expired code for this email
+    const { data: row } = await supabase
+      .from('login_codes')
+      .select('id, code_hash, expires_at, used_at, attempts')
+      .eq('email', normalizedEmail)
+      .is('used_at', null)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!row) {
+      return res.status(400).json({
+        error: 'No valid code — request a new one',
+        code: 'CODE_EXPIRED',
+      });
+    }
+
+    // Brute-force protection: 5 attempts per code
+    if (row.attempts >= 5) {
+      await supabase
+        .from('login_codes')
+        .update({ used_at: new Date().toISOString() }) // mark as dead
+        .eq('id', row.id);
+      return res.status(400).json({
+        error: 'Too many attempts — request a new code',
+        code: 'TOO_MANY_ATTEMPTS',
+      });
+    }
+
+    // Verify hash
+    const providedHash = hashCode(normalizedCode);
+    if (providedHash !== row.code_hash) {
+      await supabase
+        .from('login_codes')
+        .update({ attempts: row.attempts + 1 })
+        .eq('id', row.id);
+      return res.status(400).json({
+        error: 'Wrong code',
+        code: 'WRONG_CODE',
+        attemptsLeft: Math.max(0, 4 - row.attempts),
+      });
+    }
+
+    // Code valid — mark as used, generate Supabase session
+    await supabase
+      .from('login_codes')
+      .update({ used_at: new Date().toISOString() })
+      .eq('id', row.id);
+
+    // Find or create Supabase auth user
+    let authUserId = null;
+    try {
+      const { data: created, error: createErr } = await supabase.auth.admin.createUser({
+        email: normalizedEmail,
+        email_confirm: true,
+      });
+      if (createErr) {
+        // Already exists — look up by email
+        if (/already been registered|already registered|exists/i.test(createErr.message)) {
+          const { data: listData } = await supabase.auth.admin.listUsers({ perPage: 200 });
+          const match = listData?.users?.find(u => (u.email || '').toLowerCase() === normalizedEmail);
+          if (!match) throw createErr;
+          authUserId = match.id;
+        } else {
+          throw createErr;
+        }
+      } else {
+        authUserId = created.user.id;
+      }
+    } catch (e) {
+      console.error('❌ Auth user lookup/create failed:', e.message);
+      return res.status(500).json({ error: 'Auth error' });
+    }
+
+    // Generate a magic-link token, then swap it for a full session.
+    // generateLink with type='magiclink' gives us tokens we can pass to the frontend.
+    const { data: linkData, error: linkErr } = await supabase.auth.admin.generateLink({
+      type: 'magiclink',
+      email: normalizedEmail,
+    });
+    if (linkErr || !linkData) {
+      console.error('❌ generateLink failed:', linkErr?.message);
+      return res.status(500).json({ error: 'Session generation failed' });
+    }
+
+    // Extract the OTP token (hashed_token) from the action link —
+    // we can exchange it server-side for a session via verifyOtp.
+    const hashedToken = linkData.properties?.hashed_token;
+    if (!hashedToken) {
+      console.error('❌ No hashed_token in generateLink response');
+      return res.status(500).json({ error: 'Session token missing' });
+    }
+
+    const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
+      type: 'magiclink',
+      token_hash: hashedToken,
+    });
+    if (verifyErr || !verifyData?.session) {
+      console.error('❌ verifyOtp failed:', verifyErr?.message);
+      return res.status(500).json({ error: 'Session exchange failed' });
+    }
+
+    console.log(`✅ OTP login success for ${normalizedEmail}`);
+    res.json({
+      ok: true,
+      session: {
+        access_token: verifyData.session.access_token,
+        refresh_token: verifyData.session.refresh_token,
+      },
+      userId: authUserId,
+    });
+  } catch (err) {
+    console.error('❌ /auth/verify-otp error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // Sends magic link to log them in. No payment, no Stripe customer.
 //
 // Free tier limits (enforced elsewhere):
@@ -1465,6 +1682,58 @@ function emailFooter(email) {
 }
 
 // Branded magic-link email. Matches welcome-mail design. Bilingual via lang param.
+function buildOtpEmail(code, email, lang) {
+  const de = lang === 'de';
+  const L = {
+    subject: de ? 'Dein PEAK Login-Code' : 'Your PEAK login code',
+    label: de ? '🔐 Login-Code' : '🔐 Login code',
+    h1a: de ? 'DEIN CODE' : 'YOUR CODE',
+    h1b: de ? 'FÜR PEAK' : 'FOR PEAK',
+    intro: de
+      ? 'Gib diesen 6-stelligen Code in der PEAK-App ein, um dich anzumelden:'
+      : 'Enter this 6-digit code in the PEAK app to sign in:',
+    expiry: de
+      ? 'Der Code ist 10 Minuten gültig.'
+      : 'The code expires in 10 minutes.',
+    warning: de
+      ? 'Wenn du diesen Code nicht angefordert hast, ignoriere diese E-Mail.'
+      : 'If you did not request this code, ignore this email.',
+    footer: de
+      ? 'PEAK by MJ Performance · ' + COMPANY.address
+      : 'PEAK by MJ Performance · ' + COMPANY.address,
+  };
+
+  // Format code with middle space for readability: "123 456"
+  const codePretty = code.slice(0, 3) + ' ' + code.slice(3);
+
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${L.subject}</title></head>
+<body style="margin:0;padding:0;background:#F5F5F1;font-family:'Helvetica Neue',Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F5F5F1;padding:40px 20px"><tr><td align="center">
+<table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;background:#fff;border:1px solid #E6E6E1">
+  <tr><td style="background:#0E0E0E;padding:28px 32px">
+    <div style="color:#fff;font-family:'Helvetica Neue',Arial,sans-serif;font-weight:900;font-size:28px;letter-spacing:4px">PEAK</div>
+    <div style="color:#E8001A;font-weight:700;font-size:10px;letter-spacing:3px;margin-top:4px">BY MJ PERFORMANCE</div>
+  </td></tr>
+  <tr><td style="padding:40px 32px 32px">
+    <div style="color:#E8001A;font-weight:900;font-size:11px;letter-spacing:2.5px;margin-bottom:10px;text-transform:uppercase">${L.label}</div>
+    <h1 style="margin:0 0 18px;font-size:30px;line-height:1.15;font-weight:900;letter-spacing:1px;color:#0E0E0E">${L.h1a}<br><span style="color:#E8001A">${L.h1b}</span></h1>
+    <p style="margin:0 0 28px;font-size:15px;line-height:1.6;color:#3a3a3a">${L.intro}</p>
+    <div style="background:#0E0E0E;color:#fff;padding:28px 32px;text-align:center;margin:0 0 22px">
+      <div style="font-family:'Courier New',monospace;font-weight:900;font-size:42px;letter-spacing:12px;color:#fff">${codePretty}</div>
+    </div>
+    <p style="margin:0 0 10px;font-size:12px;color:#666">⏱ ${L.expiry}</p>
+    <p style="margin:0;font-size:11px;color:#999;line-height:1.5">${L.warning}</p>
+  </td></tr>
+  <tr><td style="background:#F5F5F1;padding:18px 32px;border-top:1px solid #E6E6E1">
+    <div style="font-size:10px;color:#999;letter-spacing:1.2px;text-align:center">${L.footer}</div>
+  </td></tr>
+</table></td></tr></table></body></html>`;
+
+  const text = `${L.h1a} ${L.h1b}\n\n${L.intro}\n\n  ${codePretty}\n\n${L.expiry}\n\n${L.warning}\n\n— ${L.footer}`;
+
+  return { subject: L.subject, html, text };
+}
+
 function buildMagicLinkEmail(magicLink, email, lang) {
   const de = lang === 'de';
   const L = {
