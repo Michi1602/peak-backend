@@ -651,10 +651,32 @@ app.post('/customer-portal', async (req, res) => {
       return res.status(404).json({ error: 'No subscription found for this email' });
     }
 
-    const portalSession = await stripe.billingPortal.sessions.create({
-      customer: profile.stripe_customer_id,
-      return_url: FRONTEND_URL,
-    });
+    let portalSession;
+    try {
+      portalSession = await stripe.billingPortal.sessions.create({
+        customer: profile.stripe_customer_id,
+        return_url: FRONTEND_URL,
+      });
+    } catch (stripeErr) {
+      // Customer may have been deleted in Stripe Dashboard but still exists in our DB.
+      // Clean up the dangling reference + inform the user.
+      if (stripeErr?.message?.includes('No such customer')) {
+        console.warn(`⚠️  Dangling stripe_customer_id for ${email}: ${profile.stripe_customer_id}. Clearing.`);
+        await supabase.from('users').update({
+          stripe_customer_id: null,
+          stripe_subscription_id: null,
+          tier: 'free',
+          status: 'cancelled',
+          trial_end: null,
+        }).eq('email', email.toLowerCase().trim());
+        return res.status(410).json({
+          error: 'subscription_not_found',
+          code: 'SUBSCRIPTION_NOT_FOUND',
+          message: 'Your subscription no longer exists. Your account has been reset to Free.',
+        });
+      }
+      throw stripeErr;
+    }
 
     console.log(`✅ Portal session created for ${email}`);
     res.json({ url: portalSession.url });
@@ -1439,14 +1461,18 @@ app.post('/webhook', async (req, res) => {
         prior = data || null;
       } catch (_) {}
 
+      // Merge metadata with prior DB row, preferring metadata when present.
+      // "Present" means: not null, not undefined, not empty string.
+      // This prevents overwriting valid onboarding data with empty checkout data.
+      const hasVal = (v) => v !== null && v !== undefined && v !== '';
       const pickNum = (meta, prior, parser) => {
-        if (meta !== null && meta !== undefined && meta !== '') return parser(meta);
-        if (prior !== null && prior !== undefined) return prior;
+        if (hasVal(meta)) return parser(meta);
+        if (hasVal(prior)) return prior;
         return null;
       };
       const pickStr = (meta, prior) => {
-        if (meta) return meta;
-        if (prior) return prior;
+        if (hasVal(meta)) return meta;
+        if (hasVal(prior)) return prior;
         return null;
       };
       const pickArr = (meta, prior) => {
