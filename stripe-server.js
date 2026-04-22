@@ -1010,10 +1010,12 @@ app.post('/create-checkout', async (req, res) => {
 
     const sessionConfig = {
       mode: 'subscription',
-      // Automatically show all payment methods enabled in Stripe Dashboard
-      // (card, Apple Pay, Google Pay, PayPal, Klarna, SEPA, etc.)
-      // No code change needed when you enable/disable methods in Stripe.
-      automatic_payment_methods: { enabled: true },
+      // When payment_method_types is omitted on a Checkout Session, Stripe
+      // automatically shows all payment methods enabled in the Dashboard
+      // (card, Apple Pay, Google Pay, PayPal, Klarna, SEPA, etc.) — no code
+      // change needed when you enable/disable methods in Stripe.
+      // (Note: `automatic_payment_methods` is a PaymentIntent-only param and
+      // must NOT be passed here — it throws "unknown parameter".)
       customer_email: email,
       line_items: [{ price: priceId, quantity: 1 }],
       subscription_data: {
