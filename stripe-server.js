@@ -249,6 +249,26 @@ app.post('/auth/send-otp', async (req, res) => {
     const normalizedEmail = email.trim().toLowerCase();
     const emailLang = (lang === 'de' || lang === 'en') ? lang : 'en';
 
+    // Block users flagged for voucher abuse — no re-entry via OTP
+    try {
+      const { data: existingUser } = await supabase
+        .from('users')
+        .select('status')
+        .eq('email', normalizedEmail)
+        .maybeSingle();
+      if (existingUser?.status === 'blocked_voucher_abuse') {
+        console.warn(`🚫 OTP blocked for abuse-flagged user: ${normalizedEmail}`);
+        return res.status(403).json({
+          error: 'account_blocked',
+          message: emailLang === 'de'
+            ? 'Dieser Account wurde wegen Verstoß gegen die Voucher-Regeln gesperrt. Bitte kontaktiere den Support.'
+            : 'This account has been blocked due to voucher policy violation. Please contact support.',
+        });
+      }
+    } catch (e) {
+      console.warn('Block-check failed (fail-open):', e.message);
+    }
+
     // Rate limit: max 3 codes per email per 15 minutes
     const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
     const { count: recentCount } = await supabase
@@ -667,6 +687,29 @@ app.post('/ai/generate', async (req, res) => {
       } catch (_) { /* ignore, treat as anonymous onboarding */ }
     }
 
+    // ─── BLOCK CHECK ──────────────────────────────────────────────────────
+    // Users flagged for voucher abuse can't use AI features even if they
+    // still have an active session from before the block.
+    if (authUserId) {
+      try {
+        const { data: blockCheck } = await supabase
+          .from('users')
+          .select('status')
+          .eq('id', authUserId)
+          .maybeSingle();
+        if (blockCheck?.status === 'blocked_voucher_abuse') {
+          console.warn(`🚫 AI call blocked for abuse-flagged user: ${userEmail}`);
+          return res.status(403).json({
+            error: 'account_blocked',
+            code: 'ACCOUNT_BLOCKED',
+            message: 'Account has been blocked due to policy violation.',
+          });
+        }
+      } catch (e) {
+        console.warn('AI block-check failed (fail-open):', e.message);
+      }
+    }
+
     // ─── MONTHLY PLAN-GENERATION LIMITS ───────────────────────────────
     // Only enforced when purpose === 'plan_generation' AND user is authenticated.
     // Other purposes (training_enrich, adjustment) are NOT counted (internal
@@ -1016,6 +1059,11 @@ app.post('/create-checkout', async (req, res) => {
       // change needed when you enable/disable methods in Stripe.
       // (Note: `automatic_payment_methods` is a PaymentIntent-only param and
       // must NOT be passed here — it throws "unknown parameter".)
+      //
+      // billing_address_collection: 'auto' is REQUIRED for PayPal subscriptions
+      // (Stripe API constraint). 'auto' means Stripe collects address only when
+      // the payment method requires it — so card users aren't bothered.
+      billing_address_collection: 'auto',
       customer_email: email,
       line_items: [{ price: priceId, quantity: 1 }],
       subscription_data: {
@@ -1553,8 +1601,15 @@ app.post('/webhook', async (req, res) => {
               prorate: false,
             });
             console.log(`🛑 Subscription cancelled due to voucher abuse: ${session.subscription}`);
-            // Mark user as blocked
-            await supabase.from('users').update({ status: 'blocked_voucher_abuse' }).eq('email', email);
+            // Mark user as blocked AND downgrade to free tier
+            // This prevents continued access to premium features via existing OTP logins
+            await supabase.from('users').update({
+              status: 'blocked_voucher_abuse',
+              tier: 'free',
+              stripe_subscription_id: null,
+              trial_ends_at: null,
+            }).eq('email', email);
+            console.log(`🔒 User downgraded to free + blocked: ${email}`);
           } catch (err) {
             console.error('❌ Could not cancel subscription after abuse detection:', err.message);
           }
@@ -1585,9 +1640,24 @@ app.post('/webhook', async (req, res) => {
         console.error('❌ Could not fetch customer for cancellation:', err.message);
       }
       if (email) {
-        const { error } = await supabase.from('users').update({ status: 'cancelled' }).eq('email', email);
+        // Downgrade tier to free — prevents continued premium access after cancellation
+        // Keep status history: if already blocked_voucher_abuse, don't overwrite
+        const { data: existing } = await supabase
+          .from('users')
+          .select('status')
+          .eq('email', email)
+          .maybeSingle();
+        const newStatus = existing?.status === 'blocked_voucher_abuse'
+          ? 'blocked_voucher_abuse'
+          : 'cancelled';
+        const { error } = await supabase.from('users').update({
+          status: newStatus,
+          tier: 'free',
+          stripe_subscription_id: null,
+          trial_ends_at: null,
+        }).eq('email', email);
         if (error) console.error('❌ Supabase update (cancelled) failed:', error.message);
-        else console.log(`✅ User cancelled: ${email}`);
+        else console.log(`✅ User cancelled + downgraded to free: ${email}`);
       }
     } else if (event.type === 'invoice.payment_succeeded') {
       const invoice = event.data.object;
@@ -1677,7 +1747,7 @@ function emailFooter(email) {
           <span style="color:#555;"> · </span>
           <a href="${unsub}" style="color:#AAA;text-decoration:none;">Unsubscribe</a>
         </p>
-        <p style="margin:0;color:#666;font-size:10px;letter-spacing:0.5px;">${COMPANY.name} · ${COMPANY.address}</p>
+        <p style="margin:0;color:#666;font-size:10px;letter-spacing:0.5px;">${COMPANY.name} · <a href="${BACKEND_URL}/impressum" style="color:#AAA;text-decoration:none;">Impressum</a></p>
       </td>
     </tr>
   </table>`;
@@ -1701,8 +1771,8 @@ function buildOtpEmail(code, email, lang) {
       ? 'Wenn du diesen Code nicht angefordert hast, ignoriere diese E-Mail.'
       : 'If you did not request this code, ignore this email.',
     footer: de
-      ? 'PEAK by MJ Performance · ' + COMPANY.address
-      : 'PEAK by MJ Performance · ' + COMPANY.address,
+      ? 'PEAK by MJ Performance · Impressum: ' + BACKEND_URL + '/impressum'
+      : 'PEAK by MJ Performance · Legal: ' + BACKEND_URL + '/impressum',
   };
 
   // Format code with middle space for readability: "123 456"
