@@ -522,6 +522,76 @@ app.post('/create-checkout', async (req, res) => {
       return res.status(400).json({ error: 'Consent required' });
     }
 
+    // ── DUPLICATE SUBSCRIPTION PREVENTION ─────────────────────────────
+    // If this email already has an active paid subscription, block new
+    // checkout and point the user to the customer portal instead.
+    // Check BOTH sources of truth:
+    //   1. our users table (stripe_subscription_id)
+    //   2. Stripe directly (live status, catches edge cases)
+    const normalizedEmail = email.toLowerCase().trim();
+    try {
+      const { data: existing } = await supabase
+        .from('users')
+        .select('tier, stripe_customer_id, stripe_subscription_id, status')
+        .eq('email', normalizedEmail)
+        .maybeSingle();
+
+      if (existing?.stripe_subscription_id && existing?.tier && existing.tier !== 'free') {
+        // Verify with Stripe that subscription is actually active
+        try {
+          const sub = await stripe.subscriptions.retrieve(existing.stripe_subscription_id);
+          const activeStatuses = ['active', 'trialing', 'past_due'];
+          if (activeStatuses.includes(sub.status)) {
+            console.warn(`🔒 Duplicate checkout blocked for ${normalizedEmail} (${sub.status})`);
+            return res.status(409).json({
+              error: 'already_subscribed',
+              code: 'ALREADY_SUBSCRIBED',
+              message: lang === 'de'
+                ? 'Du hast bereits ein aktives Abo. Verwalte es im Kundenbereich.'
+                : 'You already have an active subscription. Manage it in the customer portal.',
+              currentTier: existing.tier,
+              currentStatus: sub.status,
+              customerId: existing.stripe_customer_id,
+            });
+          }
+        } catch (stripeErr) {
+          // Sub may have been deleted in Stripe but not in DB — allow checkout
+          console.warn(`Stripe sub lookup failed for ${normalizedEmail}:`, stripeErr.message);
+        }
+      }
+
+      // Also check by customer_id directly with Stripe (catches records we may have missed)
+      if (existing?.stripe_customer_id) {
+        try {
+          const subs = await stripe.subscriptions.list({
+            customer: existing.stripe_customer_id,
+            status: 'all',
+            limit: 10,
+          });
+          const activeSub = subs.data.find(s =>
+            ['active', 'trialing', 'past_due'].includes(s.status)
+          );
+          if (activeSub) {
+            console.warn(`🔒 Stripe shows active sub for ${normalizedEmail}: ${activeSub.id} (${activeSub.status})`);
+            return res.status(409).json({
+              error: 'already_subscribed',
+              code: 'ALREADY_SUBSCRIBED',
+              message: lang === 'de'
+                ? 'Du hast bereits ein aktives Abo. Verwalte es im Kundenbereich.'
+                : 'You already have an active subscription. Manage it in the customer portal.',
+              currentStatus: activeSub.status,
+              customerId: existing.stripe_customer_id,
+            });
+          }
+        } catch (stripeErr) {
+          console.warn(`Stripe customer sub list failed:`, stripeErr.message);
+        }
+      }
+    } catch (checkErr) {
+      // Non-fatal — log and proceed to checkout
+      console.warn(`Duplicate-sub check failed for ${normalizedEmail}:`, checkErr.message);
+    }
+
     // Pick price based on tier + interval
     const normalizedTier = tier === 'basic' ? 'basic' : 'premium';
     const normalizedPlan = plan === 'annual' ? 'annual' : 'monthly';
