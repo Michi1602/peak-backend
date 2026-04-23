@@ -845,6 +845,204 @@ app.post('/ai/generate', async (req, res) => {
   }
 });
 
+// ─── SCAN: MENU PHOTO (Claude Vision) ─────────────────────────────────
+// User uploads a photo of a restaurant menu. Claude Haiku Vision reads
+// the menu and returns the top 3 dishes that best fit the user's goals,
+// with estimated kcal/protein and a fit-rating.
+app.post('/ai/scan-menu', async (req, res) => {
+  try {
+    const { image, mediaType, userGoal, userLang } = req.body;
+    if (!image || typeof image !== 'string') {
+      return res.status(400).json({ error: 'image required (base64 data)' });
+    }
+    const mt = (mediaType && /^image\/(jpeg|png|webp|gif)$/.test(mediaType)) ? mediaType : 'image/jpeg';
+
+    // Soft auth (same pattern as /ai/generate — anon during onboarding, but
+    // we record who called for monitoring)
+    const authHeader = req.headers.authorization;
+    let userEmail = 'anonymous';
+    let authUserId = null;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const token = authHeader.slice(7);
+        const { data } = await supabase.auth.getUser(token);
+        if (data?.user?.email) userEmail = data.user.email;
+        if (data?.user?.id) authUserId = data.user.id;
+      } catch (_) { /* ignore */ }
+    }
+
+    // Block abuse-flagged users
+    if (authUserId) {
+      try {
+        const { data: blockCheck } = await supabase
+          .from('users').select('status').eq('id', authUserId).maybeSingle();
+        if (blockCheck?.status === 'blocked_voucher_abuse') {
+          return res.status(403).json({ error: 'account_blocked' });
+        }
+      } catch (_) { /* fail-open */ }
+    }
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'AI not configured' });
+
+    const de = userLang === 'de';
+    const goalHint = userGoal ? (de ? `Ziel des Nutzers: ${userGoal}.` : `User goal: ${userGoal}.`) : '';
+    const prompt = de
+      ? `Du siehst ein Foto einer Speisekarte. Extrahiere die 3 Gerichte, die am besten zum Ziel des Nutzers passen. ${goalHint}
+Antworte AUSSCHLIESSLICH als JSON (kein Markdown, kein Text davor/danach) mit diesem Schema:
+{"dishes":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"fit":"best"|"good"|"ok","reason":"kurzer Grund in max 8 Wörtern"}]}
+kcal und protein sind geschätzte Zahlen (nur Zahl, keine Einheit). fit-Wert: "best"=beste Wahl, "good"=gute Wahl, "ok"=akzeptabel.
+Falls kein Menü erkennbar ist, antworte: {"dishes":[],"error":"no_menu"}.`
+      : `You see a photo of a restaurant menu. Extract the 3 dishes that best match the user's goal. ${goalHint}
+Respond ONLY as JSON (no markdown, no text before/after) with this schema:
+{"dishes":[{"name":"...","kcal":<number>,"protein":<number>,"fit":"best"|"good"|"ok","reason":"short reason max 8 words"}]}
+kcal and protein are estimated numbers (number only, no unit). fit: "best"=best choice, "good"=good, "ok"=acceptable.
+If no menu is visible, respond: {"dishes":[],"error":"no_menu"}.`;
+
+    const modelName = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: modelName,
+        max_tokens: 600,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mt, data: image } },
+            { type: 'text', text: prompt },
+          ],
+        }],
+      }),
+    });
+
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error(`❌ scan-menu Anthropic ${r.status}:`, errText.slice(0, 300));
+      return res.status(502).json({ error: 'AI service error' });
+    }
+
+    const data = await r.json();
+    const text = data?.content?.[0]?.text || '';
+    // Strip any accidental markdown fences
+    const clean = text.replace(/^```json\s*|```$/g, '').trim();
+    let parsed;
+    try { parsed = JSON.parse(clean); }
+    catch (e) {
+      console.error(`❌ scan-menu JSON parse failed for ${userEmail}:`, clean.slice(0, 200));
+      return res.status(502).json({ error: 'Could not read menu' });
+    }
+
+    console.log(`✅ scan-menu OK for ${userEmail}: ${(parsed.dishes||[]).length} dishes`);
+    res.json(parsed);
+  } catch (err) {
+    console.error('❌ /ai/scan-menu error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── SCAN: BARCODE (Open Food Facts proxy + fit rating) ──────────────
+// Frontend sends a barcode string. We look up Open Food Facts directly
+// (they have great EU/DE coverage, free, no API key) and add a "fit"
+// rating based on the user's goal.
+app.post('/ai/scan-barcode', async (req, res) => {
+  try {
+    const { barcode, userGoal, userLang } = req.body;
+    if (!barcode || !/^\d{6,14}$/.test(String(barcode))) {
+      return res.status(400).json({ error: 'valid numeric barcode required' });
+    }
+
+    // Soft auth (logging only)
+    const authHeader = req.headers.authorization;
+    let userEmail = 'anonymous';
+    let authUserId = null;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const token = authHeader.slice(7);
+        const { data } = await supabase.auth.getUser(token);
+        if (data?.user?.email) userEmail = data.user.email;
+        if (data?.user?.id) authUserId = data.user.id;
+      } catch (_) { /* ignore */ }
+    }
+    if (authUserId) {
+      try {
+        const { data: blockCheck } = await supabase
+          .from('users').select('status').eq('id', authUserId).maybeSingle();
+        if (blockCheck?.status === 'blocked_voucher_abuse') {
+          return res.status(403).json({ error: 'account_blocked' });
+        }
+      } catch (_) { /* fail-open */ }
+    }
+
+    // Look up Open Food Facts
+    const offUrl = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json`;
+    const offRes = await fetch(offUrl, { headers: { 'User-Agent': 'PEAK-by-MJ-Performance/1.0 (support@mj-performance.net)' } });
+    if (!offRes.ok) {
+      console.warn(`⚠️ Open Food Facts error ${offRes.status} for ${barcode}`);
+      return res.status(502).json({ error: 'lookup_failed' });
+    }
+    const offData = await offRes.json();
+    if (offData.status !== 1 || !offData.product) {
+      console.log(`ℹ️ Barcode ${barcode} not found in OFF (asked by ${userEmail})`);
+      return res.status(404).json({ error: 'product_not_found', barcode });
+    }
+
+    const p = offData.product;
+    const per100 = p.nutriments || {};
+    // Best-effort portion sizing: if serving_size given, use that; else 100g
+    const servingG = parseFloat(p.serving_quantity) || 100;
+    const factor = servingG / 100;
+
+    const name = p.product_name || p.product_name_en || p.product_name_de || p.generic_name || 'Unknown';
+    const brand = (p.brands || '').split(',')[0].trim() || '';
+    const kcalPer100 = per100['energy-kcal_100g'] || per100['energy-kcal'] || (per100['energy_100g'] ? per100['energy_100g']/4.184 : 0);
+    const proteinPer100 = per100['proteins_100g'] || 0;
+    const carbsPer100 = per100['carbohydrates_100g'] || 0;
+    const sugarsPer100 = per100['sugars_100g'] || 0;
+    const fatPer100 = per100['fat_100g'] || 0;
+    const satFatPer100 = per100['saturated-fat_100g'] || 0;
+
+    const round = n => Math.round(n * 10) / 10;
+    const product = {
+      barcode,
+      name,
+      brand,
+      serving_g: Math.round(servingG),
+      kcal: Math.round(kcalPer100 * factor),
+      protein: round(proteinPer100 * factor),
+      carbs: round(carbsPer100 * factor),
+      sugars: round(sugarsPer100 * factor),
+      fat: round(fatPer100 * factor),
+      saturated_fat: round(satFatPer100 * factor),
+      nutri_score: (p.nutriscore_grade || '').toUpperCase() || null,
+      image: p.image_small_url || p.image_thumb_url || null,
+    };
+
+    // Simple fit-rating — not AI, just heuristics (saves a roundtrip)
+    // "fit"=good match, "caution"=high sugar/cals, "avoid"=very high sugar or saturated fat
+    const de = userLang === 'de';
+    let fit = 'fit';
+    const warnings = [];
+    if (sugarsPer100 > 20) { fit = 'caution'; warnings.push(de ? 'Hoher Zuckergehalt' : 'High sugar'); }
+    if (satFatPer100 > 8) { fit = 'caution'; warnings.push(de ? 'Viel gesättigtes Fett' : 'High saturated fat'); }
+    if (kcalPer100 > 400 && proteinPer100 < 10) { fit = 'caution'; warnings.push(de ? 'Kalorien-dicht, wenig Protein' : 'Calorie-dense, low protein'); }
+    if (sugarsPer100 > 40 || satFatPer100 > 15) fit = 'avoid';
+    if (proteinPer100 >= 15 && sugarsPer100 < 10) fit = 'fit';
+    product.fit = fit;
+    product.warnings = warnings;
+
+    console.log(`✅ scan-barcode OK for ${userEmail}: ${barcode} → ${name} (${fit})`);
+    res.json({ product });
+  } catch (err) {
+    console.error('❌ /ai/scan-barcode error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/create-checkout', async (req, res) => {
   try {
     const { email, plan, tier, userData, consent, voucher, lang } = req.body;
