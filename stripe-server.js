@@ -1392,6 +1392,11 @@ app.post('/webhook', async (req, res) => {
         return res.status(200).json({ received: true, warning: 'no email' });
       }
 
+      // Normalize email to lowercase — Supabase Auth stores emails lowercased,
+      // and all our email lookups use .toLowerCase() too. Writing a mixed-case
+      // email here creates a ghost row the app can never find.
+      email = email.toLowerCase().trim();
+
       const meta = session.metadata || {};
       const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
