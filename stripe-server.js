@@ -23,7 +23,7 @@ const COMPANY = {
 
 app.use(cors());
 app.use('/webhook', express.raw({ type: 'application/json' }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // ── HEALTH CHECK ──────────────────────────────────────────────────────
 app.get('/', (req, res) => {
