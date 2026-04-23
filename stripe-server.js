@@ -888,16 +888,62 @@ app.post('/ai/scan-menu', async (req, res) => {
     const de = userLang === 'de';
     const goalHint = userGoal ? (de ? `Ziel des Nutzers: ${userGoal}.` : `User goal: ${userGoal}.`) : '';
     const prompt = de
-      ? `Du siehst ein Foto einer Speisekarte. Extrahiere die 3 Gerichte, die am besten zum Ziel des Nutzers passen. ${goalHint}
-Antworte AUSSCHLIESSLICH als JSON (kein Markdown, kein Text davor/danach) mit diesem Schema:
-{"dishes":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"fit":"best"|"good"|"ok","reason":"kurzer Grund in max 8 Wörtern"}]}
-kcal und protein sind geschätzte Zahlen (nur Zahl, keine Einheit). fit-Wert: "best"=beste Wahl, "good"=gute Wahl, "ok"=akzeptabel.
-Falls kein Menü erkennbar ist, antworte: {"dishes":[],"error":"no_menu"}.`
-      : `You see a photo of a restaurant menu. Extract the 3 dishes that best match the user's goal. ${goalHint}
-Respond ONLY as JSON (no markdown, no text before/after) with this schema:
+      ? `Du siehst ein Foto einer Speisekarte. Wähle die 3 Gerichte die am BESTEN zum Ziel des Nutzers passen. ${goalHint}
+
+KALORIEN-SCHÄTZUNG (sei ehrlich, nicht schönrechnen):
+- Deutsche/europäische Restaurantportionen sind GROSS (Fleisch 250-400g, Beilagen 200-300g)
+- Pommes: +380-450 kcal, Reis: +320-380 kcal, Kartoffeln: +280-340 kcal, Spätzle: +400 kcal
+- Panade + Frittieren: +200-300 kcal auf das Grundfleisch
+- Sahnesauce, Rahmsauce, Käseüberbackung: +200-300 kcal
+- Typische Gesamtwerte: Schnitzel mit Pommes = 1000-1300 kcal, Steak mit Beilagen = 900-1100 kcal, Salat mit Hähnchen = 450-650 kcal
+- Grillgerichte ohne Panade/Sauce sind am kalorienärmsten
+- Sei lieber realistisch-hoch als zu niedrig
+
+PROTEIN-SCHÄTZUNG:
+- 100g mageres Fleisch (Huhn/Pute/Rind) ≈ 25-30g Protein
+- 100g fetteres Fleisch (Schwein/Lamm) ≈ 20-25g Protein
+- 100g Fisch ≈ 20-25g Protein (Lachs ~22g, magerer Fisch ~20g)
+- Panade senkt Protein-Anteil pro Gramm Gericht
+- Typische Restaurantportion Fleisch: 200-300g
+
+FIT-BEWERTUNG (strikt anwenden!):
+- "best" = mageres gegrilltes/gekochtes Protein, wenig Fett, viel Eiweiß, wenig Kohlenhydrate aus Panade oder Sauce. Beispiele: Gegrillter Fisch, Steak ohne Sauce, gegrilltes Hähnchen, Salat mit magerem Fleisch.
+- "good" = gutes Protein aber mit Beilagen/Sauce/leichter Panade. Beispiele: Jägerschnitzel mit Pommes, Gyros-Teller, Lachs mit Kartoffeln.
+- "ok" = viel Panade, Frittiertes, schwere Saucen, Überbacken, viel Kohlenhydrate im Verhältnis zum Protein. Beispiele: Hawaiischnitzel überbacken, Rahmschnitzel, Risotto.
+- Wenn das Ziel Muskelaufbau/Performance ist: bevorzuge hohe Protein-Dichte (Protein/kcal). Paniertes Schnitzel ist NIE "best".
+- Wenn das Ziel Gewichtsabnahme ist: bevorzuge niedrige Kalorien + hohes Protein.
+
+Antworte AUSSCHLIESSLICH als JSON (kein Markdown):
+{"dishes":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"fit":"best"|"good"|"ok","reason":"kurzer Grund max 8 Wörter"}]}
+Falls kein Menü erkennbar ist: {"dishes":[],"error":"no_menu"}.`
+      : `You see a photo of a restaurant menu. Pick the 3 dishes that BEST match the user's goal. ${goalHint}
+
+CALORIE ESTIMATION (be honest, don't undersell):
+- European/German restaurant portions are LARGE (meat 250-400g, sides 200-300g)
+- Fries: +380-450 kcal, rice: +320-380 kcal, potatoes: +280-340 kcal, spätzle: +400 kcal
+- Breading + frying: +200-300 kcal on top of the base meat
+- Cream sauce, cheese topping: +200-300 kcal
+- Typical totals: schnitzel with fries = 1000-1300 kcal, steak with sides = 900-1100 kcal, salad with chicken = 450-650 kcal
+- Grilled dishes without breading/sauce are the lowest-calorie option
+- Err on the realistic-high side
+
+PROTEIN ESTIMATION:
+- 100g lean meat (chicken/turkey/beef) ≈ 25-30g protein
+- 100g fattier meat (pork/lamb) ≈ 20-25g protein
+- 100g fish ≈ 20-25g protein (salmon ~22g, lean fish ~20g)
+- Breading lowers protein ratio per gram of dish
+- Typical restaurant meat portion: 200-300g
+
+FIT RATING (apply strictly!):
+- "best" = lean grilled/cooked protein, low fat, high protein, low carbs from breading/sauce. Examples: grilled fish, steak without sauce, grilled chicken, salad with lean meat.
+- "good" = good protein but with sides/sauce/light breading. Examples: hunter schnitzel with fries, gyros plate, salmon with potatoes.
+- "ok" = heavy breading, fried, heavy sauces, cheese-topped, high carb-to-protein ratio. Examples: Hawaiian schnitzel topped, cream schnitzel, risotto.
+- If goal is muscle building/performance: prefer high protein density (protein/kcal). Breaded schnitzel is NEVER "best".
+- If goal is weight loss: prefer low calories + high protein.
+
+Respond ONLY as JSON (no markdown):
 {"dishes":[{"name":"...","kcal":<number>,"protein":<number>,"fit":"best"|"good"|"ok","reason":"short reason max 8 words"}]}
-kcal and protein are estimated numbers (number only, no unit). fit: "best"=best choice, "good"=good, "ok"=acceptable.
-If no menu is visible, respond: {"dishes":[],"error":"no_menu"}.`;
+If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
 
     const modelName = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
     const r = await fetch('https://api.anthropic.com/v1/messages', {
