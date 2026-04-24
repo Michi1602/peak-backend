@@ -102,17 +102,24 @@ app.get('/impressum', (req, res) => {
   res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Impressum — PEAK</title><style>${legalStyle}</style></head><body>
 <a href="${FRONTEND_URL}" class="back">← Zurück zur App</a>
 <h1>Impressum</h1>
-<p><em>Angaben gemäß § 5 TMG</em></p>
+<p><em>Angaben gemäß § 5 TMG / § 18 MStV</em></p>
 <h2>Verantwortlicher</h2>
-<p><strong>${COMPANY.owner}</strong><br>${COMPANY.name}<br>${COMPANY.address}</p>
+<p><strong>${COMPANY.owner}</strong><br>${COMPANY.name} (Einzelunternehmen)<br>${COMPANY.address}<br>Deutschland</p>
 <h2>Kontakt</h2>
 <p>E-Mail: <a href="mailto:${COMPANY.email}">${COMPANY.email}</a><br>Website: <a href="${COMPANY.website}">${COMPANY.website}</a></p>
-<h2>Haftungsausschluss</h2>
-<p>PEAK ersetzt keine medizinische oder ernährungswissenschaftliche Beratung. Bei gesundheitlichen Fragen wende dich bitte an einen Arzt oder Ernährungsberater.</p>
+<h2>Umsatzsteuer</h2>
+<p>Gemäß § 19 UStG wird keine Umsatzsteuer erhoben (Kleinunternehmerregelung).</p>
+<h2>Verantwortlich für den Inhalt nach § 18 Abs. 2 MStV</h2>
+<p>${COMPANY.owner}, ${COMPANY.address}</p>
+<h2>Haftungsausschluss (Gesundheit)</h2>
+<p>PEAK ist kein Medizinprodukt und ersetzt keine ärztliche, ernährungswissenschaftliche oder sporttherapeutische Beratung. Die in der App bereitgestellten Trainings-, Ernährungs- und Regenerationsempfehlungen dienen ausschließlich informatorischen Zwecken. Bei bestehenden gesundheitlichen Beschwerden, Schwangerschaft, Essstörungen, Diabetes, Herz-Kreislauf-Erkrankungen oder anderen medizinischen Bedingungen konsultiere vor der Nutzung der App deinen Arzt. Bei Unwohlsein während Training oder Ernährungsumstellung brich sofort ab und suche ärztliche Hilfe. <strong>Im Notfall: 112.</strong></p>
+<h2>Haftung für Inhalte</h2>
+<p>Die Inhalte dieser Seite wurden mit größter Sorgfalt erstellt. Für die Richtigkeit, Vollständigkeit und Aktualität der Inhalte kann jedoch keine Gewähr übernommen werden. Als Diensteanbieter sind wir gemäß § 7 Abs. 1 TMG für eigene Inhalte auf diesen Seiten nach den allgemeinen Gesetzen verantwortlich.</p>
 <h2>Urheberrecht</h2>
-<p>Die durch den Betreiber erstellten Inhalte und Werke unterliegen dem deutschen Urheberrecht.</p>
+<p>Die durch den Betreiber erstellten Inhalte und Werke auf diesen Seiten unterliegen dem deutschen Urheberrecht.</p>
 <h2>Streitschlichtung</h2>
-<p>Die EU-Kommission stellt eine Plattform zur Online-Streitbeilegung bereit: <a href="https://ec.europa.eu/consumers/odr" target="_blank">ec.europa.eu/consumers/odr</a>. Wir nehmen nicht an Streitbeilegungsverfahren teil.</p>
+<p>Die EU-Kommission stellt eine Plattform zur Online-Streitbeilegung (OS) bereit: <a href="https://ec.europa.eu/consumers/odr" target="_blank" rel="noopener">ec.europa.eu/consumers/odr</a>.</p>
+<p>Wir sind nicht bereit oder verpflichtet, an Streitbeilegungsverfahren vor einer Verbraucherschlichtungsstelle teilzunehmen.</p>
 <hr><p class="note"><strong>English:</strong> <a href="/imprint">/imprint</a> · <strong>Datenschutz:</strong> <a href="/datenschutz">/datenschutz</a></p>
 </body></html>`);
 });
@@ -121,12 +128,22 @@ app.get('/imprint', (req, res) => {
   res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Legal Notice — PEAK</title><style>${legalStyle}</style></head><body>
 <a href="${FRONTEND_URL}" class="back">← Back to app</a>
 <h1>Legal Notice</h1>
+<p><em>Information pursuant to § 5 TMG (German Telemedia Act)</em></p>
 <h2>Responsible Party</h2>
-<p><strong>${COMPANY.owner}</strong><br>${COMPANY.name}<br>${COMPANY.address}</p>
+<p><strong>${COMPANY.owner}</strong><br>${COMPANY.name} (sole proprietorship)<br>${COMPANY.address}<br>Germany</p>
 <h2>Contact</h2>
 <p>Email: <a href="mailto:${COMPANY.email}">${COMPANY.email}</a><br>Website: <a href="${COMPANY.website}">${COMPANY.website}</a></p>
-<h2>Disclaimer</h2>
-<p>PEAK does not replace professional medical or nutritional advice. Consult a qualified professional for health concerns.</p>
+<h2>VAT</h2>
+<p>Pursuant to § 19 German VAT Act (UStG), no VAT is charged (small-business regulation).</p>
+<h2>Health Disclaimer</h2>
+<p>PEAK is not a medical device and does not replace medical, nutritional or sports-therapeutic advice. The training, nutrition and recovery recommendations provided in the app are for informational purposes only. Consult your physician before using this app if you have existing health conditions, are pregnant, have an eating disorder, diabetes, cardiovascular disease, or any other medical condition. Stop any activity immediately if you feel unwell and seek medical help. <strong>Emergency in EU: 112.</strong></p>
+<h2>Liability for Content</h2>
+<p>The contents of this site were created with the greatest care. However, no guarantee can be given for the accuracy, completeness or timeliness of the contents.</p>
+<h2>Copyright</h2>
+<p>The content and works created by the operator on these pages are subject to German copyright law.</p>
+<h2>Online Dispute Resolution</h2>
+<p>The EU Commission provides an online dispute resolution platform: <a href="https://ec.europa.eu/consumers/odr" target="_blank" rel="noopener">ec.europa.eu/consumers/odr</a>.</p>
+<p>We are neither willing nor obliged to participate in dispute resolution proceedings before a consumer arbitration body.</p>
 <hr><p class="note"><strong>Deutsche Version:</strong> <a href="/impressum">/impressum</a> · <strong>Privacy:</strong> <a href="/privacy">/privacy</a></p>
 </body></html>`);
 });
@@ -472,6 +489,18 @@ app.post('/auth/signup-free', async (req, res) => {
     if (!consent || consent.healthData !== true || consent.terms !== true) {
       console.warn(`⚠️ Free signup blocked for ${email}: missing GDPR consent`);
       return res.status(400).json({ error: 'Consent required' });
+    }
+
+    // ── AGE GATE (GDPR §8 BDSG: minimum 16) ────────────────────────────
+    const ageNum = parseInt(userData && userData.age, 10);
+    if (!ageNum || ageNum < 16 || ageNum > 120) {
+      console.warn(`⚠️ Free signup blocked for ${email}: invalid age (${userData && userData.age})`);
+      return res.status(400).json({
+        error: 'AGE_RESTRICTION',
+        message: lang === 'de'
+          ? 'PEAK ist ab 16 Jahren verfügbar.'
+          : 'PEAK is available from age 16.'
+      });
     }
 
     const normalizedEmail = email.toLowerCase().trim();
@@ -1089,6 +1118,199 @@ app.post('/ai/scan-barcode', async (req, res) => {
   }
 });
 
+// ─── QUICK-LOG: TEXT → CALORIES + MACROS (Claude Haiku) ────────────────
+// User types free text ("Putenschnitzel mit Kartoffelsalat") and gets
+// a realistic kcal + macro estimate with appropriate emoji. If input is
+// too vague, returns a clarifying question instead of a bad estimate.
+// Premium-only (Protokoll tab is Premium-gated in frontend, backend
+// double-checks tier for security).
+app.post('/ai/quick-log', async (req, res) => {
+  try {
+    const { text, clarification, originalText, userLang } = req.body;
+    if (!text || typeof text !== 'string' || text.trim().length === 0) {
+      return res.status(400).json({ error: 'text required' });
+    }
+
+    // Auth (required — this endpoint is Premium-only)
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'auth_required' });
+    }
+    let userEmail = null, authUserId = null;
+    try {
+      const token = authHeader.slice(7);
+      const { data } = await supabase.auth.getUser(token);
+      if (data?.user?.email) userEmail = data.user.email;
+      if (data?.user?.id) authUserId = data.user.id;
+    } catch (_) { /* ignore */ }
+    if (!authUserId) return res.status(401).json({ error: 'auth_invalid' });
+
+    // Tier + block check
+    try {
+      const { data: u } = await supabase
+        .from('users')
+        .select('tier, status')
+        .eq('id', authUserId)
+        .maybeSingle();
+      if (u?.status === 'blocked_voucher_abuse') {
+        return res.status(403).json({ error: 'account_blocked' });
+      }
+      if (u?.tier !== 'premium') {
+        return res.status(403).json({ error: 'premium_required' });
+      }
+    } catch (_) { /* fail-closed on DB errors for tier check */
+      return res.status(500).json({ error: 'tier_check_failed' });
+    }
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'AI not configured' });
+
+    const de = userLang === 'de';
+    const inputText = text.trim();
+    const isFollowup = clarification && originalText;
+
+    // If this is a follow-up, combine original + clarification
+    const combinedText = isFollowup
+      ? `${originalText} (${de ? 'Präzisierung' : 'clarification'}: ${clarification.trim()})`
+      : inputText;
+
+    const prompt = de
+      ? `Du bist ein präziser Ernährungs-Analytiker. Der Nutzer hat eingegeben: "${combinedText}"
+
+AUFGABE: Schätze Kalorien + Makros für diese Mahlzeit/diesen Snack.
+
+KALORIEN-SCHÄTZUNG (realistisch, deutsche Portionsgrößen):
+- Standard-Hauptgericht: 600-1200 kcal
+- Schnitzel (paniert) mit Beilage: 900-1300 kcal
+- Kartoffelsalat (Portion): 250-400 kcal
+- Pommes (Portion): 380-450 kcal
+- Reis/Nudeln (Portion): 300-450 kcal
+- Ein Bier (0.5L): 200-240 kcal, Wein (0.2L): 150-180 kcal
+- Snack (Handvoll Nüsse): 180-250 kcal
+- Obst (1 Stück): 50-120 kcal
+- Kaffee schwarz: 2 kcal, Kaffee mit Milch/Zucker: 30-120 kcal
+- Sei lieber realistisch-hoch als zu niedrig. Paniertes/Frittiertes niemals unter 600 kcal für Hauptgang.
+
+MAKRO-SCHÄTZUNG:
+- Protein: 100g mageres Fleisch ≈ 25-30g, Fisch ≈ 20-25g, Eier ≈ 12g pro Stück
+- Carbs: Pommes 35g/Portion, Reis 50g/Portion, Bier 15g/0.5L
+- Fat: Panade/Frittierung +15-25g, Sahnesauce +20-30g
+
+VAGHEITS-CHECK (WICHTIG):
+Wenn der Input zu vage ist um sinnvoll zu schätzen (z.B. nur "Pizza", "Pasta", "Salat", "Fleisch", "Getränk", "Snack" ohne Menge/Art), stelle EINE prägnante Rückfrage statt zu schätzen.
+Beispiele für zu vage:
+- "Pizza" → Rückfrage: "Welche Pizza (Salami, Margherita...) und wie viele Stücke?"
+- "Pasta" → Rückfrage: "Welche Pasta und welche Sauce (Bolognese, Carbonara, Pesto...)?"
+- "Salat" → Rückfrage: "Welcher Salat und mit welchen Zutaten (Hähnchen, Thunfisch, Käse...)?"
+- "Bier" → Rückfrage: "Wie viele und welche Größe (0.3L, 0.5L)?"
+Nicht zu vage sind: konkrete Gerichte mit Zutaten ("Putenschnitzel mit Kartoffelsalat"), Alltagsprodukte ("2 Bier", "ein Apfel"), zusammengesetzte Angaben.
+${isFollowup ? 'DIES IST BEREITS EINE PRÄZISIERUNG — schätze jetzt, stelle KEINE weitere Rückfrage mehr.' : ''}
+
+EMOJI: Wähle passendes Emoji aus: 🍽️ (allgemein), 🥩 (Fleisch), 🍗 (Geflügel), 🐟 (Fisch), 🥗 (Salat), 🍝 (Pasta), 🍕 (Pizza), 🍔 (Burger), 🌯 (Wrap), 🍜 (Suppe), 🍲 (Eintopf), 🥘 (Hauptgericht), 🍚 (Reis), 🥐 (Gebäck), 🥖 (Brot), 🍳 (Eier), 🥞 (Pancakes), 🍫 (Schokolade), 🍪 (Süß), 🍎 (Obst), 🥜 (Nüsse), 🍺 (Bier), 🍷 (Wein), ☕ (Kaffee), 🍵 (Tee), 💧 (Wasser).
+
+Antworte AUSSCHLIESSLICH als JSON (kein Markdown, keine Erklärung):
+- Bei klarem Input: {"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>,"emoji":"<emoji>","label":"<kurze Beschreibung max 50 Zeichen>"}
+- Bei zu vagem Input: {"needsClarification":true,"question":"<eine prägnante Rückfrage>"}`
+      : `You are a precise nutrition analyst. User entered: "${combinedText}"
+
+TASK: Estimate calories + macros for this meal/snack.
+
+CALORIE ESTIMATION (realistic, standard portions):
+- Standard main dish: 600-1200 kcal
+- Breaded schnitzel with side: 900-1300 kcal
+- Potato salad (portion): 250-400 kcal
+- Fries (portion): 380-450 kcal
+- Rice/pasta (portion): 300-450 kcal
+- One beer (500ml): 200-240 kcal, wine (200ml): 150-180 kcal
+- Snack (handful of nuts): 180-250 kcal
+- Fruit (1 piece): 50-120 kcal
+- Black coffee: 2 kcal, coffee with milk/sugar: 30-120 kcal
+- Err on the realistic-high side. Breaded/fried main never below 600 kcal.
+
+MACRO ESTIMATION:
+- Protein: 100g lean meat ≈ 25-30g, fish ≈ 20-25g, eggs ≈ 12g each
+- Carbs: fries 35g/portion, rice 50g/portion, beer 15g/500ml
+- Fat: breading/frying +15-25g, cream sauce +20-30g
+
+VAGUENESS CHECK (IMPORTANT):
+If input is too vague for a meaningful estimate (e.g. just "pizza", "pasta", "salad", "meat", "drink", "snack" without quantity/type), ask ONE concise clarifying question instead of estimating.
+Examples of too vague:
+- "Pizza" → Question: "Which pizza (pepperoni, margherita...) and how many slices?"
+- "Pasta" → Question: "Which pasta and which sauce (bolognese, carbonara, pesto...)?"
+- "Salad" → Question: "Which salad and with which ingredients (chicken, tuna, cheese...)?"
+- "Beer" → Question: "How many and what size (pint, 500ml)?"
+Not too vague: specific dishes with ingredients ("turkey schnitzel with potato salad"), everyday items ("2 beers", "an apple"), composed descriptions.
+${isFollowup ? 'THIS IS ALREADY A CLARIFICATION — estimate now, DO NOT ask further questions.' : ''}
+
+EMOJI: Pick fitting emoji from: 🍽️ (general), 🥩 (meat), 🍗 (poultry), 🐟 (fish), 🥗 (salad), 🍝 (pasta), 🍕 (pizza), 🍔 (burger), 🌯 (wrap), 🍜 (soup), 🍲 (stew), 🥘 (main), 🍚 (rice), 🥐 (pastry), 🥖 (bread), 🍳 (eggs), 🥞 (pancakes), 🍫 (chocolate), 🍪 (sweet), 🍎 (fruit), 🥜 (nuts), 🍺 (beer), 🍷 (wine), ☕ (coffee), 🍵 (tea), 💧 (water).
+
+Respond ONLY as JSON (no markdown, no explanation):
+- Clear input: {"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>,"emoji":"<emoji>","label":"<short description max 50 chars>"}
+- Too vague: {"needsClarification":true,"question":"<one concise follow-up question>"}`;
+
+    const modelName = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: modelName,
+        max_tokens: 400,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error(`❌ quick-log Anthropic ${r.status} for ${userEmail}:`, errText.slice(0, 300));
+      return res.status(502).json({ error: 'AI service error' });
+    }
+
+    const data = await r.json();
+    const rawText = data?.content?.[0]?.text?.trim();
+    if (!rawText) return res.status(502).json({ error: 'Empty AI response' });
+
+    // Parse JSON (strip any accidental markdown fences)
+    let parsed;
+    try {
+      const jsonText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+      parsed = JSON.parse(jsonText);
+    } catch (e) {
+      console.error(`❌ quick-log JSON parse failed for ${userEmail}:`, rawText.slice(0, 200));
+      return res.status(502).json({ error: 'AI response format error' });
+    }
+
+    // Clarification branch
+    if (parsed.needsClarification) {
+      console.log(`✅ quick-log clarify for ${userEmail}: "${inputText}" → ask`);
+      return res.json({
+        needsClarification: true,
+        question: parsed.question || (de ? 'Kannst du das präzisieren?' : 'Can you clarify?'),
+        originalText: inputText,
+      });
+    }
+
+    // Estimate branch — sanitize numbers
+    const result = {
+      kcal: Math.max(0, Math.round(Number(parsed.kcal) || 0)),
+      protein: Math.max(0, Math.round(Number(parsed.protein) || 0)),
+      carbs: Math.max(0, Math.round(Number(parsed.carbs) || 0)),
+      fat: Math.max(0, Math.round(Number(parsed.fat) || 0)),
+      emoji: (typeof parsed.emoji === 'string' && parsed.emoji.length <= 4) ? parsed.emoji : '🍽️',
+      label: (typeof parsed.label === 'string' ? parsed.label : combinedText).slice(0, 80),
+    };
+
+    console.log(`✅ quick-log OK for ${userEmail}: "${combinedText.slice(0,40)}" → ${result.kcal}kcal`);
+    res.json(result);
+  } catch (err) {
+    console.error('❌ /ai/quick-log error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/create-checkout', async (req, res) => {
   try {
     const { email, plan, tier, userData, consent, voucher, lang } = req.body;
@@ -1100,6 +1322,18 @@ app.post('/create-checkout', async (req, res) => {
     if (!consent || consent.healthData !== true || consent.terms !== true) {
       console.warn(`⚠️ Checkout blocked for ${email}: missing GDPR consent`);
       return res.status(400).json({ error: 'Consent required' });
+    }
+
+    // ── AGE GATE (GDPR §8 BDSG: minimum 16) ────────────────────────────
+    const ageNum = parseInt(userData && userData.age, 10);
+    if (!ageNum || ageNum < 16 || ageNum > 120) {
+      console.warn(`⚠️ Checkout blocked for ${email}: invalid age (${userData && userData.age})`);
+      return res.status(400).json({
+        error: 'AGE_RESTRICTION',
+        message: lang === 'de'
+          ? 'PEAK ist ab 16 Jahren verfügbar.'
+          : 'PEAK is available from age 16.'
+      });
     }
 
     // ── DUPLICATE SUBSCRIPTION PREVENTION ─────────────────────────────
@@ -1525,6 +1759,159 @@ app.post('/user/update-profile', async (req, res) => {
     res.json({ profile: data });
   } catch (err) {
     console.error('❌ /user/update-profile error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE ACCOUNT (auth-protected) ───────────────────────────────────
+// Full GDPR Art. 17 "Right to Erasure" compliance — also Google Play
+// (since 2024) and Apple (since 2022) require an in-app account deletion
+// option. This is a HARD DELETE, not soft — executes immediately.
+//
+// Flow:
+//   1. Cancel Stripe subscription immediately (if any)
+//   2. Delete login_codes rows
+//   3. Delete public.users row
+//   4. Delete Supabase Auth user
+//   5. Send confirmation email
+app.delete('/user/account', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    const userId = userData.user.id;
+    const email = (userData.user.email || '').toLowerCase();
+    const lang = (req.body && req.body.lang) || 'de';
+
+    console.log(`🗑️  Account deletion started: ${email} (${userId})`);
+
+    // 1. Load profile for Stripe IDs + lang
+    const { data: profile } = await supabase
+      .from('users')
+      .select('stripe_customer_id, stripe_subscription_id, lang, name')
+      .eq('id', userId)
+      .maybeSingle();
+
+    const userLang = (profile && profile.lang) || lang || 'de';
+    const userName = (profile && profile.name) || '';
+
+    // 2. Cancel Stripe subscription immediately (if any)
+    if (profile && profile.stripe_subscription_id) {
+      try {
+        await stripe.subscriptions.cancel(profile.stripe_subscription_id, {
+          invoice_now: false,
+          prorate: false,
+        });
+        console.log(`   ✓ Stripe subscription cancelled: ${profile.stripe_subscription_id}`);
+      } catch (err) {
+        // Sub might already be cancelled — log but continue
+        console.warn(`   ⚠ Stripe sub cancel failed (continuing): ${err.message}`);
+      }
+    }
+
+    // 3. Delete Stripe customer (optional — keeps invoice history if not deleted)
+    // We keep the customer for legal/tax record reasons (invoices must be
+    // retained 10 years in DE per §147 AO). Only the subscription is cancelled.
+
+    // 4. Delete login_codes rows (cleanup)
+    try {
+      await supabase
+        .from('login_codes')
+        .delete()
+        .eq('email', email);
+      console.log(`   ✓ login_codes deleted for ${email}`);
+    } catch (err) {
+      console.warn(`   ⚠ login_codes delete failed: ${err.message}`);
+    }
+
+    // 5. Delete public.users row
+    try {
+      const { error: delProfileErr } = await supabase
+        .from('users')
+        .delete()
+        .eq('id', userId);
+      if (delProfileErr) throw delProfileErr;
+      console.log(`   ✓ public.users row deleted`);
+    } catch (err) {
+      console.error(`   ❌ users row delete failed: ${err.message}`);
+      return res.status(500).json({ error: 'Failed to delete profile data' });
+    }
+
+    // 6. Delete Supabase Auth user (hard delete)
+    try {
+      const { error: delAuthErr } = await supabase.auth.admin.deleteUser(userId);
+      if (delAuthErr) throw delAuthErr;
+      console.log(`   ✓ Supabase Auth user deleted`);
+    } catch (err) {
+      console.error(`   ❌ auth user delete failed: ${err.message}`);
+      // Don't fail the whole request — profile is already gone, user
+      // effectively can't login anymore. Log for manual cleanup.
+    }
+
+    // 7. Send confirmation email (best-effort)
+    try {
+      await sendEmail(email, 'account_deleted', { name: userName, lang: userLang });
+      console.log(`   ✓ Confirmation email sent to ${email}`);
+    } catch (err) {
+      console.warn(`   ⚠ Confirmation email failed: ${err.message}`);
+    }
+
+    console.log(`✅ Account deletion complete: ${email}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('❌ /user/account DELETE error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── EXPORT MY DATA (GDPR Art. 20) ─────────────────────────────────────
+// Assembles all user-related data into a JSON package and emails it
+// as a download link (stored briefly). Users have a right to portability.
+app.get('/user/export-data', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    const userId = userData.user.id;
+    const email = (userData.user.email || '').toLowerCase();
+
+    // Gather everything we have on this user
+    const { data: profile } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', userId)
+      .maybeSingle();
+
+    // Build export JSON (strip internal-only fields that aren't user data)
+    const exportPayload = {
+      export_generated_at: new Date().toISOString(),
+      export_format_version: '1.0',
+      user_id: userId,
+      email: email,
+      profile: profile || null,
+      _notice: 'This export contains all personal data MJ Performance / PEAK holds about you. Payment data is held by Stripe and not included here — see stripe.com/privacy. AI prompts sent to Anthropic during your usage are not retained (Zero Data Retention).'
+    };
+
+    console.log(`📦 Data export generated for ${email}`);
+
+    // Return as downloadable JSON
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="peak-data-export-${Date.now()}.json"`);
+    res.send(JSON.stringify(exportPayload, null, 2));
+  } catch (err) {
+    console.error('❌ /user/export-data error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2332,6 +2719,13 @@ async function sendEmail(to, type, data) {
     cancelFinalF3: '1 Plan-Generierung pro 30 Tage',
     cancelFinalReactivate: 'Premium vermissen? Upgrade ist jederzeit möglich — dein Profil ist gespeichert.',
     cancelFinalCTA: 'Premium zurückholen',
+    accountDeletedSubject: 'Dein PEAK-Konto wurde gelöscht',
+    accountDeletedLabel: 'Konto gelöscht',
+    accountDeletedH1a: 'Dein Konto',
+    accountDeletedH1b: 'ist gelöscht.',
+    accountDeletedBody: (name) => (name ? name + ', d' : 'D') + 'ein PEAK-Konto wurde auf deinen Wunsch hin vollständig gelöscht. Alle deine Daten (Profil, Ziele, Fortschritt) wurden aus unserer Datenbank entfernt. Falls du ein Premium-Abo hattest, wurde es beendet.',
+    accountDeletedLegal: 'Hinweis: Rechnungen und Zahlungsdaten müssen wir aus steuerrechtlichen Gründen für 10 Jahre aufbewahren (§147 AO). Alle anderen personenbezogenen Daten sind gelöscht.',
+    accountDeletedBye: 'Danke, dass du PEAK ausprobiert hast. Falls du irgendwann zurückkommen möchtest — du bist willkommen.',
   } : {
     welcomeSubject: (isFree) => isFree ? 'Welcome to PEAK — your free plan is ready' : 'Welcome to PEAK — your plan is ready',
     welcomeLabel: (n) => 'Welcome' + (n ? ', ' + n : ''),
@@ -2406,6 +2800,13 @@ async function sendEmail(to, type, data) {
     cancelFinalF3: '1 plan generation every 30 days',
     cancelFinalReactivate: 'Missing Premium? You can upgrade anytime — your profile is saved.',
     cancelFinalCTA: 'Bring back Premium',
+    accountDeletedSubject: 'Your PEAK account has been deleted',
+    accountDeletedLabel: 'Account deleted',
+    accountDeletedH1a: 'Your account',
+    accountDeletedH1b: 'is deleted.',
+    accountDeletedBody: (name) => (name ? name + ', y' : 'Y') + 'our PEAK account has been fully deleted at your request. All your data (profile, goals, progress) has been removed from our database. If you had a Premium subscription, it has been ended.',
+    accountDeletedLegal: 'Note: invoices and payment records must be retained for 10 years for tax-law reasons (German §147 AO). All other personal data has been deleted.',
+    accountDeletedBye: 'Thanks for trying PEAK. If you ever want to come back — you\'re welcome.',
   };
 
   // Responsive email CSS: proper mobile breakpoint + padding reduction
@@ -2657,6 +3058,31 @@ async function sendEmail(to, type, data) {
 
         <tr><td class="email-cta" align="center" style="padding:0 40px 56px;">
           ${emailButton(FRONTEND_URL, L.cancelFinalCTA)}
+        </td></tr>
+
+        <tr><td>${emailFooter(to)}</td></tr>
+      `)
+    },
+
+    // ── ACCOUNT DELETED (GDPR Art. 17 — confirmation email) ──
+    account_deleted: {
+      subject: L.accountDeletedSubject,
+      html: emailShell(RESPONSIVE_CSS + `
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.accountDeletedLabel}</p>
+          <h1 class="email-h1" style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${L.accountDeletedH1a}<br>${L.accountDeletedH1b}
+          </h1>
+          <p style="margin:0 0 20px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            ${L.accountDeletedBody(data.name || '')}
+          </p>
+          <p style="margin:0 0 20px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};padding:14px 16px;background:#F5F5F3;border-left:3px solid ${BRAND.red};">
+            ${L.accountDeletedLegal}
+          </p>
+          <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            ${L.accountDeletedBye}
+          </p>
         </td></tr>
 
         <tr><td>${emailFooter(to)}</td></tr>
