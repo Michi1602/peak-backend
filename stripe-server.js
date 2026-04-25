@@ -266,24 +266,41 @@ app.post('/auth/send-otp', async (req, res) => {
     const normalizedEmail = email.trim().toLowerCase();
     const emailLang = (lang === 'de' || lang === 'en') ? lang : 'en';
 
-    // Block users flagged for voucher abuse — no re-entry via OTP
+    // ── ACCOUNT EXISTENCE CHECK ────────────────────────────────────────
+    // Before sending an OTP we make sure an account actually exists for
+    // this email. Saves the user from waiting for an email that says
+    // "no account" — and saves us Resend credits.
+    let existingUser = null;
     try {
-      const { data: existingUser } = await supabase
+      const { data } = await supabase
         .from('users')
         .select('status')
         .eq('email', normalizedEmail)
         .maybeSingle();
-      if (existingUser?.status === 'blocked_voucher_abuse') {
-        console.warn(`🚫 OTP blocked for abuse-flagged user: ${normalizedEmail}`);
-        return res.status(403).json({
-          error: 'account_blocked',
-          message: emailLang === 'de'
-            ? 'Dieser Account wurde wegen Verstoß gegen die Voucher-Regeln gesperrt. Bitte kontaktiere den Support.'
-            : 'This account has been blocked due to voucher policy violation. Please contact support.',
-        });
-      }
+      existingUser = data;
     } catch (e) {
-      console.warn('Block-check failed (fail-open):', e.message);
+      console.warn('Account-existence check failed (fail-open):', e.message);
+    }
+
+    if (!existingUser) {
+      console.log(`ℹ️  OTP refused (no account): ${normalizedEmail}`);
+      return res.status(404).json({
+        error: 'no_account',
+        message: emailLang === 'de'
+          ? 'Für diese E-Mail gibt es noch kein Konto. Möchtest du dich kostenlos anmelden?'
+          : 'There is no account for this email yet. Want to sign up for free?',
+      });
+    }
+
+    // Block users flagged for voucher abuse — no re-entry via OTP
+    if (existingUser.status === 'blocked_voucher_abuse') {
+      console.warn(`🚫 OTP blocked for abuse-flagged user: ${normalizedEmail}`);
+      return res.status(403).json({
+        error: 'account_blocked',
+        message: emailLang === 'de'
+          ? 'Dieser Account wurde wegen Verstoß gegen die Voucher-Regeln gesperrt. Bitte kontaktiere den Support.'
+          : 'This account has been blocked due to voucher policy violation. Please contact support.',
+      });
     }
 
     // Rate limit: max 3 codes per email per 15 minutes
@@ -2302,6 +2319,9 @@ app.post('/webhook', async (req, res) => {
         console.error('❌ Could not fetch customer for cancellation:', err.message);
       }
       if (email) {
+        // Normalise to lowercase — DB stores normalised emails, Stripe may
+        // hand us mixed case which would silently miss the row.
+        email = email.toLowerCase().trim();
         // Downgrade tier to free — prevents continued premium access after cancellation
         // Keep status history: if already blocked_voucher_abuse, don't overwrite
         const { data: existing } = await supabase
@@ -2350,14 +2370,19 @@ app.post('/webhook', async (req, res) => {
         } catch (err) {
           console.error('❌ Could not fetch customer for sub.updated:', err.message);
         }
+        // Normalise to lowercase — see "Email-Case-Bug" notes
+        if (email) email = email.toLowerCase().trim();
         if (email && justCancelled) {
           // Email A: Cancellation confirmed — premium continues until period end
           const periodEnd = sub.cancel_at || sub.current_period_end;
           const endDate = periodEnd ? new Date(periodEnd * 1000) : null;
-          // Mark in DB as pending cancellation + store end date for reminder cron
+          // Mark in DB as pending cancellation + store end date for reminder cron.
+          // Reset cancel_reminder_sent so a fresh reminder is queued for this
+          // cancellation cycle (relevant if user previously reactivated).
           await supabase.from('users').update({
             status: 'cancelling',
             cancel_at: endDate ? endDate.toISOString() : null,
+            cancel_reminder_sent: false,
           }).eq('email', email);
 
           try {
@@ -2371,10 +2396,12 @@ app.post('/webhook', async (req, res) => {
           }
         }
         if (email && wasReactivated) {
-          // User clicked "Don't cancel" in portal → restore status
+          // User clicked "Don't cancel" in portal → restore status + reset
+          // the reminder flag (so a future cancel triggers a fresh reminder).
           await supabase.from('users').update({
             status: 'active',
             cancel_at: null,
+            cancel_reminder_sent: false,
           }).eq('email', email);
           console.log(`✅ User un-cancelled (reactivated): ${email}`);
         }
@@ -2392,6 +2419,7 @@ app.post('/webhook', async (req, res) => {
           }
         }
         if (email) {
+          email = email.toLowerCase().trim();
           const { error } = await supabase.from('users').update({ status: 'active' }).eq('email', email);
           if (error) console.error('❌ Supabase update (active) failed:', error.message);
           else console.log(`✅ User renewed: ${email}`);
@@ -3125,6 +3153,10 @@ cron.schedule('0 10 * * *', async () => {
   }
 
   // ── 2. CANCELLATION REMINDERS ──
+  // Send a win-back email when the user is 2-4 days away from period end.
+  // Window (instead of exact ===3) is safety net for cron downtime.
+  // We track `cancel_reminder_sent` in DB so a user only ever gets ONE
+  // reminder even if cron runs multiple times in window.
   try {
     const { data: cancellingUsers } = await supabase
       .from('users')
@@ -3133,18 +3165,27 @@ cron.schedule('0 10 * * *', async () => {
       .eq('unsubscribed', false);
     for (const user of cancellingUsers || []) {
       if (!user.cancel_at) continue;
+      if (user.cancel_reminder_sent === true) continue; // already reminded
       const daysLeft = Math.ceil((new Date(user.cancel_at) - now) / (1000 * 60 * 60 * 24));
-      // Send reminder 3 days before end
-      if (daysLeft === 3) {
+      // Window: 2-4 days before end (catches cron-downtime cases)
+      if (daysLeft >= 2 && daysLeft <= 4) {
         const endDateStr = new Date(user.cancel_at).toLocaleDateString(
           user.lang === 'de' ? 'de-DE' : 'en-GB',
           { day: '2-digit', month: 'long', year: 'numeric' }
         );
-        await sendEmail(user.email, 'cancellation_reminder', {
-          daysLeft: 3,
-          endDate: endDateStr,
-        });
-        console.log(`📧 Cancellation reminder → ${user.email} (${daysLeft}d left)`);
+        try {
+          await sendEmail(user.email, 'cancellation_reminder', {
+            daysLeft: daysLeft,
+            endDate: endDateStr,
+          });
+          // Mark as sent so we don't repeat
+          await supabase.from('users').update({
+            cancel_reminder_sent: true,
+          }).eq('email', user.email);
+          console.log(`📧 Cancellation reminder → ${user.email} (${daysLeft}d left)`);
+        } catch (err) {
+          console.error(`⚠️  cancellation_reminder send failed for ${user.email}:`, err.message);
+        }
       }
     }
   } catch (err) {
