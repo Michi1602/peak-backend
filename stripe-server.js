@@ -46,107 +46,15 @@ app.get('/unsubscribe', async (req, res) => {
 });
 
 // ── LEGAL PAGES ───────────────────────────────────────────────────────
-const legalStyle = `body{font-family:sans-serif;max-width:680px;margin:0 auto;padding:40px 20px;color:#1C1C1A;line-height:1.7}h1{font-size:28px;margin-bottom:8px}h2{font-size:18px;margin-top:32px;margin-bottom:8px}p{margin-bottom:12px}a{color:#2D6A4F}.back{display:inline-block;background:#2D6A4F;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-size:13px;margin-bottom:24px}ul{padding-left:20px;line-height:2}hr{margin:40px 0;border:none;border-top:1px solid #E8E8E3}.note{color:#999;font-size:13px}`;
-
-app.get('/datenschutz', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Datenschutzerklärung — PEAK</title><style>${legalStyle}</style></head><body>
-<a href="${FRONTEND_URL}" class="back">← Zurück zur App</a>
-<h1>Datenschutzerklärung</h1>
-<p><strong>Stand:</strong> ${new Date().toLocaleDateString('de-DE')}</p>
-<h2>1. Verantwortlicher</h2>
-<p>${COMPANY.owner}<br>${COMPANY.name}<br>${COMPANY.address}<br>E-Mail: <a href="mailto:${COMPANY.email}">${COMPANY.email}</a></p>
-<h2>2. Erhobene Daten</h2>
-<ul><li>Name und E-Mail-Adresse (bei Registrierung)</li><li>Gesundheitliche Angaben (Gewicht, Größe, Ernährungspräferenzen — freiwillig)</li><li>Zahlungsdaten (verarbeitet durch Stripe — wir speichern keine Kartendaten)</li><li>Nutzungsdaten (Bewertungen, Protokolleinträge)</li></ul>
-<h2>3. Zweck der Datenverarbeitung</h2>
-<p>Wir verarbeiten deine Daten zur Erbringung des personalisierten KI-Coaching-Dienstes, zur Abwicklung von Zahlungen sowie zur Kommunikation (Transaktions-E-Mails, Erinnerungen).</p>
-<h2>4. Rechtsgrundlage</h2>
-<p>Die Verarbeitung erfolgt auf Basis von Art. 6 Abs. 1 lit. b DSGVO (Vertragserfüllung) und Art. 6 Abs. 1 lit. a DSGVO (Einwilligung).</p>
-<h2>5. Drittanbieter</h2>
-<ul><li><strong>Stripe</strong> (Zahlungsabwicklung) — stripe.com/de/privacy</li><li><strong>Supabase</strong> (Datenbank) — supabase.com/privacy</li><li><strong>Resend</strong> (E-Mail-Versand) — resend.com/legal/privacy-policy</li><li><strong>Anthropic</strong> (KI-Analyse) — anthropic.com/privacy</li></ul>
-<h2>6. Datenspeicherung</h2>
-<p>Deine Daten werden so lange gespeichert, wie du ein aktives Konto bei PEAK hast. Nach Kündigung werden persönliche Daten innerhalb von 30 Tagen gelöscht.</p>
-<h2>7. Deine Rechte</h2>
-<p>Du hast das Recht auf Auskunft, Berichtigung, Löschung und Datenportabilität. Kontakt: <a href="mailto:${COMPANY.email}">${COMPANY.email}</a></p>
-<h2>8. Cookies</h2>
-<p>PEAK verwendet keine Tracking-Cookies. Es werden ausschließlich technisch notwendige Session-Daten verwendet.</p>
-<hr><p class="note"><strong>English version:</strong> <a href="/privacy">/privacy</a></p>
-</body></html>`);
-});
-
-app.get('/privacy', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Privacy Policy — PEAK</title><style>${legalStyle}</style></head><body>
-<a href="${FRONTEND_URL}" class="back">← Back to app</a>
-<h1>Privacy Policy</h1>
-<p><strong>Last updated:</strong> ${new Date().toLocaleDateString('en-GB')}</p>
-<h2>1. Controller</h2>
-<p>${COMPANY.owner}<br>${COMPANY.name}<br>${COMPANY.address}<br>Email: <a href="mailto:${COMPANY.email}">${COMPANY.email}</a></p>
-<h2>2. Data We Collect</h2>
-<ul><li>Name and email address (on registration)</li><li>Health data (weight, height, dietary preferences — voluntary)</li><li>Payment data (processed by Stripe — we do not store card details)</li><li>Usage data (ratings, log entries)</li></ul>
-<h2>3. Purpose</h2>
-<p>We process your data to provide the personalised AI coaching service, process payments, and send transactional communications.</p>
-<h2>4. Legal Basis</h2>
-<p>Processing is based on Art. 6(1)(b) GDPR (contract performance) and Art. 6(1)(a) GDPR (consent).</p>
-<h2>5. Third Parties</h2>
-<ul><li><strong>Stripe</strong> (payments) — stripe.com/privacy</li><li><strong>Supabase</strong> (database) — supabase.com/privacy</li><li><strong>Resend</strong> (email) — resend.com/legal/privacy-policy</li><li><strong>Anthropic</strong> (AI) — anthropic.com/privacy</li></ul>
-<h2>6. Data Retention</h2>
-<p>Your data is retained for as long as you have an active PEAK account. Personal data is deleted within 30 days of account cancellation.</p>
-<h2>7. Your Rights</h2>
-<p>You have the right to access, rectification, deletion and data portability. Contact: <a href="mailto:${COMPANY.email}">${COMPANY.email}</a></p>
-<h2>8. Cookies</h2>
-<p>PEAK does not use tracking cookies. Only technically necessary session data is used.</p>
-<hr><p class="note"><strong>Deutsche Version:</strong> <a href="/datenschutz">/datenschutz</a></p>
-</body></html>`);
-});
-
-app.get('/impressum', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Impressum — PEAK</title><style>${legalStyle}</style></head><body>
-<a href="${FRONTEND_URL}" class="back">← Zurück zur App</a>
-<h1>Impressum</h1>
-<p><em>Angaben gemäß § 5 TMG / § 18 MStV</em></p>
-<h2>Verantwortlicher</h2>
-<p><strong>${COMPANY.owner}</strong><br>${COMPANY.name} (Einzelunternehmen)<br>${COMPANY.address}<br>Deutschland</p>
-<h2>Kontakt</h2>
-<p>E-Mail: <a href="mailto:${COMPANY.email}">${COMPANY.email}</a><br>Website: <a href="${COMPANY.website}">${COMPANY.website}</a></p>
-<h2>Umsatzsteuer</h2>
-<p>Gemäß § 19 UStG wird keine Umsatzsteuer erhoben (Kleinunternehmerregelung).</p>
-<h2>Verantwortlich für den Inhalt nach § 18 Abs. 2 MStV</h2>
-<p>${COMPANY.owner}, ${COMPANY.address}</p>
-<h2>Haftungsausschluss (Gesundheit)</h2>
-<p>PEAK ist kein Medizinprodukt und ersetzt keine ärztliche, ernährungswissenschaftliche oder sporttherapeutische Beratung. Die in der App bereitgestellten Trainings-, Ernährungs- und Regenerationsempfehlungen dienen ausschließlich informatorischen Zwecken. Bei bestehenden gesundheitlichen Beschwerden, Schwangerschaft, Essstörungen, Diabetes, Herz-Kreislauf-Erkrankungen oder anderen medizinischen Bedingungen konsultiere vor der Nutzung der App deinen Arzt. Bei Unwohlsein während Training oder Ernährungsumstellung brich sofort ab und suche ärztliche Hilfe. <strong>Im Notfall: 112.</strong></p>
-<h2>Haftung für Inhalte</h2>
-<p>Die Inhalte dieser Seite wurden mit größter Sorgfalt erstellt. Für die Richtigkeit, Vollständigkeit und Aktualität der Inhalte kann jedoch keine Gewähr übernommen werden. Als Diensteanbieter sind wir gemäß § 7 Abs. 1 TMG für eigene Inhalte auf diesen Seiten nach den allgemeinen Gesetzen verantwortlich.</p>
-<h2>Urheberrecht</h2>
-<p>Die durch den Betreiber erstellten Inhalte und Werke auf diesen Seiten unterliegen dem deutschen Urheberrecht.</p>
-<h2>Streitschlichtung</h2>
-<p>Die EU-Kommission stellt eine Plattform zur Online-Streitbeilegung (OS) bereit: <a href="https://ec.europa.eu/consumers/odr" target="_blank" rel="noopener">ec.europa.eu/consumers/odr</a>.</p>
-<p>Wir sind nicht bereit oder verpflichtet, an Streitbeilegungsverfahren vor einer Verbraucherschlichtungsstelle teilzunehmen.</p>
-<hr><p class="note"><strong>English:</strong> <a href="/imprint">/imprint</a> · <strong>Datenschutz:</strong> <a href="/datenschutz">/datenschutz</a></p>
-</body></html>`);
-});
-
-app.get('/imprint', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Legal Notice — PEAK</title><style>${legalStyle}</style></head><body>
-<a href="${FRONTEND_URL}" class="back">← Back to app</a>
-<h1>Legal Notice</h1>
-<p><em>Information pursuant to § 5 TMG (German Telemedia Act)</em></p>
-<h2>Responsible Party</h2>
-<p><strong>${COMPANY.owner}</strong><br>${COMPANY.name} (sole proprietorship)<br>${COMPANY.address}<br>Germany</p>
-<h2>Contact</h2>
-<p>Email: <a href="mailto:${COMPANY.email}">${COMPANY.email}</a><br>Website: <a href="${COMPANY.website}">${COMPANY.website}</a></p>
-<h2>VAT</h2>
-<p>Pursuant to § 19 German VAT Act (UStG), no VAT is charged (small-business regulation).</p>
-<h2>Health Disclaimer</h2>
-<p>PEAK is not a medical device and does not replace medical, nutritional or sports-therapeutic advice. The training, nutrition and recovery recommendations provided in the app are for informational purposes only. Consult your physician before using this app if you have existing health conditions, are pregnant, have an eating disorder, diabetes, cardiovascular disease, or any other medical condition. Stop any activity immediately if you feel unwell and seek medical help. <strong>Emergency in EU: 112.</strong></p>
-<h2>Liability for Content</h2>
-<p>The contents of this site were created with the greatest care. However, no guarantee can be given for the accuracy, completeness or timeliness of the contents.</p>
-<h2>Copyright</h2>
-<p>The content and works created by the operator on these pages are subject to German copyright law.</p>
-<h2>Online Dispute Resolution</h2>
-<p>The EU Commission provides an online dispute resolution platform: <a href="https://ec.europa.eu/consumers/odr" target="_blank" rel="noopener">ec.europa.eu/consumers/odr</a>.</p>
-<p>We are neither willing nor obliged to participate in dispute resolution proceedings before a consumer arbitration body.</p>
-<hr><p class="note"><strong>Deutsche Version:</strong> <a href="/impressum">/impressum</a> · <strong>Privacy:</strong> <a href="/privacy">/privacy</a></p>
-</body></html>`);
-});
+// The authoritative versions of Datenschutz/Impressum live on the
+// frontend (Vercel) as static HTML files. They have full DE+EN content
+// with TOC and processing-activities table. We keep these backend routes
+// only as 301 redirects so any old bookmarks or search-engine cached
+// URLs still land users on the right page.
+app.get('/datenschutz', (req, res) => res.redirect(301, `${FRONTEND_URL}/datenschutz`));
+app.get('/privacy',     (req, res) => res.redirect(301, `${FRONTEND_URL}/datenschutz`));
+app.get('/impressum',   (req, res) => res.redirect(301, `${FRONTEND_URL}/impressum`));
+app.get('/imprint',     (req, res) => res.redirect(301, `${FRONTEND_URL}/impressum`));
 
 // ── CREATE CHECKOUT SESSION ───────────────────────────────────────────
 // ── CHECK IF EMAIL ALREADY HAS AN ACCOUNT ─────────────────────────────
@@ -2495,7 +2403,7 @@ function emailFooter(email) {
           <span style="color:#555;"> · </span>
           <a href="${unsub}" style="color:#AAA;text-decoration:none;">Unsubscribe</a>
         </p>
-        <p style="margin:0;color:#666;font-size:10px;letter-spacing:0.5px;">${COMPANY.name} · <a href="${BACKEND_URL}/impressum" style="color:#AAA;text-decoration:none;">Impressum</a></p>
+        <p style="margin:0;color:#666;font-size:10px;letter-spacing:0.5px;">${COMPANY.name}</p>
       </td>
     </tr>
   </table>`;
@@ -2519,8 +2427,8 @@ function buildOtpEmail(code, email, lang) {
       ? 'Wenn du diesen Code nicht angefordert hast, ignoriere diese E-Mail.'
       : 'If you did not request this code, ignore this email.',
     footer: de
-      ? 'PEAK by MJ Performance · Impressum: ' + BACKEND_URL + '/impressum'
-      : 'PEAK by MJ Performance · Legal: ' + BACKEND_URL + '/impressum',
+      ? 'PEAK by MJ Performance · Impressum: ' + FRONTEND_URL + '/impressum'
+      : 'PEAK by MJ Performance · Legal: ' + FRONTEND_URL + '/impressum',
   };
 
   // Format code with middle space for readability: "123 456"
