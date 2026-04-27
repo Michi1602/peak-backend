@@ -6,6 +6,29 @@ const cron = require('node-cron');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 
+// ── STARTUP ENV VALIDATION (Apr 2026 hardening) ──────────────────────
+// Fail loud at boot if a critical secret is missing instead of crashing
+// later when a user hits the affected endpoint. Prevents the worst case
+// where Stripe webhooks silently fail because STRIPE_WEBHOOK_SECRET was
+// forgotten on Render after a redeploy.
+const REQUIRED_ENV = [
+  'STRIPE_SECRET_KEY',
+  'STRIPE_WEBHOOK_SECRET',
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_KEY',
+  'ANTHROPIC_API_KEY',
+  'RESEND_API_KEY',
+];
+const MISSING_ENV = REQUIRED_ENV.filter(k => !process.env[k]);
+if (MISSING_ENV.length) {
+  console.error('═══════════════════════════════════════════════════════════════');
+  console.error('❌ FATAL: Missing required environment variables:');
+  MISSING_ENV.forEach(k => console.error(`   • ${k}`));
+  console.error('   Set these in Render → Environment before redeploying.');
+  console.error('═══════════════════════════════════════════════════════════════');
+  process.exit(1);
+}
+
 const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const resend = new Resend(process.env.RESEND_API_KEY);
@@ -2031,7 +2054,35 @@ app.post('/webhook', async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  console.log(`🔔 Webhook received: ${event.type}`);
+  console.log(`🔔 Webhook received: ${event.type} (${event.id})`);
+
+  // ── IDEMPOTENCY CHECK (Apr 2026 hardening) ─────────────────────────
+  // Stripe occasionally redelivers webhooks (network blips, retries after
+  // 5xx responses). Without this guard we would create duplicate auth
+  // users, send duplicate welcome emails, and double-count plan_generations.
+  // We persist event.id in `webhook_events` and bail out on duplicates.
+  // The table only stores ID + type + received_at, so size stays trivial.
+  try {
+    const { error: insertErr } = await supabase
+      .from('webhook_events')
+      .insert({
+        event_id: event.id,
+        event_type: event.type,
+        received_at: new Date().toISOString(),
+      });
+    if (insertErr) {
+      // Postgres unique-violation code is '23505'. Anything else → log but
+      // process the event anyway (fail-open: better to risk a duplicate
+      // than to silently drop a legitimate event).
+      if (insertErr.code === '23505') {
+        console.log(`↩️  Duplicate webhook event ${event.id} — already processed, skipping`);
+        return res.status(200).json({ received: true, duplicate: true });
+      }
+      console.warn(`⚠️  webhook_events insert failed (fail-open):`, insertErr.message);
+    }
+  } catch (e) {
+    console.warn('⚠️  Idempotency check threw (fail-open):', e.message);
+  }
 
   try {
     if (event.type === 'checkout.session.completed') {
@@ -2439,6 +2490,80 @@ app.post('/webhook', async (req, res) => {
           else console.log(`✅ User renewed: ${email}`);
         }
       }
+    } else if (event.type === 'invoice.payment_failed') {
+      // ── PAYMENT FAILED ──────────────────────────────────────────────
+      // Stripe retries the charge automatically on its dunning schedule
+      // (3 attempts over ~3 weeks by default). We don't cancel here —
+      // Stripe will fire customer.subscription.deleted at end of dunning
+      // if all retries fail. We just notify the user so they can update
+      // their card before the subscription gets cancelled.
+      const invoice = event.data.object;
+      let email = invoice.customer_email || null;
+      if (!email && invoice.customer) {
+        try {
+          const customer = await stripe.customers.retrieve(invoice.customer);
+          email = customer.email;
+        } catch (err) {
+          console.error('❌ Could not fetch customer for payment_failed:', err.message);
+        }
+      }
+      if (email) {
+        email = email.toLowerCase().trim();
+        // Mark as past_due so the app can show a banner / restrict access
+        const { error: updErr } = await supabase
+          .from('users')
+          .update({ status: 'past_due' })
+          .eq('email', email);
+        if (updErr) console.error('❌ Supabase update (past_due) failed:', updErr.message);
+
+        // Send email — but only on the first attempt to avoid spamming on
+        // every retry. Stripe sets attempt_count starting at 1.
+        const attempt = invoice.attempt_count || 1;
+        if (attempt === 1) {
+          const { data: user } = await supabase
+            .from('users')
+            .select('name, language')
+            .eq('email', email)
+            .maybeSingle();
+          await sendEmail(email, 'payment_failed', {
+            name: user?.name || '',
+            lang: user?.language || 'de',
+          });
+          console.log(`📧 Payment-failed email → ${email} (attempt ${attempt})`);
+        } else {
+          console.log(`ℹ️  Payment failed for ${email} (attempt ${attempt}) — no email (already notified)`);
+        }
+      }
+    } else if (event.type === 'customer.subscription.trial_will_end') {
+      // ── TRIAL ENDING SOON ──────────────────────────────────────────
+      // Stripe fires this 3 days before trial_end. We send a friendly
+      // reminder so the user can cancel cleanly if they don't want to
+      // be charged. Required by Apple & Google for subscription apps,
+      // also a good-faith signal that builds trust.
+      const sub = event.data.object;
+      let email = null;
+      if (sub.customer) {
+        try {
+          const customer = await stripe.customers.retrieve(sub.customer);
+          email = customer.email;
+        } catch (err) {
+          console.error('❌ Could not fetch customer for trial_will_end:', err.message);
+        }
+      }
+      if (email) {
+        email = email.toLowerCase().trim();
+        const { data: user } = await supabase
+          .from('users')
+          .select('name, language')
+          .eq('email', email)
+          .maybeSingle();
+        await sendEmail(email, 'trial_ending', {
+          name: user?.name || '',
+          lang: user?.language || 'de',
+          trialEnd: sub.trial_end ? new Date(sub.trial_end * 1000) : null,
+        });
+        console.log(`📧 Trial-ending email → ${email}`);
+      }
     }
   } catch (err) {
     console.error('❌ Webhook handler error:', err.message, err.stack);
@@ -2768,6 +2893,22 @@ async function sendEmail(to, type, data) {
     accountDeletedBody: (name) => (name ? name + ', d' : 'D') + 'ein PEAK-Konto wurde auf deinen Wunsch hin vollständig gelöscht. Alle deine Daten (Profil, Ziele, Fortschritt) wurden aus unserer Datenbank entfernt. Falls du ein Premium-Abo hattest, wurde es beendet.',
     accountDeletedLegal: 'Hinweis: Rechnungen und Zahlungsdaten müssen wir aus steuerrechtlichen Gründen für 10 Jahre aufbewahren (§147 AO). Alle anderen personenbezogenen Daten sind gelöscht.',
     accountDeletedBye: 'Danke, dass du PEAK ausprobiert hast. Falls du irgendwann zurückkommen möchtest — du bist willkommen.',
+    // ── PAYMENT FAILED (DE) ──
+    paymentFailedSubject: 'Zahlung fehlgeschlagen — bitte Karte aktualisieren',
+    paymentFailedLabel: 'Zahlung fehlgeschlagen',
+    paymentFailedH1a: 'Deine Zahlung',
+    paymentFailedH1b: 'ging schief.',
+    paymentFailedBody: (name) => (name ? name + ', w' : 'W') + 'ir konnten deine letzte Abbuchung nicht durchführen. Häufigster Grund: abgelaufene Karte oder fehlendes Guthaben. Stripe versucht es in den nächsten Tagen automatisch erneut.',
+    paymentFailedBox: '<strong>Was du tun kannst:</strong> Öffne PEAK, gehe zu Einstellungen → Abonnement → Zahlungsmethode und hinterlege eine aktuelle Karte. Sobald die Zahlung durchgeht, läuft dein Abo nahtlos weiter.',
+    paymentFailedCTA: 'Karte aktualisieren',
+    // ── TRIAL ENDING (DE) — fired by Stripe 3 days before trial_end ──
+    trialEndingSubject: 'Deine Testphase endet in 3 Tagen',
+    trialEndingLabel: 'Noch 3 Tage gratis',
+    trialEndingH1a: 'In 3 Tagen',
+    trialEndingH1b: 'startet dein Abo.',
+    trialEndingBody: (name, dateStr) => (name ? name + ', d' : 'D') + 'eine 7-tägige Testphase endet ' + (dateStr ? 'am <strong>' + dateStr + '</strong>' : 'in 3 Tagen') + '. Danach startet dein PEAK-Abo automatisch — du musst nichts tun, um weiterzumachen.',
+    trialEndingBox: '<strong>Möchtest du nicht weitermachen?</strong> Öffne PEAK → Einstellungen → Abonnement → Testphase beenden. 10 Sekunden, kein Telefonat.',
+    trialEndingCTA: 'PEAK öffnen',
   } : {
     welcomeSubject: (isFree) => isFree ? 'Welcome to PEAK — your free plan is ready' : 'Welcome to PEAK — your plan is ready',
     welcomeLabel: (n) => 'Welcome' + (n ? ', ' + n : ''),
@@ -2849,6 +2990,22 @@ async function sendEmail(to, type, data) {
     accountDeletedBody: (name) => (name ? name + ', y' : 'Y') + 'our PEAK account has been fully deleted at your request. All your data (profile, goals, progress) has been removed from our database. If you had a Premium subscription, it has been ended.',
     accountDeletedLegal: 'Note: invoices and payment records must be retained for 10 years for tax-law reasons (German §147 AO). All other personal data has been deleted.',
     accountDeletedBye: 'Thanks for trying PEAK. If you ever want to come back — you\'re welcome.',
+    // ── PAYMENT FAILED (EN) ──
+    paymentFailedSubject: 'Payment failed — please update your card',
+    paymentFailedLabel: 'Payment failed',
+    paymentFailedH1a: 'Your payment',
+    paymentFailedH1b: 'didn\'t go through.',
+    paymentFailedBody: (name) => (name ? name + ', w' : 'W') + 'e couldn\'t process your last payment. Most common reason: expired card or insufficient funds. Stripe will retry automatically over the next few days.',
+    paymentFailedBox: '<strong>What you can do:</strong> Open PEAK, go to Settings → Subscription → Payment method and add a current card. Once the charge goes through, your subscription continues without interruption.',
+    paymentFailedCTA: 'Update card',
+    // ── TRIAL ENDING (EN) — fired by Stripe 3 days before trial_end ──
+    trialEndingSubject: 'Your trial ends in 3 days',
+    trialEndingLabel: '3 days of trial left',
+    trialEndingH1a: 'In 3 days',
+    trialEndingH1b: 'your plan starts.',
+    trialEndingBody: (name, dateStr) => (name ? name + ', y' : 'Y') + 'our 7-day trial ends ' + (dateStr ? 'on <strong>' + dateStr + '</strong>' : 'in 3 days') + '. After that, your PEAK subscription starts automatically — you don\'t need to do anything to continue.',
+    trialEndingBox: '<strong>Don\'t want to continue?</strong> Open PEAK → Settings → Subscription → End trial. Ten seconds, no phone call.',
+    trialEndingCTA: 'Open PEAK',
   };
 
   // Responsive email CSS: proper mobile breakpoint + padding reduction
@@ -3125,6 +3282,64 @@ async function sendEmail(to, type, data) {
           <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
             ${L.accountDeletedBye}
           </p>
+        </td></tr>
+
+        <tr><td>${emailFooter(to)}</td></tr>
+      `)
+    },
+
+    // ── PAYMENT FAILED (Stripe webhook: invoice.payment_failed) ──
+    payment_failed: {
+      subject: L.paymentFailedSubject,
+      html: emailShell(RESPONSIVE_CSS + `
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.paymentFailedLabel}</p>
+          <h1 class="email-h1" style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${L.paymentFailedH1a}<br>${L.paymentFailedH1b}
+          </h1>
+          <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            ${L.paymentFailedBody(name)}
+          </p>
+
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};margin-bottom:32px;">
+            <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
+              ${L.paymentFailedBox}
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td class="email-cta" align="center" style="padding:0 40px 56px;">
+          ${emailButton(FRONTEND_URL, L.paymentFailedCTA)}
+        </td></tr>
+
+        <tr><td>${emailFooter(to)}</td></tr>
+      `)
+    },
+
+    // ── TRIAL ENDING (Stripe webhook: customer.subscription.trial_will_end) ──
+    trial_ending: {
+      subject: L.trialEndingSubject,
+      html: emailShell(RESPONSIVE_CSS + `
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.trialEndingLabel}</p>
+          <h1 class="email-h1" style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${L.trialEndingH1a}<br>${L.trialEndingH1b}
+          </h1>
+          <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            ${L.trialEndingBody(name, data?.trialEnd ? data.trialEnd.toLocaleDateString(de ? 'de-DE' : 'en-GB', { day: '2-digit', month: 'long', year: 'numeric' }) : '')}
+          </p>
+
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};margin-bottom:32px;">
+            <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
+              ${L.trialEndingBox}
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td class="email-cta" align="center" style="padding:0 40px 56px;">
+          ${emailButton(FRONTEND_URL, L.trialEndingCTA)}
         </td></tr>
 
         <tr><td>${emailFooter(to)}</td></tr>
