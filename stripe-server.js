@@ -4,6 +4,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { Resend } = require('resend');
 const cron = require('node-cron');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -21,9 +22,63 @@ const COMPANY = {
   owner: 'Michael Jahn',
 };
 
-app.use(cors());
+// ── CORS — restricted to known origins (security hardening Apr 2026) ──
+// Previously: app.use(cors()) — open to all origins, allowed CSRF-style abuse.
+// Now: explicit allowlist. TWA wraps the app so the origin in production
+// is the same as the deployed frontend.
+const ALLOWED_ORIGINS = [
+  'https://peak-mj-performance.app',
+  'https://www.peak-mj-performance.app',
+  'https://mj-performance.net',
+  'https://www.mj-performance.net',
+  // Vercel preview deployments — pattern match below
+];
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow no-origin requests (mobile apps, curl, server-to-server)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    // Vercel preview URLs follow https://peak-frontend-*.vercel.app pattern
+    if (/^https:\/\/peak-frontend-[a-z0-9-]+\.vercel\.app$/.test(origin)) return callback(null, true);
+    console.warn(`🚫 CORS blocked origin: ${origin}`);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '10mb' }));
+
+// ── RATE LIMITERS — protect expensive AI endpoints + auth flows ──────
+// Render free tier sits behind a proxy, so we trust X-Forwarded-For.
+app.set('trust proxy', 1);
+
+// AI endpoints: per IP, 60 req / 10 min (covers normal use, blocks scripts).
+// Authenticated users get a more generous quota via the per-user quota in
+// /ai/generate; this is just the floor.
+const aiLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests', code: 'RATE_LIMIT' },
+  // Rate-limit by user id when authenticated, else by IP. This prevents
+  // one rogue user from blocking other users behind the same NAT.
+  keyGenerator: (req) => {
+    const auth = req.headers.authorization;
+    if (auth && auth.startsWith('Bearer ')) return 'tok:' + auth.slice(7, 50);
+    return req.ip;
+  },
+});
+
+// Auth endpoints: stricter — 20 req / 10 min per IP.
+// Login/OTP flows shouldn't be hammered.
+const authLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many auth requests', code: 'AUTH_RATE_LIMIT' },
+});
 
 // ── HEALTH CHECK ──────────────────────────────────────────────────────
 app.get('/', (req, res) => {
@@ -60,7 +115,7 @@ app.get('/imprint',     (req, res) => res.redirect(301, `${FRONTEND_URL}/impress
 // ── CHECK IF EMAIL ALREADY HAS AN ACCOUNT ─────────────────────────────
 // Called from Step 7 before redirecting to Stripe Checkout.
 // Returns { exists: true/false, hasSubscription: true/false }
-app.post('/auth/check-email', async (req, res) => {
+app.post('/auth/check-email', authLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
@@ -92,7 +147,7 @@ app.post('/auth/check-email', async (req, res) => {
 
 // ── SEND MAGIC LINK (for "login instead of new signup" flow) ──────────
 // Called when user realizes they already have an account and wants to log in.
-app.post('/auth/send-login-link', async (req, res) => {
+app.post('/auth/send-login-link', authLimiter, async (req, res) => {
   try {
     const { email, lang } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
@@ -165,7 +220,7 @@ function generateOTP() {
   return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
 }
 
-app.post('/auth/send-otp', async (req, res) => {
+app.post('/auth/send-otp', authLimiter, async (req, res) => {
   try {
     const { email, lang } = req.body || {};
     if (!email || typeof email !== 'string' || !email.includes('@')) {
@@ -267,7 +322,7 @@ app.post('/auth/send-otp', async (req, res) => {
   }
 });
 
-app.post('/auth/verify-otp', async (req, res) => {
+app.post('/auth/verify-otp', authLimiter, async (req, res) => {
   try {
     const { email, code } = req.body || {};
     if (!email || !code) {
@@ -405,7 +460,7 @@ app.post('/auth/verify-otp', async (req, res) => {
 //   - no training progression
 //   - no recovery tools
 //   - no workout adjustments
-app.post('/auth/signup-free', async (req, res) => {
+app.post('/auth/signup-free', authLimiter, async (req, res) => {
   try {
     const { email, userData, consent, lang } = req.body;
 
@@ -590,10 +645,29 @@ app.post('/auth/signup-free', async (req, res) => {
 // ── OPEN STRIPE CUSTOMER PORTAL ───────────────────────────────────────
 // Generates a one-time portal session URL for the given email.
 // User is redirected there to manage/cancel their subscription.
-app.post('/customer-portal', async (req, res) => {
+app.post('/customer-portal', authLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
+
+    // ─── AUTH CHECK ──────────────────────────────────────────────────
+    // Verify the requester owns this email. Without this, any visitor
+    // could open a Stripe billing portal session for any customer email
+    // and view/cancel their subscription. CRITICAL fix (Apr 2026).
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    const token = authHeader.slice(7);
+    const { data: authData, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !authData?.user?.email) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    // Email must match the authenticated user's email (case-insensitive).
+    if (authData.user.email.toLowerCase() !== email.toLowerCase().trim()) {
+      console.warn(`🚫 customer-portal email mismatch: token=${authData.user.email}, requested=${email}`);
+      return res.status(403).json({ error: 'Email does not match authenticated user' });
+    }
 
     const { data: profile, error: profileErr } = await supabase
       .from('users')
@@ -643,14 +717,19 @@ app.post('/customer-portal', async (req, res) => {
 // ── AI PROXY ──────────────────────────────────────────────────────────
 // Frontend can't call Anthropic directly (CORS + API key must stay server-side).
 // This endpoint proxies requests. Max tokens clamped 100-2000 to prevent abuse.
-app.post('/ai/generate', async (req, res) => {
+app.post('/ai/generate', aiLimiter, async (req, res) => {
   try {
     const { prompt, max_tokens, purpose } = req.body;
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'prompt required' });
     }
 
-    // Optional auth check: log who's calling for monitoring
+    // ─── AUTH RESOLUTION ────────────────────────────────────────────────
+    // Auth is OPTIONAL on this endpoint because the very first plan
+    // generation happens during onboarding before signup completes.
+    // BUT: anonymous users get tighter restrictions (see below) — this
+    // closes the previous quota-bypass where unauthenticated callers
+    // could bypass per-user plan-generation limits entirely.
     const authHeader = req.headers.authorization;
     let userEmail = 'anonymous';
     let authUserId = null;
@@ -661,6 +740,33 @@ app.post('/ai/generate', async (req, res) => {
         if (data?.user?.email) userEmail = data.user.email;
         if (data?.user?.id) authUserId = data.user.id;
       } catch (_) { /* ignore, treat as anonymous onboarding */ }
+    }
+
+    // ─── ANONYMOUS GUARDRAILS (Apr 2026 hardening) ─────────────────────
+    // Block anonymous abuse vectors:
+    //   1. plan_generation requires auth — onboarding flow signs up first
+    //      then calls this endpoint, so authUserId should always be set
+    //      for purpose='plan_generation'. The OLD onboarding flow that
+    //      called this anonymously was a bug.
+    //   2. plan_generation_initial is the new free first-time slot used
+    //      during onboarding before/right after signup. Allow anonymous
+    //      but strictly via the aiLimiter (60/10min per IP).
+    //   3. Everything else (training_enrich, recipe, mood_recipe, etc.)
+    //      requires auth — these are post-onboarding features.
+    if (!authUserId) {
+      // Allowlist of purposes safe to run anonymously (rate-limited by IP).
+      const ANONYMOUS_PURPOSES = new Set([
+        'plan_generation_initial',  // first plan during signup flow
+        'session_translate',         // translation helper, no DB writes
+        null, undefined, ''         // legacy calls without explicit purpose
+      ]);
+      if (!ANONYMOUS_PURPOSES.has(purpose)) {
+        console.warn(`🚫 Anonymous AI call blocked: purpose=${purpose} from IP=${req.ip}`);
+        return res.status(401).json({
+          error: 'Authentication required for this operation',
+          code: 'AUTH_REQUIRED',
+        });
+      }
     }
 
     // ─── BLOCK CHECK ──────────────────────────────────────────────────────
@@ -803,7 +909,7 @@ app.post('/ai/generate', async (req, res) => {
 // User uploads a photo of a restaurant menu. Claude Haiku Vision reads
 // the menu and returns the top 3 dishes that best fit the user's goals,
 // with estimated kcal/protein and a fit-rating.
-app.post('/ai/scan-menu', async (req, res) => {
+app.post('/ai/scan-menu', aiLimiter, async (req, res) => {
   try {
     const { image, mediaType, userGoal, userLang } = req.body;
     if (!image || typeof image !== 'string') {
@@ -949,7 +1055,7 @@ If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
 // Frontend sends a barcode string. We look up Open Food Facts directly
 // (they have great EU/DE coverage, free, no API key) and add a "fit"
 // rating based on the user's goal.
-app.post('/ai/scan-barcode', async (req, res) => {
+app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
   try {
     const { barcode, userGoal, userLang } = req.body;
     if (!barcode || !/^\d{6,14}$/.test(String(barcode))) {
@@ -1049,7 +1155,7 @@ app.post('/ai/scan-barcode', async (req, res) => {
 // too vague, returns a clarifying question instead of a bad estimate.
 // Premium-only (Protokoll tab is Premium-gated in frontend, backend
 // double-checks tier for security).
-app.post('/ai/quick-log', async (req, res) => {
+app.post('/ai/quick-log', aiLimiter, async (req, res) => {
   try {
     const { text, clarification, originalText, userLang } = req.body;
     if (!text || typeof text !== 'string' || text.trim().length === 0) {
@@ -1236,7 +1342,7 @@ Respond ONLY as JSON (no markdown, no explanation):
   }
 });
 
-app.post('/create-checkout', async (req, res) => {
+app.post('/create-checkout', authLimiter, async (req, res) => {
   try {
     const { email, plan, tier, userData, consent, voucher, lang } = req.body;
 
@@ -1520,7 +1626,7 @@ app.post('/create-checkout', async (req, res) => {
 // ── VOUCHER VALIDATION (public, no auth needed) ───────────────────────
 // Frontend calls this when user types a code to show preview of discount
 // before they commit to checkout.
-app.post('/voucher/validate', async (req, res) => {
+app.post('/voucher/validate', authLimiter, async (req, res) => {
   try {
     const { code, plan, tier, email } = req.body;
     if (!code || typeof code !== 'string') {
@@ -3099,6 +3205,21 @@ cron.schedule('0 10 * * *', async () => {
   } catch (err) {
     console.error('❌ Cancellation reminder cron error:', err.message);
   }
+});
+
+// ── PROCESS-LEVEL ERROR HANDLERS (prevent silent crashes) ────────────
+// Render restarts the process on crash, but in-flight requests get 502s.
+// These handlers log + keep the process alive when an async failure
+// escapes a request handler. Inspired by Node.js best practices Apr 2026.
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ unhandledRejection:', reason);
+  // Don't exit — log and keep serving. Production traffic shouldn't be
+  // killed by a single async slip.
+});
+process.on('uncaughtException', (err) => {
+  console.error('❌ uncaughtException:', err);
+  // Same philosophy — log and keep going. If we DO need to exit, Render
+  // will restart us on health-check failure.
 });
 
 const PORT = process.env.PORT || 3000;
