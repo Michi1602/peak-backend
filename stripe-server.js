@@ -2058,6 +2058,68 @@ app.get('/user/training-state', async (req, res) => {
 });
 
 // POST: save training state (upserts entire blob)
+// ── MEAL TRACKING (Apr 2026) ──────────────────────────────────────────
+// Stores which planned meals the user has checked off as eaten today.
+// Frontend keeps localStorage as source of truth on the device; this
+// endpoint syncs that state to Supabase so it follows the user across
+// devices. Basic + Premium only — frontend gates Free users with an
+// upgrade prompt before they can even tap a checkbox.
+app.post('/user/meal-track', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    // Tier gate — Free users cannot persist meal tracking
+    const { data: u } = await supabase
+      .from('users').select('tier, status').eq('id', userData.user.id).maybeSingle();
+    if (u?.status === 'blocked_voucher_abuse') {
+      return res.status(403).json({ error: 'account_blocked', code: 'ACCOUNT_BLOCKED' });
+    }
+    if (!u || u.tier === 'free') {
+      return res.status(403).json({ error: 'basic_required', code: 'BASIC_REQUIRED' });
+    }
+
+    const { date, checked } = req.body;
+    // Validate: date is YYYY-MM-DD, checked is { "0": true, ... } with ≤ 12 keys
+    if (!date || typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    }
+    if (!checked || typeof checked !== 'object' || Array.isArray(checked)) {
+      return res.status(400).json({ error: 'checked must be an object' });
+    }
+    const keys = Object.keys(checked);
+    if (keys.length > 12) {
+      return res.status(400).json({ error: 'too many entries' });
+    }
+    // Sanitise: only string keys → boolean values
+    const cleaned = {};
+    for (const k of keys) {
+      if (/^\d{1,2}$/.test(k) && checked[k] === true) cleaned[k] = true;
+    }
+
+    const payload = { date, checked: cleaned };
+    const { error } = await supabase
+      .from('users')
+      .update({ meal_track: payload, updated_at: new Date().toISOString() })
+      .eq('id', userData.user.id);
+
+    if (error) {
+      console.error('❌ meal-track POST failed:', error.message);
+      return res.status(500).json({ error: 'Failed to save meal track' });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('❌ /user/meal-track POST error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/user/training-state', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
