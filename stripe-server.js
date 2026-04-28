@@ -110,6 +110,57 @@ const authLimiter = rateLimit({
   message: { error: 'Too many auth requests', code: 'AUTH_RATE_LIMIT' },
 });
 
+// ── AUTH + TIER HELPERS (Apr 2026 hardening) ─────────────────────────
+// Centralised auth-resolution + tier-validation so we don't duplicate the
+// same check across every premium endpoint. Consistent error responses
+// make the frontend simpler too.
+//
+// Returns { ok: true, userId, email, tier } on success, or
+// { ok: false, status, body } on any failure (caller just spreads body).
+async function resolveAuthAndTier(req, { requirePremium = false } = {}) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return { ok: false, status: 401, body: { error: 'auth_required', code: 'AUTH_REQUIRED' } };
+  }
+  const token = authHeader.slice(7);
+  let authUserId, email;
+  try {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user?.id) {
+      return { ok: false, status: 401, body: { error: 'auth_invalid', code: 'AUTH_INVALID' } };
+    }
+    authUserId = data.user.id;
+    email = data.user.email;
+  } catch (_) {
+    return { ok: false, status: 401, body: { error: 'auth_invalid', code: 'AUTH_INVALID' } };
+  }
+
+  // Pull tier + abuse-block status in one shot.
+  let tier = 'free', status = null;
+  try {
+    const { data: u } = await supabase
+      .from('users')
+      .select('tier, status')
+      .eq('id', authUserId)
+      .maybeSingle();
+    if (u?.tier) tier = u.tier;
+    if (u?.status) status = u.status;
+  } catch (e) {
+    // DB error → fail-closed for premium endpoints, fail-open otherwise
+    if (requirePremium) {
+      return { ok: false, status: 500, body: { error: 'tier_check_failed', code: 'TIER_CHECK_FAILED' } };
+    }
+  }
+
+  if (status === 'blocked_voucher_abuse') {
+    return { ok: false, status: 403, body: { error: 'account_blocked', code: 'ACCOUNT_BLOCKED' } };
+  }
+  if (requirePremium && tier !== 'premium') {
+    return { ok: false, status: 403, body: { error: 'premium_required', code: 'PREMIUM_REQUIRED' } };
+  }
+  return { ok: true, userId: authUserId, email, tier };
+}
+
 // ── HEALTH CHECK ──────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'PEAK Backend running', time: new Date().toISOString() });
@@ -822,6 +873,33 @@ app.post('/ai/generate', aiLimiter, async (req, res) => {
       }
     }
 
+    // ─── PREMIUM-ONLY PURPOSES (Apr 2026 hardening) ───────────────────
+    // Some AI flows are advertised as Premium-only in the frontend
+    // (recipe generation, mood-based recipe swap, quick-log via /ai/generate).
+    // Lock them down server-side too — frontend gating alone could be
+    // bypassed by anyone with a logged-in token + the API URL.
+    const PREMIUM_PURPOSES = new Set(['recipe', 'mood_recipe', 'recipe_builder']);
+    if (PREMIUM_PURPOSES.has(purpose)) {
+      if (!authUserId) {
+        return res.status(401).json({ error: 'auth_required', code: 'AUTH_REQUIRED' });
+      }
+      try {
+        const { data: u } = await supabase
+          .from('users').select('tier').eq('id', authUserId).maybeSingle();
+        if (!u || u.tier !== 'premium') {
+          console.warn(`🚫 Premium-only AI call from non-premium user: ${userEmail} (purpose=${purpose})`);
+          return res.status(403).json({
+            error: 'premium_required',
+            code: 'PREMIUM_REQUIRED',
+          });
+        }
+      } catch (e) {
+        // Fail-closed: a DB hiccup must not let a Free user through.
+        console.error('Premium tier check failed:', e.message);
+        return res.status(500).json({ error: 'tier_check_failed', code: 'TIER_CHECK_FAILED' });
+      }
+    }
+
     // ─── MONTHLY PLAN-GENERATION LIMITS ───────────────────────────────
     // Only enforced when purpose === 'plan_generation' AND user is authenticated.
     // Other purposes (training_enrich, adjustment) are NOT counted (internal
@@ -947,30 +1025,15 @@ app.post('/ai/scan-menu', aiLimiter, async (req, res) => {
     }
     const mt = (mediaType && /^image\/(jpeg|png|webp|gif)$/.test(mediaType)) ? mediaType : 'image/jpeg';
 
-    // Soft auth (same pattern as /ai/generate — anon during onboarding, but
-    // we record who called for monitoring)
-    const authHeader = req.headers.authorization;
-    let userEmail = 'anonymous';
-    let authUserId = null;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      try {
-        const token = authHeader.slice(7);
-        const { data } = await supabase.auth.getUser(token);
-        if (data?.user?.email) userEmail = data.user.email;
-        if (data?.user?.id) authUserId = data.user.id;
-      } catch (_) { /* ignore */ }
-    }
-
-    // Block abuse-flagged users
-    if (authUserId) {
-      try {
-        const { data: blockCheck } = await supabase
-          .from('users').select('status').eq('id', authUserId).maybeSingle();
-        if (blockCheck?.status === 'blocked_voucher_abuse') {
-          return res.status(403).json({ error: 'account_blocked' });
-        }
-      } catch (_) { /* fail-open */ }
-    }
+    // ── PREMIUM-ONLY (Apr 2026 hardening) ─────────────────────────────
+    // Scanner is a Premium feature. Frontend gates it (tSc: isFree → upgrade
+    // screen, isBasic → upgrade screen) but the API was open before, so a
+    // logged-in Free user with a valid token could bypass the UI gate and
+    // burn AI credits. Enforce server-side now.
+    const auth = await resolveAuthAndTier(req, { requirePremium: true });
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const userEmail = auth.email || 'unknown';
+    const authUserId = auth.userId;
 
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) return res.status(500).json({ error: 'AI not configured' });
@@ -1092,27 +1155,13 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
       return res.status(400).json({ error: 'valid numeric barcode required' });
     }
 
-    // Soft auth (logging only)
-    const authHeader = req.headers.authorization;
-    let userEmail = 'anonymous';
-    let authUserId = null;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      try {
-        const token = authHeader.slice(7);
-        const { data } = await supabase.auth.getUser(token);
-        if (data?.user?.email) userEmail = data.user.email;
-        if (data?.user?.id) authUserId = data.user.id;
-      } catch (_) { /* ignore */ }
-    }
-    if (authUserId) {
-      try {
-        const { data: blockCheck } = await supabase
-          .from('users').select('status').eq('id', authUserId).maybeSingle();
-        if (blockCheck?.status === 'blocked_voucher_abuse') {
-          return res.status(403).json({ error: 'account_blocked' });
-        }
-      } catch (_) { /* fail-open */ }
-    }
+    // ── PREMIUM-ONLY (Apr 2026 hardening) ─────────────────────────────
+    // Same rationale as /ai/scan-menu: Scanner is a Premium feature, the
+    // frontend gates it but the API was open. Locked down server-side now.
+    const auth = await resolveAuthAndTier(req, { requirePremium: true });
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const userEmail = auth.email || 'unknown';
+    const authUserId = auth.userId;
 
     // Look up Open Food Facts
     const offUrl = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json`;
