@@ -54,15 +54,22 @@ const ALLOWED_ORIGINS = [
   'https://www.peak-mj-performance.app',
   'https://mj-performance.net',
   'https://www.mj-performance.net',
-  // Vercel preview deployments — pattern match below
+  // Vercel default URLs — both the production alias (no hash) and
+  // any preview deployment (with hash). Bug fixed Apr 2026: previously
+  // only the hashed preview pattern matched, which meant the stable
+  // production alias https://peak-frontend.vercel.app was blocked,
+  // breaking every backend call from any user who landed on that URL.
+  'https://peak-frontend.vercel.app',
 ];
 app.use(cors({
   origin: (origin, callback) => {
     // Allow no-origin requests (mobile apps, curl, server-to-server)
     if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    // Vercel preview URLs follow https://peak-frontend-*.vercel.app pattern
-    if (/^https:\/\/peak-frontend-[a-z0-9-]+\.vercel\.app$/.test(origin)) return callback(null, true);
+    // Vercel preview deployments use either of these patterns:
+    //   https://peak-frontend-<hash>.vercel.app           (branch alias)
+    //   https://peak-frontend-<hash>-michi1602.vercel.app (deploy alias)
+    if (/^https:\/\/peak-frontend(-[a-z0-9-]+)?\.vercel\.app$/.test(origin)) return callback(null, true);
     console.warn(`🚫 CORS blocked origin: ${origin}`);
     return callback(new Error('Not allowed by CORS'));
   },
