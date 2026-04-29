@@ -110,6 +110,39 @@ const authLimiter = rateLimit({
   message: { error: 'Too many auth requests', code: 'AUTH_RATE_LIMIT' },
 });
 
+// ── PAGINATED USER LOOKUP (Apr 2026 fix) ─────────────────────────────
+// Supabase's auth.admin.listUsers() returns ONE PAGE at a time (default
+// 50, max 1000). Earlier code called it without pagination, which means
+// any user past the first page was effectively invisible — verify-otp
+// would create duplicate auth entries for them, signup-free would miss
+// the existence check, and the webhook's deduplication broke the same way.
+// This helper iterates pages until the user is found or pages run out.
+async function findAuthUserByEmail(email) {
+  const target = String(email || '').toLowerCase().trim();
+  if (!target) return null;
+  const PAGE_SIZE = 1000; // Supabase max — fewer round-trips
+  let page = 1;
+  // Hard cap at 50 pages (50k users) to prevent runaway loops on a broken API.
+  while (page <= 50) {
+    let data;
+    try {
+      const result = await supabase.auth.admin.listUsers({ page, perPage: PAGE_SIZE });
+      data = result?.data;
+    } catch (e) {
+      console.error(`listUsers page ${page} failed:`, e.message);
+      return null;
+    }
+    const users = data?.users || [];
+    if (users.length === 0) return null;
+    const match = users.find(u => (u.email || '').toLowerCase() === target);
+    if (match) return match;
+    if (users.length < PAGE_SIZE) return null; // last page, no match
+    page++;
+  }
+  console.warn(`findAuthUserByEmail: gave up after 50 pages for ${target}`);
+  return null;
+}
+
 // ── AUTH + TIER HELPERS (Apr 2026 hardening) ─────────────────────────
 // Centralised auth-resolution + tier-validation so we don't duplicate the
 // same check across every premium endpoint. Consistent error responses
@@ -475,8 +508,7 @@ app.post('/auth/verify-otp', authLimiter, async (req, res) => {
       if (createErr) {
         // Already exists — look up by email
         if (/already been registered|already registered|exists/i.test(createErr.message)) {
-          const { data: listData } = await supabase.auth.admin.listUsers({ perPage: 200 });
-          const match = listData?.users?.find(u => (u.email || '').toLowerCase() === normalizedEmail);
+          const match = await findAuthUserByEmail(normalizedEmail);
           if (!match) throw createErr;
           authUserId = match.id;
         } else {
@@ -568,8 +600,7 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
 
     // Check if account already exists
     try {
-      const { data: existing } = await supabase.auth.admin.listUsers();
-      const match = existing?.users?.find(u => u.email?.toLowerCase() === normalizedEmail);
+      const match = await findAuthUserByEmail(normalizedEmail);
       if (match) {
         // Existing account — send them a login link instead
         console.log(`ℹ️  Free signup for existing user: ${normalizedEmail} → sending login link`);
@@ -591,7 +622,7 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
         return res.json({ success: true, existing: true });
       }
     } catch (e) {
-      console.warn('listUsers check failed, proceeding with signup:', e.message);
+      console.warn('User-existence check failed, proceeding with signup:', e.message);
     }
 
     // Create new auth user (service role — bypasses signup toggle)
@@ -1834,6 +1865,18 @@ app.post('/user/update-profile', async (req, res) => {
     }
     const user = userData.user;
 
+    // Block voucher-abuse-flagged accounts from any profile update.
+    // Without this, a blocked user could keep editing their plan inputs and
+    // re-trigger plan generations, even though all their AI endpoints are
+    // already locked.
+    try {
+      const { data: status } = await supabase
+        .from('users').select('status').eq('id', user.id).maybeSingle();
+      if (status?.status === 'blocked_voucher_abuse') {
+        return res.status(403).json({ error: 'account_blocked', code: 'ACCOUNT_BLOCKED' });
+      }
+    } catch (_) { /* fail-open on transient DB errors — auth still verified */ }
+
     // Whitelist of editable fields. Anything not in this list is silently ignored.
     // NO access to: id, email, stripe_*, plan, tier, trial_*, status, consent_*, created_at
     const ALLOWED = [
@@ -1842,9 +1885,73 @@ app.post('/user/update-profile', async (req, res) => {
       'sport','level','sessions','dur','equip',
       'al','di','cu','cook','budget','goal','goals','lang',
     ];
+
+    // Type rules per field. Validation is conservative: anything that doesn't
+    // match the rule is rejected with 400, NOT silently coerced — better to
+    // surface the error to the caller than to write garbage that breaks the
+    // app downstream (e.g. weight="abc" would crash BMR calculation).
+    const NUMERIC_FIELDS = new Set(['age','weight','dweight','height','sleep','sessions','dur','stress','budget']);
+    const ARRAY_FIELDS = new Set(['al','di','cu','goals']);
+    const STRING_FIELDS = new Set(['name','gender','job','commute','sport','level','equip','cook','goal','lang']);
+
+    // Sane numeric ranges — protects against -50 weight, age=999, etc.
+    const NUMERIC_RANGES = {
+      age:      [16, 120],
+      weight:   [25, 350],
+      dweight:  [25, 350],
+      height:   [100, 250],
+      sleep:    [0, 24],
+      sessions: [0, 14],
+      dur:      [10, 240],
+      stress:   [1, 10],
+      budget:   [0, 10000],
+    };
+
     const updates = {};
     for (const k of ALLOWED) {
-      if (req.body[k] !== undefined) updates[k] = req.body[k];
+      if (req.body[k] === undefined) continue;
+      const v = req.body[k];
+
+      if (NUMERIC_FIELDS.has(k)) {
+        if (v === null) { updates[k] = null; continue; }
+        const num = typeof v === 'number' ? v : parseFloat(v);
+        if (!isFinite(num)) {
+          return res.status(400).json({ error: `Invalid number for ${k}` });
+        }
+        const range = NUMERIC_RANGES[k];
+        if (range && (num < range[0] || num > range[1])) {
+          return res.status(400).json({ error: `${k} out of range (${range[0]}–${range[1]})` });
+        }
+        updates[k] = num;
+      } else if (ARRAY_FIELDS.has(k)) {
+        if (!Array.isArray(v)) {
+          return res.status(400).json({ error: `${k} must be an array` });
+        }
+        if (v.length > 30) {
+          return res.status(400).json({ error: `${k} too many entries` });
+        }
+        // Each entry must be a non-empty string under 80 chars (protects against
+        // accidentally storing objects, html, or unbounded strings).
+        const cleaned = [];
+        for (const item of v) {
+          if (typeof item !== 'string') {
+            return res.status(400).json({ error: `${k} entries must be strings` });
+          }
+          const s = item.trim();
+          if (s && s.length <= 80) cleaned.push(s);
+        }
+        updates[k] = cleaned;
+      } else if (STRING_FIELDS.has(k)) {
+        if (v === null || v === '') { updates[k] = null; continue; }
+        if (typeof v !== 'string') {
+          return res.status(400).json({ error: `${k} must be a string` });
+        }
+        const s = v.trim();
+        if (s.length > 200) {
+          return res.status(400).json({ error: `${k} too long` });
+        }
+        updates[k] = s;
+      }
     }
 
     if (Object.keys(updates).length === 0) {
@@ -2249,9 +2356,7 @@ app.post('/webhook', async (req, res) => {
         if (createErr) {
           // "User already registered" is fine — look up the existing one
           if (createErr.message?.toLowerCase().includes('already')) {
-            const { data: existing, error: listErr } = await supabase.auth.admin.listUsers();
-            if (listErr) throw listErr;
-            const match = existing?.users?.find(u => u.email?.toLowerCase() === email.toLowerCase());
+            const match = await findAuthUserByEmail(email);
             if (match) {
               authUserId = match.id;
               console.log(`ℹ️  Existing auth user found: ${email} (${authUserId})`);
