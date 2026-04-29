@@ -35,12 +35,19 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://peak-mj-performance.app';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://peak-backend-u52q.onrender.com';
+// FROM_EMAIL: visible "from" address. Uses mj-performance.net because that's
+// the domain verified at Resend (free tier limits to one domain). The user
+// sees "PEAK <support@mj-performance.net>" but if they hit "Reply", their
+// mail client routes to REPLY_TO instead — that mailbox actually receives.
 const FROM_EMAIL = 'PEAK <support@mj-performance.net>';
+// REPLY_TO: real, monitored support inbox. Set as a header on every send
+// so user replies don't disappear into a non-existent mailbox.
+const REPLY_TO = 'support@peak-mj-performance.app';
 
 const COMPANY = {
   name: 'MJ Performance',
   address: 'Am Hasel 6, 85139 Wettstetten',
-  email: 'support@mj-performance.net',
+  email: REPLY_TO, // Public-facing contact — must match imprint + privacy
   website: 'https://peak-mj-performance.app',
   owner: 'Michael Jahn',
 };
@@ -298,6 +305,7 @@ app.post('/auth/send-login-link', authLimiter, async (req, res) => {
     const mail = buildMagicLinkEmail(magicLink, email, emailLang || 'en');
     await resend.emails.send({
       from: FROM_EMAIL,
+      reply_to: REPLY_TO,
       to: email,
       subject: mail.subject,
       html: mail.html,
@@ -418,6 +426,7 @@ app.post('/auth/send-otp', authLimiter, async (req, res) => {
     try {
       await resend.emails.send({
         from: FROM_EMAIL,
+        reply_to: REPLY_TO,
         to: normalizedEmail,
         subject: mail.subject,
         html: mail.html,
@@ -614,6 +623,7 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
           const mail = buildMagicLinkEmail(magicLink, normalizedEmail, lang === 'de' ? 'de' : 'en');
           await resend.emails.send({
             from: FROM_EMAIL,
+            reply_to: REPLY_TO,
             to: normalizedEmail,
             subject: mail.subject,
             html: mail.html,
@@ -705,6 +715,7 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
           const mail = buildMagicLinkEmail(magicLink, normalizedEmail, lang === 'de' ? 'de' : 'en');
           await resend.emails.send({
             from: FROM_EMAIL,
+            reply_to: REPLY_TO,
             to: normalizedEmail,
             subject: mail.subject,
             html: mail.html,
@@ -3573,7 +3584,7 @@ async function sendEmail(to, type, data) {
   const tmpl = templates[type];
   if (!tmpl) return;
   try {
-    await resend.emails.send({ from: FROM_EMAIL, to, subject: tmpl.subject, html: tmpl.html });
+    await resend.emails.send({ from: FROM_EMAIL, reply_to: REPLY_TO, to, subject: tmpl.subject, html: tmpl.html });
     console.log(`📧 ${type} → ${to} (${lang})`);
   } catch (err) {
     console.error(`Email error:`, err.message);
