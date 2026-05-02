@@ -1018,7 +1018,11 @@ app.post('/ai/generate', aiLimiter, async (req, res) => {
     }
 
     const modelName = process.env.ANTHROPIC_MODEL || 'claude-opus-4-7';
-    const tokens = Math.min(Math.max(parseInt(max_tokens) || 800, 100), 2000);
+    // Token cap: 2000 was the legacy default for single-meal/day plans.
+    // Raised to 12000 so the 14-day meal pool (≈9k output) fits with
+    // headroom. 12k is a deliberate ceiling — anything over that signals
+    // a malformed prompt and we'd rather fail-fast than burn tokens.
+    const tokens = Math.min(Math.max(parseInt(max_tokens) || 800, 100), 12000);
 
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
