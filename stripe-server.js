@@ -2424,6 +2424,121 @@ app.post('/user/meal-pool', async (req, res) => {
   }
 });
 
+// ── STRETCH POOL ENDPOINT (May 2026, Phase 3) ──────────────────────────
+// Same pattern as /user/meal-pool, but premium-only and with a different
+// pool shape: each slot is an OBJECT (training/rest), not an array.
+//
+// Validation rules:
+//   - Must be exactly 14 slots
+//   - Each slot has type='training' (with pre+post arrays) or type='rest'
+//     (with full array). All exercises have name + detail strings.
+app.post('/user/stretch-pool', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    // Premium-only — Free + Basic don't get cross-device stretching sync.
+    // (Local pool still works for them; they just don't sync between devices.)
+    const { data: u } = await supabase
+      .from('users').select('tier, status').eq('id', userData.user.id).maybeSingle();
+    if (u?.status === 'blocked_voucher_abuse') {
+      return res.status(403).json({ error: 'account_blocked', code: 'ACCOUNT_BLOCKED' });
+    }
+    if (!u || u.tier !== 'premium') {
+      return res.status(403).json({ error: 'premium_required', code: 'PREMIUM_REQUIRED' });
+    }
+
+    const { stretch_pool, stretch_pool_anchor, stretch_pool_last_refresh, stretch_pool_refresh_count } = req.body || {};
+
+    if (!Array.isArray(stretch_pool) || stretch_pool.length !== 14) {
+      return res.status(400).json({ error: 'stretch_pool must be an array of exactly 14 slots' });
+    }
+
+    // Per-slot shape validation: training has pre+post, rest has full
+    function validateExerciseList(arr, slotIdx, listKey) {
+      if (!Array.isArray(arr)) {
+        return `stretch_pool[${slotIdx}].${listKey} must be an array`;
+      }
+      if (arr.length > 20) {
+        return `stretch_pool[${slotIdx}].${listKey} too many exercises`;
+      }
+      for (let i = 0; i < arr.length; i++) {
+        const ex = arr[i];
+        if (!ex || typeof ex !== 'object') {
+          return `stretch_pool[${slotIdx}].${listKey}[${i}] must be an object`;
+        }
+        if (typeof ex.name !== 'string' || typeof ex.detail !== 'string') {
+          return `stretch_pool[${slotIdx}].${listKey}[${i}] missing name/detail`;
+        }
+      }
+      return null;
+    }
+
+    for (let s = 0; s < 14; s++) {
+      const slot = stretch_pool[s];
+      if (!slot || typeof slot !== 'object') {
+        return res.status(400).json({ error: `stretch_pool[${s}] must be an object` });
+      }
+      if (slot.type !== 'training' && slot.type !== 'rest') {
+        return res.status(400).json({ error: `stretch_pool[${s}].type must be 'training' or 'rest'` });
+      }
+      if (slot.type === 'training') {
+        const errPre = validateExerciseList(slot.pre, s, 'pre');
+        if (errPre) return res.status(400).json({ error: errPre });
+        const errPost = validateExerciseList(slot.post, s, 'post');
+        if (errPost) return res.status(400).json({ error: errPost });
+      } else {
+        const errFull = validateExerciseList(slot.full, s, 'full');
+        if (errFull) return res.status(400).json({ error: errFull });
+      }
+    }
+
+    // Size cap: 14 slots × ~10 exercises × ~80 chars ≈ 11KB. Cap at 32KB
+    // to catch hallucinated bloat without rejecting legit large pools.
+    const serialised = JSON.stringify(stretch_pool);
+    if (serialised.length > 32 * 1024) {
+      return res.status(400).json({ error: 'stretch_pool payload too large' });
+    }
+
+    if (stretch_pool_anchor != null && typeof stretch_pool_anchor !== 'string') {
+      return res.status(400).json({ error: 'stretch_pool_anchor must be a string' });
+    }
+    if (stretch_pool_last_refresh != null && typeof stretch_pool_last_refresh !== 'string') {
+      return res.status(400).json({ error: 'stretch_pool_last_refresh must be a string' });
+    }
+    const refreshCountClean = Number.isFinite(stretch_pool_refresh_count)
+      ? Math.max(0, Math.min(1000, Math.floor(stretch_pool_refresh_count)))
+      : 0;
+
+    const { error } = await supabase
+      .from('users')
+      .update({
+        stretch_pool,
+        stretch_pool_anchor: stretch_pool_anchor || null,
+        stretch_pool_last_refresh: stretch_pool_last_refresh || null,
+        stretch_pool_refresh_count: refreshCountClean,
+        stretch_pool_updated_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', userData.user.id);
+
+    if (error) {
+      console.error('❌ stretch-pool POST failed:', error.message);
+      return res.status(500).json({ error: 'Failed to save stretch pool' });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('❌ /user/stretch-pool POST error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // ── WEBHOOK ───────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
