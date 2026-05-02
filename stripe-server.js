@@ -2539,6 +2539,70 @@ app.post('/user/stretch-pool', async (req, res) => {
   }
 });
 
+// ── PLAN SYNC ENDPOINT (May 2026 evening) ─────────────────────────────
+// Stores the user's generated plan so opening the app on a different
+// device doesn't trigger a fresh AI call. Without this endpoint, every
+// browser session/tab without a sessionStorage cache regenerates the
+// plan from scratch — wasting ~$0.05 + 6sec loader per redundant load.
+//
+// Available to ALL tiers (including Free) — every user who paid Haiku
+// to generate a plan should be able to see it across their devices.
+// Validation kept light because we trust our own AI output schema.
+app.post('/user/plan', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    const { data: u } = await supabase
+      .from('users').select('status').eq('id', userData.user.id).maybeSingle();
+    if (u?.status === 'blocked_voucher_abuse') {
+      return res.status(403).json({ error: 'account_blocked', code: 'ACCOUNT_BLOCKED' });
+    }
+
+    const { plan_data } = req.body || {};
+    if (!plan_data || typeof plan_data !== 'object') {
+      return res.status(400).json({ error: 'plan_data must be an object' });
+    }
+    // Spot-check the shape — we expect at minimum a headline + calorie target
+    if (typeof plan_data.headline !== 'string') {
+      return res.status(400).json({ error: 'plan_data.headline required' });
+    }
+
+    // Size cap: typical plan with week + meal_pool reference is ~30KB.
+    // Cap at 256KB to allow for legitimately large pools (the meal pool
+    // itself goes through /user/meal-pool, but if the client lazily
+    // includes it here we still accept up to that size).
+    const serialised = JSON.stringify(plan_data);
+    if (serialised.length > 256 * 1024) {
+      return res.status(400).json({ error: 'plan_data too large' });
+    }
+
+    const { error } = await supabase
+      .from('users')
+      .update({
+        plan_data,
+        plan_updated_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', userData.user.id);
+
+    if (error) {
+      console.error('❌ plan POST failed:', error.message);
+      return res.status(500).json({ error: 'Failed to save plan' });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('❌ /user/plan POST error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // ── WEBHOOK ───────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
