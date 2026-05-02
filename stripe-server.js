@@ -2499,10 +2499,11 @@ app.post('/user/stretch-pool', async (req, res) => {
       }
     }
 
-    // Size cap: 14 slots × ~10 exercises × ~80 chars ≈ 11KB. Cap at 32KB
-    // to catch hallucinated bloat without rejecting legit large pools.
+    // Size cap: with howTo (steps + cues + mistakes + why), each exercise
+    // is ~400 chars. 14 slots × ~10 exercises × 400 = ~56KB. Cap at 128KB
+    // to allow for legitimately large pools without rejecting legit cases.
     const serialised = JSON.stringify(stretch_pool);
-    if (serialised.length > 32 * 1024) {
+    if (serialised.length > 128 * 1024) {
       return res.status(400).json({ error: 'stretch_pool payload too large' });
     }
 
