@@ -676,6 +676,8 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
       cu: Array.isArray(userData?.cu) ? userData.cu : [],
       cook: userData?.cook || null,
       budget: userData?.budget ? parseFloat(userData.budget) : null,
+      stretch_areas: Array.isArray(userData?.stretchAreas) ? userData.stretchAreas : [],
+      stretch_dur: userData?.stretchDur ? parseInt(userData.stretchDur) : 10,
       stripe_customer_id: null,
       stripe_subscription_id: null,
       plan: 'free',
@@ -1609,6 +1611,8 @@ app.post('/create-checkout', authLimiter, async (req, res) => {
       cu: Array.isArray(userData?.cu) ? userData.cu : [],
       cook: userData?.cook || null,
       budget: userData?.budget || null,
+      stretchAreas: Array.isArray(userData?.stretchAreas) ? userData.stretchAreas : [],
+      stretchDur: userData?.stretchDur || null,
     }).slice(0, 480);
     const sharedMetadata = {
       userName: userData?.name || '',
@@ -1899,14 +1903,15 @@ app.post('/user/update-profile', async (req, res) => {
       'job','commute','stress',
       'sport','level','sessions','dur','equip',
       'al','di','cu','cook','budget','goal','goals','lang',
+      'stretchAreas','stretchDur',
     ];
 
     // Type rules per field. Validation is conservative: anything that doesn't
     // match the rule is rejected with 400, NOT silently coerced — better to
     // surface the error to the caller than to write garbage that breaks the
     // app downstream (e.g. weight="abc" would crash BMR calculation).
-    const NUMERIC_FIELDS = new Set(['age','weight','dweight','height','sleep','sessions','dur','stress','budget']);
-    const ARRAY_FIELDS = new Set(['al','di','cu','goals']);
+    const NUMERIC_FIELDS = new Set(['age','weight','dweight','height','sleep','sessions','dur','stress','budget','stretchDur']);
+    const ARRAY_FIELDS = new Set(['al','di','cu','goals','stretchAreas']);
     const STRING_FIELDS = new Set(['name','gender','job','commute','sport','level','equip','cook','goal','lang']);
 
     // Sane numeric ranges — protects against -50 weight, age=999, etc.
@@ -1918,6 +1923,7 @@ app.post('/user/update-profile', async (req, res) => {
       sleep:    [0, 24],
       sessions: [0, 14],
       dur:      [10, 240],
+      stretchDur: [5, 60],
       stress:   [1, 10],
       budget:   [0, 10000],
     };
@@ -1941,6 +1947,24 @@ app.post('/user/update-profile', async (req, res) => {
       } else if (ARRAY_FIELDS.has(k)) {
         if (!Array.isArray(v)) {
           return res.status(400).json({ error: `${k} must be an array` });
+        }
+        // stretchAreas has stricter rules than the other arrays:
+        //   - hard cap at 3 entries (UX promise + AI prompt focus)
+        //   - only specific keys allowed (matches the onboarding chip set)
+        // We validate this BEFORE the generic length+string check so a bad
+        // value gets a precise error message instead of a generic one.
+        if (k === 'stretchAreas') {
+          const ALLOWED_AREAS = new Set(['hip','chest','upBack','lowBack','ham','calf','neck','knee','ankle']);
+          if (v.length > 3) {
+            return res.status(400).json({ error: 'stretchAreas: max 3 areas' });
+          }
+          for (const item of v) {
+            if (typeof item !== 'string' || !ALLOWED_AREAS.has(item)) {
+              return res.status(400).json({ error: `stretchAreas: invalid area "${item}"` });
+            }
+          }
+          updates[k] = v.slice();
+          continue;
         }
         if (v.length > 30) {
           return res.status(400).json({ error: `${k} too many entries` });
@@ -1973,11 +1997,24 @@ app.post('/user/update-profile', async (req, res) => {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
 
-    updates.updated_at = new Date().toISOString();
+    // Field-name mapping: frontend uses camelCase, some DB columns are
+    // snake_case (mostly multi-word fields added later in the project's
+    // life). Translate before writing — keeps the validation logic above
+    // simple and the API contract stable for the frontend.
+    const FIELD_TO_COLUMN = {
+      stretchAreas: 'stretch_areas',
+      stretchDur:   'stretch_dur',
+    };
+    const dbUpdates = {};
+    for (const [k, v] of Object.entries(updates)) {
+      dbUpdates[FIELD_TO_COLUMN[k] || k] = v;
+    }
+
+    dbUpdates.updated_at = new Date().toISOString();
 
     const { data, error } = await supabase
       .from('users')
-      .update(updates)
+      .update(dbUpdates)
       .eq('id', user.id)
       .select()
       .maybeSingle();
@@ -2516,7 +2553,7 @@ app.post('/webhook', async (req, res) => {
       try {
         const { data } = await supabase
           .from('users')
-          .select('age,gender,weight,dweight,height,sleep,job,commute,stress,level,sessions,dur,equip,al,di,cu,cook,budget')
+          .select('age,gender,weight,dweight,height,sleep,job,commute,stress,level,sessions,dur,equip,al,di,cu,cook,budget,stretch_areas,stretch_dur')
           .eq('id', authUserId)
           .maybeSingle();
         prior = data || null;
@@ -2564,6 +2601,8 @@ app.post('/webhook', async (req, res) => {
         cu: pickArr(train.cu, prior?.cu),
         cook: pickStr(train.cook, prior?.cook),
         budget: pickNum(train.budget, prior?.budget, parseFloat),
+        stretch_areas: pickArr(train.stretchAreas, prior?.stretch_areas),
+        stretch_dur: pickNum(train.stretchDur, prior?.stretch_dur, parseInt),
         stripe_customer_id: session.customer || null,
         stripe_subscription_id: session.subscription || null,
         plan: meta.plan || 'monthly',
