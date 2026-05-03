@@ -607,50 +607,80 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
 
     const normalizedEmail = email.toLowerCase().trim();
 
-    // Check if account already exists
+    // Check if account already exists in auth.users
+    let existingAuthUserId = null;
     try {
       const match = await findAuthUserByEmail(normalizedEmail);
       if (match) {
-        // Existing account — send them a login link instead
-        console.log(`ℹ️  Free signup for existing user: ${normalizedEmail} → sending login link`);
-        const { data: linkData } = await supabase.auth.admin.generateLink({
-          type: 'magiclink',
-          email: normalizedEmail,
-          options: { redirectTo: `${FRONTEND_URL}/` },
-        });
-        const magicLink = linkData?.properties?.action_link;
-        if (magicLink) {
-          const mail = buildMagicLinkEmail(magicLink, normalizedEmail, lang === 'de' ? 'de' : 'en');
-          await resend.emails.send({
-            from: FROM_EMAIL,
-            reply_to: REPLY_TO,
-            to: normalizedEmail,
-            subject: mail.subject,
-            html: mail.html,
+        // Auth user exists — but does the public.users profile row exist too?
+        // If we early-return here without checking, users who only have an auth
+        // record (e.g. half-completed signup, profile manually deleted, schema
+        // migration leftover) would receive a magic link, log in, and hit a
+        // 404 on /user/profile — which the frontend renders as "Noch kein Abo"
+        // (the bug Nick reported on 03.05.2026).
+        //
+        // Resolution: load the profile. If absent, fall through to the upsert
+        // below — but use the EXISTING auth user id instead of creating a new
+        // auth user (which would fail with "user already registered").
+        const { data: existingProfile } = await supabase
+          .from('users')
+          .select('id, tier, stripe_subscription_id')
+          .eq('id', match.id)
+          .maybeSingle();
+
+        if (existingProfile) {
+          // Both auth + profile exist → just send a login link, don't re-upsert.
+          console.log(`ℹ️  Free signup for existing user: ${normalizedEmail} → sending login link`);
+          const { data: linkData } = await supabase.auth.admin.generateLink({
+            type: 'magiclink',
+            email: normalizedEmail,
+            options: { redirectTo: `${FRONTEND_URL}/` },
           });
+          const magicLink = linkData?.properties?.action_link;
+          if (magicLink) {
+            const mail = buildMagicLinkEmail(magicLink, normalizedEmail, lang === 'de' ? 'de' : 'en');
+            await resend.emails.send({
+              from: FROM_EMAIL,
+              reply_to: REPLY_TO,
+              to: normalizedEmail,
+              subject: mail.subject,
+              html: mail.html,
+            });
+          }
+          return res.json({ success: true, existing: true });
         }
-        return res.json({ success: true, existing: true });
+
+        // Auth user exists but no profile → reuse the auth id and fall through
+        // to the upsert path below to create the missing profile row.
+        console.warn(`⚠️  Repairing orphaned auth user: ${normalizedEmail} (${match.id}) — auth exists, profile missing`);
+        existingAuthUserId = match.id;
       }
     } catch (e) {
       console.warn('User-existence check failed, proceeding with signup:', e.message);
     }
 
-    // Create new auth user (service role — bypasses signup toggle)
-    const { data: created, error: createErr } = await supabase.auth.admin.createUser({
-      email: normalizedEmail,
-      email_confirm: true,
-      user_metadata: {
-        name: userData?.name || '',
-        source: 'free_signup',
-      },
-    });
+    // Create new auth user only if we don't already have one for this email.
+    let authUserId;
+    if (existingAuthUserId) {
+      authUserId = existingAuthUserId;
+    } else {
+      const { data: created, error: createErr } = await supabase.auth.admin.createUser({
+        email: normalizedEmail,
+        email_confirm: true,
+        user_metadata: {
+          name: userData?.name || '',
+          source: 'free_signup',
+        },
+      });
 
-    if (createErr) {
-      console.error('❌ Free auth user creation failed:', createErr.message);
-      return res.status(500).json({ error: createErr.message });
+      if (createErr) {
+        console.error('❌ Free auth user creation failed:', createErr.message);
+        return res.status(500).json({ error: createErr.message });
+      }
+
+      authUserId = created.user.id;
     }
 
-    const authUserId = created.user.id;
     const consentAt = consent.at || new Date().toISOString();
 
     // Upsert free profile row
