@@ -1866,14 +1866,22 @@ app.get('/user/profile', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+    if (!token) {
+      console.warn('[/user/profile] no auth token in request');
+      return res.status(401).json({ error: 'Missing auth token' });
+    }
 
     // Validate token by asking Supabase who this is
     const { data: userData, error: userErr } = await supabase.auth.getUser(token);
     if (userErr || !userData?.user) {
+      console.warn('[/user/profile] token validation failed:', userErr?.message || 'no user');
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
     const user = userData.user;
+    // Diagnostic log so we can trace 404 cases — includes the auth id,
+    // email, and whether the token came from a fresh login or a restore
+    // (created_at gives us age info for token-rotation issues).
+    console.log(`[/user/profile] resolved user: ${user.email} id=${user.id} created=${user.created_at}`);
 
     // Load profile row by id (matches auth.users.id now)
     const { data: profile, error: profileErr } = await supabase
@@ -1888,8 +1896,43 @@ app.get('/user/profile', async (req, res) => {
     }
 
     if (!profile) {
-      // Edge case: auth user exists but no public.users row (shouldn't happen
-      // in normal flow, but handle gracefully rather than crashing)
+      // Edge case: auth user exists but no public.users row. Could indicate
+      // (a) genuine missing profile (orphaned auth user), or (b) auth.id
+      // mismatch with the public.users.id (e.g. user re-signed up under
+      // same email creating a new auth row pointing at no profile while
+      // an old profile sits with the previous id).
+      // Try to find a profile by EMAIL as a fallback diagnostic — if we
+      // find one, the IDs are out of sync and we report it loudly.
+      const { data: byEmail } = await supabase
+        .from('users')
+        .select('id, email, tier, status')
+        .ilike('email', user.email)
+        .maybeSingle();
+      if (byEmail) {
+        console.error(`🚨 ID MISMATCH for ${user.email}: auth.id=${user.id} but public.users.id=${byEmail.id}. Profile lookup by id returned 404.`);
+        // Repair: rewrite the profile row's id to match the new auth id
+        // so future lookups work. Safe because the email is unique.
+        const { error: updErr } = await supabase
+          .from('users')
+          .update({ id: user.id })
+          .eq('email', user.email);
+        if (!updErr) {
+          console.log(`✅ Auto-repaired ID mismatch for ${user.email} → ${user.id}`);
+          // Re-fetch with the new id
+          const { data: repaired } = await supabase
+            .from('users')
+            .select('*')
+            .eq('id', user.id)
+            .maybeSingle();
+          if (repaired) {
+            return res.json({ profile: repaired });
+          }
+        } else {
+          console.error('❌ Could not auto-repair ID mismatch:', updErr.message);
+        }
+      } else {
+        console.warn(`[/user/profile] no profile row found for ${user.email} (id=${user.id})`);
+      }
       return res.status(404).json({ error: 'Profile not found', email: user.email });
     }
 
