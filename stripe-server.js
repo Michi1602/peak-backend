@@ -708,6 +708,9 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
       budget: userData?.budget ? parseFloat(userData.budget) : null,
       stretch_areas: Array.isArray(userData?.stretchAreas) ? userData.stretchAreas : [],
       stretch_dur: userData?.stretchDur ? parseInt(userData.stretchDur) : 10,
+      train_days: Array.isArray(userData?.trainDays)
+        ? userData.trainDays.filter(d => Number.isInteger(d) && d >= 0 && d <= 6).slice(0, 7)
+        : [],
       stripe_customer_id: null,
       stripe_subscription_id: null,
       plan: 'free',
@@ -1643,6 +1646,9 @@ app.post('/create-checkout', authLimiter, async (req, res) => {
       budget: userData?.budget || null,
       stretchAreas: Array.isArray(userData?.stretchAreas) ? userData.stretchAreas : [],
       stretchDur: userData?.stretchDur || null,
+      trainDays: Array.isArray(userData?.trainDays)
+        ? userData.trainDays.filter(d => Number.isInteger(d) && d >= 0 && d <= 6).slice(0, 7)
+        : [],
     }).slice(0, 480);
     const sharedMetadata = {
       userName: userData?.name || '',
@@ -1977,6 +1983,7 @@ app.post('/user/update-profile', async (req, res) => {
       'sport','level','sessions','dur','equip',
       'al','di','cu','cook','budget','goal','goals','lang',
       'stretchAreas','stretchDur',
+      'trainDays',
     ];
 
     // Type rules per field. Validation is conservative: anything that doesn't
@@ -1985,6 +1992,7 @@ app.post('/user/update-profile', async (req, res) => {
     // app downstream (e.g. weight="abc" would crash BMR calculation).
     const NUMERIC_FIELDS = new Set(['age','weight','dweight','height','sleep','sessions','dur','stress','budget','stretchDur']);
     const ARRAY_FIELDS = new Set(['al','di','cu','goals','stretchAreas']);
+    const INT_ARRAY_FIELDS = new Set(['trainDays']);
     const STRING_FIELDS = new Set(['name','gender','job','commute','sport','level','equip','cook','goal','lang']);
 
     // Sane numeric ranges — protects against -50 weight, age=999, etc.
@@ -2053,6 +2061,24 @@ app.post('/user/update-profile', async (req, res) => {
           if (s && s.length <= 80) cleaned.push(s);
         }
         updates[k] = cleaned;
+      } else if (INT_ARRAY_FIELDS.has(k)) {
+        // trainDays: optional weekday picker. Frontend sends 0..6 (Mon..Sun).
+        // Accept null/[] as "clear preference, use auto-distribution".
+        if (v === null) { updates[k] = []; continue; }
+        if (!Array.isArray(v)) {
+          return res.status(400).json({ error: `${k} must be an array` });
+        }
+        const seen = new Set();
+        const cleanedInts = [];
+        for (const item of v) {
+          const n = typeof item === 'number' ? item : parseInt(item);
+          if (!Number.isInteger(n) || n < 0 || n > 6) {
+            return res.status(400).json({ error: `${k}: entries must be integers 0..6` });
+          }
+          if (!seen.has(n)) { seen.add(n); cleanedInts.push(n); }
+        }
+        cleanedInts.sort((a, b) => a - b);
+        updates[k] = cleanedInts;
       } else if (STRING_FIELDS.has(k)) {
         if (v === null || v === '') { updates[k] = null; continue; }
         if (typeof v !== 'string') {
@@ -2077,6 +2103,7 @@ app.post('/user/update-profile', async (req, res) => {
     const FIELD_TO_COLUMN = {
       stretchAreas: 'stretch_areas',
       stretchDur:   'stretch_dur',
+      trainDays:    'train_days',
     };
     const dbUpdates = {};
     for (const [k, v] of Object.entries(updates)) {
@@ -2806,7 +2833,7 @@ app.post('/webhook', async (req, res) => {
       try {
         const { data } = await supabase
           .from('users')
-          .select('age,gender,weight,dweight,height,sleep,job,commute,stress,level,sessions,dur,equip,al,di,cu,cook,budget,stretch_areas,stretch_dur')
+          .select('age,gender,weight,dweight,height,sleep,job,commute,stress,level,sessions,dur,equip,al,di,cu,cook,budget,stretch_areas,stretch_dur,train_days')
           .eq('id', authUserId)
           .maybeSingle();
         prior = data || null;
@@ -2856,6 +2883,7 @@ app.post('/webhook', async (req, res) => {
         budget: pickNum(train.budget, prior?.budget, parseFloat),
         stretch_areas: pickArr(train.stretchAreas, prior?.stretch_areas),
         stretch_dur: pickNum(train.stretchDur, prior?.stretch_dur, parseInt),
+        train_days: pickArr(train.trainDays, prior?.train_days),
         stripe_customer_id: session.customer || null,
         stripe_subscription_id: session.subscription || null,
         plan: meta.plan || 'monthly',
