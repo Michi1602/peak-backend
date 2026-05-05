@@ -3066,9 +3066,12 @@ app.post('/webhook', async (req, res) => {
         email = email.toLowerCase().trim();
         // Downgrade tier to free — prevents continued premium access after cancellation
         // Keep status history: if already blocked_voucher_abuse, don't overwrite
+        // Also pull `lang` so we can pass it explicitly to sendEmail — without
+        // it sendEmail falls back to a goal-text heuristic which has flagged
+        // German users as English in the past (Bug D2).
         const { data: existing } = await supabase
           .from('users')
-          .select('status')
+          .select('status,lang')
           .eq('email', email)
           .maybeSingle();
         // Detect if user is being deleted right now via /user/account DELETE.
@@ -3107,8 +3110,15 @@ app.post('/webhook', async (req, res) => {
           || isAccountDeletion;
         if (!skipEmail) {
           try {
-            await sendEmail(email, 'cancellation_final', {});
-            console.log(`📧 Cancellation final → ${email}`);
+            // Pass explicit lang to override sendEmail's fallback heuristic.
+            // If user.lang is missing the function falls back to goal-text
+            // detection, which is unreliable for users without German keyword
+            // goals (e.g. someone with goal "endurance" still wants German
+            // mail if they signed up in DE).
+            const userLang = (existing?.lang === 'de' || existing?.lang === 'en')
+              ? existing.lang : 'de';
+            await sendEmail(email, 'cancellation_final', { lang: userLang });
+            console.log(`📧 Cancellation final → ${email} (${userLang})`);
           } catch (err) {
             console.error('⚠️  cancellation_final email failed:', err.message);
           }
@@ -3139,6 +3149,16 @@ app.post('/webhook', async (req, res) => {
           // Email A: Cancellation confirmed — premium continues until period end
           const periodEnd = sub.cancel_at || sub.current_period_end;
           const endDate = periodEnd ? new Date(periodEnd * 1000) : null;
+          // Pull lang first so date and email both render in user's language.
+          // Without this, endDate is always rendered in German ("5. Mai 2026")
+          // even for English users, and sendEmail's heuristic may also pick wrong.
+          const { data: existing } = await supabase
+            .from('users')
+            .select('lang')
+            .eq('email', email)
+            .maybeSingle();
+          const userLang = (existing?.lang === 'de' || existing?.lang === 'en')
+            ? existing.lang : 'de';
           // Mark in DB as pending cancellation + store end date for reminder cron.
           // Reset cancel_reminder_sent so a fresh reminder is queued for this
           // cancellation cycle (relevant if user previously reactivated).
@@ -3150,10 +3170,10 @@ app.post('/webhook', async (req, res) => {
 
           try {
             const endDateStr = endDate
-              ? endDate.toLocaleDateString('de-DE', { day: '2-digit', month: 'long', year: 'numeric' })
+              ? endDate.toLocaleDateString(userLang === 'de' ? 'de-DE' : 'en-US', { day: '2-digit', month: 'long', year: 'numeric' })
               : '';
-            await sendEmail(email, 'cancellation_confirmed', { endDate: endDateStr });
-            console.log(`📧 Cancellation confirmed → ${email} (ends ${endDateStr})`);
+            await sendEmail(email, 'cancellation_confirmed', { endDate: endDateStr, lang: userLang });
+            console.log(`📧 Cancellation confirmed → ${email} (ends ${endDateStr}, ${userLang})`);
           } catch (err) {
             console.error('⚠️  cancellation_confirmed email failed:', err.message);
           }
@@ -3220,12 +3240,12 @@ app.post('/webhook', async (req, res) => {
         if (attempt === 1) {
           const { data: user } = await supabase
             .from('users')
-            .select('name, language')
+            .select('name, lang')
             .eq('email', email)
             .maybeSingle();
           await sendEmail(email, 'payment_failed', {
             name: user?.name || '',
-            lang: user?.language || 'de',
+            lang: user?.lang || 'de',
           });
           console.log(`📧 Payment-failed email → ${email} (attempt ${attempt})`);
         } else {
@@ -3252,12 +3272,12 @@ app.post('/webhook', async (req, res) => {
         email = email.toLowerCase().trim();
         const { data: user } = await supabase
           .from('users')
-          .select('name, language')
+          .select('name, lang')
           .eq('email', email)
           .maybeSingle();
         await sendEmail(email, 'trial_ending', {
           name: user?.name || '',
-          lang: user?.language || 'de',
+          lang: user?.lang || 'de',
           trialEnd: sub.trial_end ? new Date(sub.trial_end * 1000) : null,
         });
         console.log(`📧 Trial-ending email → ${email}`);
@@ -3575,14 +3595,10 @@ async function sendEmail(to, type, data) {
     cancelReminderCTA: 'Jetzt PEAK nutzen',
     cancelFinalSubject: 'Dein PEAK Premium ist beendet',
     cancelFinalLabel: 'Premium beendet',
-    cancelFinalH1a: 'Jetzt bist du',
-    cancelFinalH1b: 'auf Free.',
-    cancelFinalBody: 'Dein Premium-Abo ist heute ausgelaufen. Du kannst PEAK weiter kostenlos nutzen — mit eingeschränktem Funktionsumfang.',
-    cancelFinalIncludesTitle: 'Mit Free hast du weiterhin:',
-    cancelFinalF1: 'Dein Basis-Ernährungsplan',
-    cancelFinalF2: 'Dein Basis-Trainingsplan',
-    cancelFinalF3: '1 Plan-Generierung pro 30 Tage',
-    cancelFinalReactivate: 'Premium vermissen? Upgrade ist jederzeit möglich — dein Profil ist gespeichert.',
+    cancelFinalH1a: 'Premium',
+    cancelFinalH1b: 'ist beendet.',
+    cancelFinalBody: 'Dein Premium-Abo ist heute ausgelaufen. Dein Profil bleibt gespeichert — du kannst jederzeit upgraden und genau dort weitermachen, wo du aufgehört hast.',
+    cancelFinalReactivate: 'Premium vermissen? Hol es dir mit einem Klick zurück.',
     cancelFinalCTA: 'Premium zurückholen',
     accountDeletedSubject: 'Dein PEAK-Konto wurde gelöscht',
     accountDeletedLabel: 'Konto gelöscht',
@@ -3672,14 +3688,10 @@ async function sendEmail(to, type, data) {
     cancelReminderCTA: 'Use PEAK now',
     cancelFinalSubject: 'Your PEAK Premium has ended',
     cancelFinalLabel: 'Premium ended',
-    cancelFinalH1a: 'You\'re now',
-    cancelFinalH1b: 'on Free.',
-    cancelFinalBody: 'Your Premium subscription ended today. You can keep using PEAK for free — with a reduced feature set.',
-    cancelFinalIncludesTitle: 'With Free you still get:',
-    cancelFinalF1: 'Your basic nutrition plan',
-    cancelFinalF2: 'Your basic training plan',
-    cancelFinalF3: '1 plan generation every 30 days',
-    cancelFinalReactivate: 'Missing Premium? You can upgrade anytime — your profile is saved.',
+    cancelFinalH1a: 'Premium',
+    cancelFinalH1b: 'has ended.',
+    cancelFinalBody: 'Your Premium subscription ended today. Your profile stays saved — you can upgrade any time and pick up exactly where you left off.',
+    cancelFinalReactivate: 'Missing Premium? Bring it back with one click.',
     cancelFinalCTA: 'Bring back Premium',
     accountDeletedSubject: 'Your PEAK account has been deleted',
     accountDeletedLabel: 'Account deleted',
@@ -3930,25 +3942,8 @@ async function sendEmail(to, type, data) {
           </p>
         </td></tr>
 
-        <tr><td class="email-pad" style="padding:0 40px 8px;">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:1px solid ${BRAND.border};">
-            <tr><td style="padding:24px 0 8px;">
-              <p style="margin:0 0 16px;font-family:${FONT_HEAD};font-size:11px;font-weight:900;letter-spacing:3px;color:${BRAND.ink};text-transform:uppercase;">${L.cancelFinalIncludesTitle}</p>
-            </td></tr>
-            <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${L.cancelFinalF1}
-            </td></tr>
-            <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${L.cancelFinalF2}
-            </td></tr>
-            <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:24px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${L.cancelFinalF3}
-            </td></tr>
-          </table>
-        </td></tr>
-
         <tr><td class="email-pad" style="padding:8px 40px 24px;">
-          <p style="margin:0;font-family:${FONT_BODY};font-size:14px;line-height:1.65;color:${BRAND.ink2};">
+          <p style="margin:0;font-family:${FONT_BODY};font-size:14px;line-height:1.65;color:${BRAND.ink2};border-top:1px solid ${BRAND.border};padding-top:24px;">
             ${L.cancelFinalReactivate}
           </p>
         </td></tr>
@@ -4071,9 +4066,10 @@ cron.schedule('0 10 * * *', async () => {
       .eq('unsubscribed', false);
     for (const user of trialUsers || []) {
       if (!user.trial_end) continue;
+      const userLang = (user.lang === 'de' || user.lang === 'en') ? user.lang : 'de';
       const daysLeft = Math.ceil((new Date(user.trial_end) - now) / (1000 * 60 * 60 * 24));
-      if (daysLeft === 2) await sendEmail(user.email, 'day5', { name: user.name });
-      else if (daysLeft === 1) await sendEmail(user.email, 'day6', { name: user.name });
+      if (daysLeft === 2) await sendEmail(user.email, 'day5', { name: user.name, lang: userLang });
+      else if (daysLeft === 1) await sendEmail(user.email, 'day6', { name: user.name, lang: userLang });
     }
   } catch (err) {
     console.error('❌ Trial reminder cron error:', err.message);
@@ -4096,14 +4092,16 @@ cron.schedule('0 10 * * *', async () => {
       const daysLeft = Math.ceil((new Date(user.cancel_at) - now) / (1000 * 60 * 60 * 24));
       // Window: 2-4 days before end (catches cron-downtime cases)
       if (daysLeft >= 2 && daysLeft <= 4) {
+        const userLang = (user.lang === 'de' || user.lang === 'en') ? user.lang : 'de';
         const endDateStr = new Date(user.cancel_at).toLocaleDateString(
-          user.lang === 'de' ? 'de-DE' : 'en-GB',
+          userLang === 'de' ? 'de-DE' : 'en-GB',
           { day: '2-digit', month: 'long', year: 'numeric' }
         );
         try {
           await sendEmail(user.email, 'cancellation_reminder', {
             daysLeft: daysLeft,
             endDate: endDateStr,
+            lang: userLang,
           });
           // Mark as sent so we don't repeat
           await supabase.from('users').update({
