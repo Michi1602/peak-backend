@@ -3590,7 +3590,7 @@ async function sendEmail(to, type, data) {
     accountDeletedH1b: 'ist gelöscht.',
     accountDeletedBody: (name) => (name ? name + ', d' : 'D') + 'ein PEAK-Konto wurde auf deinen Wunsch hin vollständig gelöscht. Alle deine Daten (Profil, Ziele, Fortschritt) wurden aus unserer Datenbank entfernt. Falls du ein Premium-Abo hattest, wurde es beendet.',
     accountDeletedLegal: 'Hinweis: Rechnungen und Zahlungsdaten müssen wir aus steuerrechtlichen Gründen für 10 Jahre aufbewahren (§147 AO). Alle anderen personenbezogenen Daten sind gelöscht.',
-    accountDeletedBye: 'Danke, dass du PEAK ausprobiert hast. Falls du irgendwann zurückkommen möchtest — du bist willkommen.',
+    accountDeletedBye: 'Danke, dass du PEAK ausprobiert hast. Du bist jederzeit wieder willkommen.',
     // ── PAYMENT FAILED (DE) ──
     paymentFailedSubject: 'Zahlung fehlgeschlagen — bitte Karte aktualisieren',
     paymentFailedLabel: 'Zahlung fehlgeschlagen',
@@ -3687,7 +3687,7 @@ async function sendEmail(to, type, data) {
     accountDeletedH1b: 'is deleted.',
     accountDeletedBody: (name) => (name ? name + ', y' : 'Y') + 'our PEAK account has been fully deleted at your request. All your data (profile, goals, progress) has been removed from our database. If you had a Premium subscription, it has been ended.',
     accountDeletedLegal: 'Note: invoices and payment records must be retained for 10 years for tax-law reasons (German §147 AO). All other personal data has been deleted.',
-    accountDeletedBye: 'Thanks for trying PEAK. If you ever want to come back — you\'re welcome.',
+    accountDeletedBye: 'Thanks for trying PEAK. You\'re always welcome back.',
     // ── PAYMENT FAILED (EN) ──
     paymentFailedSubject: 'Payment failed — please update your card',
     paymentFailedLabel: 'Payment failed',
