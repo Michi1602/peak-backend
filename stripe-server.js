@@ -2172,6 +2172,20 @@ app.delete('/user/account', async (req, res) => {
 
     // 2. Cancel Stripe subscription immediately (if any)
     if (profile && profile.stripe_subscription_id) {
+      // FIRST: mark the user row as pending deletion. The
+      // customer.subscription.deleted webhook fires asynchronously after
+      // the Stripe cancel below; without this flag it would send a
+      // "cancellation_final" email even though the user is also about to
+      // get an "account_deleted" email — i.e. two emails for one action.
+      // The webhook checks this status and skips the email.
+      try {
+        await supabase
+          .from('users')
+          .update({ status: 'pending_deletion' })
+          .eq('id', userId);
+      } catch (err) {
+        console.warn(`   ⚠ Failed to mark pending_deletion (continuing): ${err.message}`);
+      }
       try {
         await stripe.subscriptions.cancel(profile.stripe_subscription_id, {
           invoice_now: false,
@@ -3057,28 +3071,49 @@ app.post('/webhook', async (req, res) => {
           .select('status')
           .eq('email', email)
           .maybeSingle();
+        // Detect if user is being deleted right now via /user/account DELETE.
+        // That endpoint sets status to 'pending_deletion' BEFORE calling
+        // stripe.subscriptions.cancel(), so when this webhook fires we can
+        // tell the cancellation is part of an account deletion and skip the
+        // redundant "cancellation_final" email (account_deleted email is
+        // sent by the deletion endpoint itself).
+        const isAccountDeletion = existing?.status === 'pending_deletion';
         const newStatus = existing?.status === 'blocked_voucher_abuse'
           ? 'blocked_voucher_abuse'
-          : 'cancelled';
-        const { error } = await supabase.from('users').update({
+          : (isAccountDeletion ? 'pending_deletion' : 'cancelled');
+        const { data: updated, error } = await supabase.from('users').update({
           status: newStatus,
           tier: 'free',
           stripe_subscription_id: null,
           trial_end: null,
           cancel_at: null,
-        }).eq('email', email);
+        }).eq('email', email).select('id');
         if (error) console.error('❌ Supabase update (cancelled) failed:', error.message);
         else console.log(`✅ User cancelled + downgraded to free: ${email}`);
 
+        // If the update affected 0 rows, the user row was already deleted
+        // (race condition: account-deletion endpoint finished the row delete
+        // before this webhook arrived). In that case the cancellation email
+        // is redundant — the user already gets the "account deleted" mail.
+        const userStillExists = Array.isArray(updated) && updated.length > 0;
+
         // Email C: Final — subscription has actually ended
-        // Skip if user was abuse-blocked (they shouldn't get win-back mails)
-        if (newStatus !== 'blocked_voucher_abuse') {
+        // Skip in three cases:
+        //   1. User abuse-blocked (no win-back mail)
+        //   2. User row already deleted (account-deletion race)
+        //   3. User is mid-deletion (pending_deletion flag set)
+        const skipEmail = newStatus === 'blocked_voucher_abuse'
+          || !userStillExists
+          || isAccountDeletion;
+        if (!skipEmail) {
           try {
             await sendEmail(email, 'cancellation_final', {});
             console.log(`📧 Cancellation final → ${email}`);
           } catch (err) {
             console.error('⚠️  cancellation_final email failed:', err.message);
           }
+        } else if (isAccountDeletion || !userStillExists) {
+          console.log(`ℹ️  Skipping cancellation_final for ${email}: account deletion in progress`);
         }
       }
     } else if (event.type === 'customer.subscription.updated') {
