@@ -793,7 +793,11 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
     }
 
     console.log(`✅ Free signup complete: ${normalizedEmail} (${authUserId})`);
-    res.json({ success: true, userId: authUserId });
+    // Send magicLink back to the frontend too — that way the client can
+    // exchange it for a session immediately and the user lands logged in
+    // straight from the onboarding flow, without having to open the
+    // welcome email. The email is purely a backup for cross-device cases.
+    res.json({ success: true, userId: authUserId, magicLink });
   } catch (err) {
     console.error('❌ signup-free error:', err.message);
     res.status(500).json({ error: err.message });
