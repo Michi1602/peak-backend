@@ -3535,16 +3535,20 @@ async function sendEmail(to, type, data) {
 
   // Localised strings
   const L = de ? {
-    welcomeSubject: (isFree) => isFree ? 'Willkommen bei PEAK — dein Gratis-Plan ist bereit' : 'Willkommen bei PEAK — dein Plan ist bereit',
+    welcomeSubject: (isFree) => isFree ? 'Dein PEAK-Plan ist live — diese Mail ist dein Cross-Device-Login' : 'Willkommen bei PEAK — dein Plan ist bereit',
     welcomeLabel: (n) => 'Willkommen' + (n ? ', ' + n : ''),
     welcomeH1a: 'Dein Plan',
     welcomeH1b: 'ist live.',
-    welcomeH1FreeB: 'steht.',
+    welcomeH1FreeB: 'läuft.',
     welcomeIntro: (isFree, goal, sport) => {
-      let intro = 'System statt Motivation. Hier startet dein Weg — ';
-      if (sport && goal) intro += `dein individueller ${sport}-Plan, abgestimmt auf „${goal}".`;
-      else if (sport) intro += `dein individueller ${sport}-Plan.`;
-      else if (goal) intro += `maßgeschneidert auf dein Ziel: „${goal}".`;
+      if (isFree) {
+        let intro = 'Du bist bereits eingeloggt — diese Mail ist dein Backup. Speicher sie, falls du PEAK auf einem anderen Gerät öffnen willst (Handy, Tablet). Klick einfach unten auf den Button und du landest direkt in deinem Plan, ohne Passwort.';
+        return intro;
+      }
+      let intro = 'Deine 7-Tage-Testphase läuft — keine Abbuchung bis Tag 8. ';
+      if (sport && goal) intro += `Dein individueller ${sport}-Plan ist abgestimmt auf „${goal}".`;
+      else if (sport) intro += `Dein individueller ${sport}-Plan ist bereit.`;
+      else if (goal) intro += `Maßgeschneidert auf dein Ziel: „${goal}".`;
       else intro += 'KI-gestützte Ernährung, Training und Regeneration — auf dich zugeschnitten.';
       return intro;
     },
@@ -3563,7 +3567,7 @@ async function sendEmail(to, type, data) {
     step2Paid: 'Erstes Training starten',
     step3Free: 'Mahlzeit protokollieren für Fortschritts-Tracking',
     step3Paid: 'Regenerations-Protokoll lesen',
-    boxFree: '<strong>Gratis-Plan.</strong> Keine Karte, keine Abbuchung. Upgrade jederzeit für unbegrenzte Pläne, volle Trainingsprogression und Regenerations-Tools.',
+    boxFree: '<strong>Gratis-Plan.</strong> Keine Karte, keine Abbuchung. Mit Basic schaltest du den vollen Plan inkl. Regeneration & Tools frei. Mit Premium kommen 12-Wochen-Progression, Mobility, KI-Anpassung und mehr dazu.',
     boxPaid: '<strong>7 Tage kostenlos.</strong> Erst ab Tag 8 wird abgebucht. Erinnerungen an Tag 5 und 6.',
     ctaOpen: 'Plan öffnen',
     day5Subject: 'Noch 2 Tage — deine PEAK-Testphase',
@@ -3628,16 +3632,20 @@ async function sendEmail(to, type, data) {
     trialEndingBox: '<strong>Möchtest du nicht weitermachen?</strong> Öffne PEAK → Einstellungen → Abonnement → Testphase beenden. 10 Sekunden, kein Telefonat.',
     trialEndingCTA: 'PEAK öffnen',
   } : {
-    welcomeSubject: (isFree) => isFree ? 'Welcome to PEAK — your free plan is ready' : 'Welcome to PEAK — your plan is ready',
+    welcomeSubject: (isFree) => isFree ? 'Your PEAK plan is live — this email is your cross-device login' : 'Welcome to PEAK — your plan is ready',
     welcomeLabel: (n) => 'Welcome' + (n ? ', ' + n : ''),
     welcomeH1a: 'Your plan is',
     welcomeH1b: 'live.',
     welcomeH1FreeB: 'live.',
     welcomeIntro: (isFree, goal, sport) => {
-      let intro = 'System over motivation. This is where it starts — ';
-      if (sport && goal) intro += `your custom ${sport} plan, tuned to "${goal}".`;
-      else if (sport) intro += `your custom ${sport} programme.`;
-      else if (goal) intro += `built around your goal: "${goal}".`;
+      if (isFree) {
+        let intro = 'You\'re already logged in — this email is your backup. Save it if you ever want to open PEAK on another device (phone, tablet). Just tap the button below and you\'ll land straight in your plan, no password.';
+        return intro;
+      }
+      let intro = 'Your 7-day trial is running — no charge until Day 8. ';
+      if (sport && goal) intro += `Your custom ${sport} plan is tuned to "${goal}".`;
+      else if (sport) intro += `Your custom ${sport} programme is ready.`;
+      else if (goal) intro += `Built around your goal: "${goal}".`;
       else intro += 'AI-built nutrition, training and recovery, tuned to you.';
       return intro;
     },
@@ -3656,7 +3664,7 @@ async function sendEmail(to, type, data) {
     step2Paid: 'Start your first training session',
     step3Free: 'Log a meal to track progress',
     step3Paid: 'Read your recovery protocol',
-    boxFree: '<strong>Free plan.</strong> No card, no charge. Upgrade any time for unlimited plans, full training progression and recovery tools.',
+    boxFree: '<strong>Free plan.</strong> No card, no charge. Basic unlocks the full plan including recovery & tools. Premium adds 12-week progression, mobility, AI adaptation and more.',
     boxPaid: '<strong>7 days free.</strong> No charge until Day 8. Reminders on Day 5 and Day 6.',
     ctaOpen: 'Open my plan',
     day5Subject: 'Two days left on your PEAK trial',
