@@ -786,6 +786,7 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
         sport: userData?.sport || '',
         magicLink,
         isFree: true,
+        tier: 'free',
         lang: lang === 'de' ? 'de' : (lang === 'en' ? 'en' : undefined),
       });
     } catch (err) {
@@ -2791,7 +2792,25 @@ app.post('/webhook', async (req, res) => {
       email = email.toLowerCase().trim();
 
       const meta = session.metadata || {};
-      const trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+      // Pull real trial_end from the Stripe subscription instead of hardcoding
+      // 7 days. With voucher promos (LAUNCH4W = 28d, full-free codes = 90d)
+      // the hardcoded 7 was always wrong — users got correct billing from
+      // Stripe but the wrong trial_end stored in our users table, so the
+      // trial_ending email at day 5 fired way too early.
+      let trialEnd = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // safe default
+      let trialDaysCount = 7;
+      if (session.subscription) {
+        try {
+          const sub = await stripe.subscriptions.retrieve(session.subscription);
+          if (sub && sub.trial_end) {
+            trialEnd = new Date(sub.trial_end * 1000);
+            trialDaysCount = Math.round((trialEnd.getTime() - Date.now()) / 86400000);
+            if (trialDaysCount < 1) trialDaysCount = 7; // sanity floor
+          }
+        } catch (err) {
+          console.warn('⚠️  Could not fetch subscription for trial_end:', err.message);
+        }
+      }
 
       // ── STEP 1: Create or find Auth user ────────────────────────────
       // Service role bypasses the "Allow signups" toggle, so we can create
@@ -2963,6 +2982,13 @@ app.post('/webhook', async (req, res) => {
           goals: parsedGoals,
           sport: meta.userSport || '',
           magicLink,
+          // Distinguish Basic vs Premium so the email can show the right
+          // tier-specific feature list and trial copy. The original code
+          // only had a binary "isFree" flag — Basic users would see the
+          // generic "paid" path with Premium features advertised, which
+          // they don't actually get.
+          tier: meta.tier === 'basic' ? 'basic' : 'premium',
+          trialDays: trialDaysCount,
           lang: meta.userLang === 'de' ? 'de' : (meta.userLang === 'en' ? 'en' : undefined),
         });
       } catch (err) {
@@ -3138,6 +3164,60 @@ app.post('/webhook', async (req, res) => {
       const wasCancelling = prev.cancel_at_period_end === true;
       const wasReactivated = wasCancelling && !nowCancelling;
       const justCancelled = nowCancelling && !wasCancelling;
+
+      // ── PLAN-CHANGE DETECTION ────────────────────────────────────────
+      // When a user switches Basic ↔ Premium or monthly ↔ annual in the
+      // Customer Portal, Stripe fires customer.subscription.updated with
+      // the new price under sub.items.data[0].price.id. Without this
+      // handler, our DB tier/plan never updates and the user keeps
+      // seeing Basic limits even after paying for Premium (or vice versa).
+      let priceChanged = false;
+      let newTier = null;
+      let newPlan = null;
+      try {
+        const newPriceId = sub.items?.data?.[0]?.price?.id;
+        if (newPriceId) {
+          const PRICE_BASIC_MONTHLY = process.env.STRIPE_PRICE_BASIC_MONTHLY;
+          const PRICE_BASIC_ANNUAL = process.env.STRIPE_PRICE_BASIC_ANNUAL;
+          const PRICE_PREMIUM_MONTHLY = process.env.STRIPE_PRICE_PREMIUM_MONTHLY || process.env.STRIPE_PRICE_MONTHLY;
+          const PRICE_PREMIUM_ANNUAL = process.env.STRIPE_PRICE_PREMIUM_ANNUAL || process.env.STRIPE_PRICE_ANNUAL;
+          if (newPriceId === PRICE_BASIC_MONTHLY) { newTier = 'basic'; newPlan = 'monthly'; }
+          else if (newPriceId === PRICE_BASIC_ANNUAL) { newTier = 'basic'; newPlan = 'annual'; }
+          else if (newPriceId === PRICE_PREMIUM_MONTHLY) { newTier = 'premium'; newPlan = 'monthly'; }
+          else if (newPriceId === PRICE_PREMIUM_ANNUAL) { newTier = 'premium'; newPlan = 'annual'; }
+          // Only flag a change if items actually moved (Stripe sends
+          // subscription.updated for many reasons — cancellations, trial
+          // ending, billing-cycle ticks, metadata edits — and we don't
+          // want to redundantly write tier on every one of those events).
+          priceChanged = !!prev.items;
+        }
+      } catch (err) {
+        console.warn('⚠️  Plan-change parse failed:', err.message);
+      }
+
+      if (priceChanged && newTier && newPlan) {
+        let email = null;
+        try {
+          const customer = await stripe.customers.retrieve(sub.customer);
+          email = customer.email ? customer.email.toLowerCase().trim() : null;
+        } catch (err) {
+          console.error('❌ Could not fetch customer for plan-change:', err.message);
+        }
+        if (email) {
+          // Pull trial_end from the live Stripe sub so the DB stays in sync
+          // even when the Customer Portal cleared/extended trial.
+          const trialEndIso = sub.trial_end ? new Date(sub.trial_end * 1000).toISOString() : null;
+          const updates = {
+            tier: newTier,
+            plan: newPlan,
+            status: sub.status === 'trialing' ? 'trial' : 'active',
+          };
+          if (trialEndIso) updates.trial_end = trialEndIso;
+          const { error } = await supabase.from('users').update(updates).eq('email', email);
+          if (error) console.error('❌ Plan-change DB update failed:', error.message);
+          else console.log(`🔄 Plan changed: ${email} → ${newTier}/${newPlan} (trial_end=${trialEndIso || 'unchanged'})`);
+        }
+      }
 
       if (justCancelled || wasReactivated) {
         let email = null;
@@ -3535,32 +3615,43 @@ async function sendEmail(to, type, data) {
 
   // Localised strings
   const L = de ? {
-    welcomeSubject: (isFree) => isFree ? 'Dein PEAK-Plan ist live — diese Mail ist dein Cross-Device-Login' : 'Willkommen bei PEAK — dein Plan ist bereit',
+    // Subject branches by tier — Basic and Premium share the "trial" subject;
+    // Free uses the cross-device login subject.
+    welcomeSubject: (tier) => tier === 'free' ? 'Dein PEAK-Plan ist live — diese Mail ist dein Cross-Device-Login' : 'Willkommen bei PEAK — dein Plan ist bereit',
     welcomeLabel: (n) => 'Willkommen' + (n ? ', ' + n : ''),
     welcomeH1a: 'Dein Plan',
     welcomeH1b: 'ist live.',
     welcomeH1FreeB: 'läuft.',
-    welcomeIntro: (isFree, goal, sport) => {
-      if (isFree) {
-        let intro = 'Du bist bereits eingeloggt — diese Mail ist dein Backup. Speicher sie, falls du PEAK auf einem anderen Gerät öffnen willst (Handy, Tablet). Klick einfach unten auf den Button und du landest direkt in deinem Plan, ohne Passwort.';
-        return intro;
+    welcomeIntro: (tier, goal, sport, trialDays) => {
+      if (tier === 'free') {
+        return 'Du bist bereits eingeloggt — diese Mail ist dein Backup. Speicher sie, falls du PEAK auf einem anderen Gerät öffnen willst (Handy, Tablet). Klick einfach unten auf den Button und du landest direkt in deinem Plan, ohne Passwort.';
       }
-      let intro = 'Deine 7-Tage-Testphase läuft — keine Abbuchung bis Tag 8. ';
+      const days = trialDays && trialDays > 0 ? trialDays : 7;
+      let intro = `Deine ${days}-Tage-Testphase läuft — keine Abbuchung bis Tag ${days + 1}. `;
       if (sport && goal) intro += `Dein individueller ${sport}-Plan ist abgestimmt auf „${goal}".`;
       else if (sport) intro += `Dein individueller ${sport}-Plan ist bereit.`;
       else if (goal) intro += `Maßgeschneidert auf dein Ziel: „${goal}".`;
       else intro += 'KI-gestützte Ernährung, Training und Regeneration — auf dich zugeschnitten.';
       return intro;
     },
+    // "What's included" list — three flavours: free, basic, premium.
+    // Each list reflects the documented tier matrix (May 2026):
+    //   Free    = Vorschau (1 Woche Training, 7 Tage Essensplan)
+    //   Basic   = volle Pläne, Tracking, 3 Updates/Mo, Recovery-Plan
+    //   Premium = Basic + 12W-Progression, Mobility, Mood, Scanner, Log
     includesFree: 'Dein Gratis-Plan enthält',
-    includesPaid: 'In PEAK enthalten',
+    includesBasic: 'In Basic enthalten',
+    includesPremium: 'In Premium enthalten',
     f1: (sport) => sport ? `KI-Ernährungsplan für dein ${sport}-Training` : 'KI-Ernährungsplan, passend zu Ziel & Geschmack',
     f2Free: (sport) => sport ? `${sport}-Training — eine Woche zum Reinschnuppern` : 'Trainings-Vorschau für deine Sportart',
-    f2Paid: (sport) => sport ? `12-Wochen-${sport}-Programm mit Progression` : '12-Wochen-Programm für deine Sportart',
+    f2Basic: (sport) => sport ? `Voller ${sport}-Trainingsplan, alle Wochen` : 'Voller Trainingsplan für deine Sportart',
+    f2Premium: (sport) => sport ? `12-Wochen-${sport}-Programm mit Progression` : '12-Wochen-Programm mit Progression',
     f3Free: '3 Plan-Updates inklusive',
-    f3Paid: 'Regeneration — Schlaf, Hydration, Mobilität',
+    f3Basic: 'Voller Regenerationsplan: Schlaf, Hydration, Tools',
+    f3Premium: 'Mobility, Stretching & Recovery-Tools',
     f4Free: 'Jederzeit Upgrade möglich',
-    f4Paid: 'Barcode-Scanner & Shopping-Modus',
+    f4Basic: 'Meal-Tracking & Tagesfortschritt',
+    f4Premium: 'Barcode-Scanner, Protokoll & KI-Anpassung',
     stepsTitle: 'Deine ersten 3 Schritte',
     step1: 'Plan öffnen und Essensplan anschauen',
     step2Free: 'Trainings-Tab — Woche 1 ansehen',
@@ -3568,7 +3659,7 @@ async function sendEmail(to, type, data) {
     step3Free: 'Mahlzeit protokollieren für Fortschritts-Tracking',
     step3Paid: 'Regenerations-Protokoll lesen',
     boxFree: '<strong>Gratis-Plan.</strong> Keine Karte, keine Abbuchung. Mit Basic schaltest du den vollen Plan inkl. Regeneration & Tools frei. Mit Premium kommen 12-Wochen-Progression, Mobility, KI-Anpassung und mehr dazu.',
-    boxPaid: '<strong>7 Tage kostenlos.</strong> Erst ab Tag 8 wird abgebucht. Erinnerungen an Tag 5 und 6.',
+    boxPaid: (trialDays) => `<strong>${trialDays && trialDays > 0 ? trialDays : 7} Tage kostenlos.</strong> Erst ab Tag ${(trialDays && trialDays > 0 ? trialDays : 7) + 1} wird abgebucht. Erinnerungen 2 Tage und 1 Tag vor Ende.`,
     ctaOpen: 'Plan öffnen',
     day5Subject: 'Noch 2 Tage — deine PEAK-Testphase',
     day5Label: '48 Stunden übrig',
@@ -3632,17 +3723,17 @@ async function sendEmail(to, type, data) {
     trialEndingBox: '<strong>Möchtest du nicht weitermachen?</strong> Öffne PEAK → Einstellungen → Abonnement → Testphase beenden. 10 Sekunden, kein Telefonat.',
     trialEndingCTA: 'PEAK öffnen',
   } : {
-    welcomeSubject: (isFree) => isFree ? 'Your PEAK plan is live — this email is your cross-device login' : 'Welcome to PEAK — your plan is ready',
+    welcomeSubject: (tier) => tier === 'free' ? 'Your PEAK plan is live — this email is your cross-device login' : 'Welcome to PEAK — your plan is ready',
     welcomeLabel: (n) => 'Welcome' + (n ? ', ' + n : ''),
     welcomeH1a: 'Your plan is',
     welcomeH1b: 'live.',
     welcomeH1FreeB: 'live.',
-    welcomeIntro: (isFree, goal, sport) => {
-      if (isFree) {
-        let intro = 'You\'re already logged in — this email is your backup. Save it if you ever want to open PEAK on another device (phone, tablet). Just tap the button below and you\'ll land straight in your plan, no password.';
-        return intro;
+    welcomeIntro: (tier, goal, sport, trialDays) => {
+      if (tier === 'free') {
+        return 'You\'re already logged in — this email is your backup. Save it if you ever want to open PEAK on another device (phone, tablet). Just tap the button below and you\'ll land straight in your plan, no password.';
       }
-      let intro = 'Your 7-day trial is running — no charge until Day 8. ';
+      const days = trialDays && trialDays > 0 ? trialDays : 7;
+      let intro = `Your ${days}-day trial is running — no charge until Day ${days + 1}. `;
       if (sport && goal) intro += `Your custom ${sport} plan is tuned to "${goal}".`;
       else if (sport) intro += `Your custom ${sport} programme is ready.`;
       else if (goal) intro += `Built around your goal: "${goal}".`;
@@ -3650,14 +3741,18 @@ async function sendEmail(to, type, data) {
       return intro;
     },
     includesFree: 'Your free plan includes',
-    includesPaid: 'Inside PEAK',
+    includesBasic: 'Basic includes',
+    includesPremium: 'Premium includes',
     f1: (sport) => sport ? `AI nutrition plan for your ${sport} training` : 'AI nutrition plan, matched to goal and taste',
     f2Free: (sport) => sport ? `${sport} training — 1-week preview` : '1-week training preview for your sport',
-    f2Paid: (sport) => sport ? `12-week ${sport} programme with progression` : 'Personalised programme for your sport',
+    f2Basic: (sport) => sport ? `Full ${sport} training plan, every week` : 'Full training plan for your sport',
+    f2Premium: (sport) => sport ? `12-week ${sport} programme with progression` : '12-week programme with progression',
     f3Free: '3 plan regenerations included',
-    f3Paid: 'Recovery protocol — sleep, hydration, mobility',
+    f3Basic: 'Full recovery plan: sleep, hydration, tools',
+    f3Premium: 'Mobility, stretching & recovery tools',
     f4Free: 'Upgrade any time',
-    f4Paid: 'Barcode scanner and shopping mode',
+    f4Basic: 'Meal tracking & daily progress',
+    f4Premium: 'Barcode scanner, log & AI adaptation',
     stepsTitle: 'Your first 3 steps',
     step1: 'Open your plan and check your meals',
     step2Free: 'Open the Training tab — see Week 1',
@@ -3665,7 +3760,7 @@ async function sendEmail(to, type, data) {
     step3Free: 'Log a meal to track progress',
     step3Paid: 'Read your recovery protocol',
     boxFree: '<strong>Free plan.</strong> No card, no charge. Basic unlocks the full plan including recovery & tools. Premium adds 12-week progression, mobility, AI adaptation and more.',
-    boxPaid: '<strong>7 days free.</strong> No charge until Day 8. Reminders on Day 5 and Day 6.',
+    boxPaid: (trialDays) => `<strong>${trialDays && trialDays > 0 ? trialDays : 7} days free.</strong> No charge until Day ${(trialDays && trialDays > 0 ? trialDays : 7) + 1}. Reminders 2 days and 1 day before end.`,
     ctaOpen: 'Open my plan',
     day5Subject: 'Two days left on your PEAK trial',
     day5Label: '48 hours left',
@@ -3742,36 +3837,50 @@ async function sendEmail(to, type, data) {
 
   const templates = {
     welcome: {
-      subject: L.welcomeSubject(data?.isFree),
-      html: emailShell(RESPONSIVE_CSS + `
+      subject: L.welcomeSubject(data?.tier || (data?.isFree ? 'free' : 'premium')),
+      html: emailShell(RESPONSIVE_CSS + (() => {
+        // Resolve tier with backwards-compat: legacy callers pass isFree=true
+        // for the Free path; new callers pass tier explicitly. Default to
+        // 'premium' if neither is set so paid signups keep working.
+        const tier = data?.tier || (data?.isFree ? 'free' : 'premium');
+        const isFree = tier === 'free';
+        const isBasic = tier === 'basic';
+        const isPremium = tier === 'premium';
+        // Feature list lookup — pulls the right localised strings per tier.
+        const includesLbl = isFree ? L.includesFree : (isBasic ? L.includesBasic : L.includesPremium);
+        const f2 = isFree ? L.f2Free(sport) : (isBasic ? L.f2Basic(sport) : L.f2Premium(sport));
+        const f3 = isFree ? L.f3Free : (isBasic ? L.f3Basic : L.f3Premium);
+        const f4 = isFree ? L.f4Free : (isBasic ? L.f4Basic : L.f4Premium);
+        const trialDays = data?.trialDays;
+        return `
         <tr><td>${emailHeader()}</td></tr>
         <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
           <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.welcomeLabel(name)}</p>
           <h1 class="email-h1" style="margin:0 0 14px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
-            ${L.welcomeH1a}<br>${data?.isFree ? L.welcomeH1FreeB : L.welcomeH1b}
+            ${L.welcomeH1a}<br>${isFree ? L.welcomeH1FreeB : L.welcomeH1b}
           </h1>
           ${goalHeadline ? `<p style="margin:0 0 18px;font-family:${FONT_HEAD};font-size:13px;font-weight:700;letter-spacing:2px;color:${BRAND.red};text-transform:uppercase;">🎯 ${goalHeadline}</p>` : ''}
           <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
-            ${L.welcomeIntro(data?.isFree, goal, sport)}
+            ${L.welcomeIntro(tier, goal, sport, trialDays)}
           </p>
         </td></tr>
 
         <tr><td class="email-pad" style="padding:0 40px 8px;">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:1px solid ${BRAND.border};">
             <tr><td style="padding:24px 0 8px;">
-              <p style="margin:0 0 16px;font-family:${FONT_HEAD};font-size:11px;font-weight:900;letter-spacing:3px;color:${BRAND.ink};text-transform:uppercase;">${data?.isFree ? L.includesFree : L.includesPaid}</p>
+              <p style="margin:0 0 16px;font-family:${FONT_HEAD};font-size:11px;font-weight:900;letter-spacing:3px;color:${BRAND.ink};text-transform:uppercase;">${includesLbl}</p>
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
               <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${L.f1(sport)}
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? L.f2Free(sport) : L.f2Paid(sport)}
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${f2}
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:6px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? L.f3Free : L.f3Paid}
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${f3}
             </td></tr>
             <tr><td style="font-family:${FONT_BODY};font-size:14px;line-height:1.7;color:${BRAND.ink2};padding-bottom:24px;">
-              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${data?.isFree ? L.f4Free : L.f4Paid}
+              <span style="color:${BRAND.red};font-weight:700;">—</span>&nbsp;&nbsp;${f4}
             </td></tr>
           </table>
         </td></tr>
@@ -3792,7 +3901,7 @@ async function sendEmail(to, type, data) {
                 <td valign="top" style="padding-right:12px;">
                   <div style="width:24px;height:24px;background:${BRAND.red};color:${BRAND.white};font-family:${FONT_HEAD};font-weight:900;font-size:13px;text-align:center;line-height:24px;">2</div>
                 </td>
-                <td style="font-family:${FONT_BODY};font-size:14px;line-height:1.5;color:${BRAND.ink2};padding-top:2px;">${data?.isFree ? L.step2Free : L.step2Paid}</td>
+                <td style="font-family:${FONT_BODY};font-size:14px;line-height:1.5;color:${BRAND.ink2};padding-top:2px;">${isFree ? L.step2Free : L.step2Paid}</td>
               </tr></table>
             </td></tr>
             <tr><td style="padding:8px 0;">
@@ -3800,7 +3909,7 @@ async function sendEmail(to, type, data) {
                 <td valign="top" style="padding-right:12px;">
                   <div style="width:24px;height:24px;background:${BRAND.red};color:${BRAND.white};font-family:${FONT_HEAD};font-weight:900;font-size:13px;text-align:center;line-height:24px;">3</div>
                 </td>
-                <td style="font-family:${FONT_BODY};font-size:14px;line-height:1.5;color:${BRAND.ink2};padding-top:2px;">${data?.isFree ? L.step3Free : L.step3Paid}</td>
+                <td style="font-family:${FONT_BODY};font-size:14px;line-height:1.5;color:${BRAND.ink2};padding-top:2px;">${isFree ? L.step3Free : L.step3Paid}</td>
               </tr></table>
             </td></tr>
           </table>
@@ -3809,7 +3918,7 @@ async function sendEmail(to, type, data) {
         <tr><td class="email-pad" style="padding:8px 40px 36px;">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};">
             <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
-              ${data?.isFree ? L.boxFree : L.boxPaid}
+              ${isFree ? L.boxFree : L.boxPaid(trialDays)}
             </td></tr>
           </table>
         </td></tr>
@@ -3819,7 +3928,8 @@ async function sendEmail(to, type, data) {
         </td></tr>
 
         <tr><td>${emailFooter(to)}</td></tr>
-      `)
+      `;
+      })())
     },
 
     day5: {
