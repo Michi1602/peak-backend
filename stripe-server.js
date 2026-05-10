@@ -2989,6 +2989,11 @@ app.post('/webhook', async (req, res) => {
           // they don't actually get.
           tier: meta.tier === 'basic' ? 'basic' : 'premium',
           trialDays: trialDaysCount,
+          // Pass through voucher code so the welcome email can highlight
+          // bonus trial days (e.g. LAUNCH4W → "your code added 21 bonus
+          // days"). Without this, users wonder why their trial is longer
+          // than 7 days.
+          voucherCode: meta.voucherCode || '',
           lang: meta.userLang === 'de' ? 'de' : (meta.userLang === 'en' ? 'en' : undefined),
         });
       } catch (err) {
@@ -3101,9 +3106,14 @@ app.post('/webhook', async (req, res) => {
         // German users as English in the past (Bug D2).
         const { data: existing } = await supabase
           .from('users')
-          .select('status,lang')
+          .select('status,lang,tier')
           .eq('email', email)
           .maybeSingle();
+        // Capture the tier BEFORE we downgrade to 'free', so the
+        // cancellation_final email can reference what they actually had
+        // ("Your Basic plan has ended" vs blanket "Premium has ended"
+        // which was confusing for Basic users).
+        const cancelledFromTier = existing?.tier || 'premium';
         // Detect if user is being deleted right now via /user/account DELETE.
         // That endpoint sets status to 'pending_deletion' BEFORE calling
         // stripe.subscriptions.cancel(), so when this webhook fires we can
@@ -3147,8 +3157,8 @@ app.post('/webhook', async (req, res) => {
             // mail if they signed up in DE).
             const userLang = (existing?.lang === 'de' || existing?.lang === 'en')
               ? existing.lang : 'de';
-            await sendEmail(email, 'cancellation_final', { lang: userLang });
-            console.log(`📧 Cancellation final → ${email} (${userLang})`);
+            await sendEmail(email, 'cancellation_final', { lang: userLang, tier: cancelledFromTier });
+            console.log(`📧 Cancellation final → ${email} (${userLang}, was ${cancelledFromTier})`);
           } catch (err) {
             console.error('⚠️  cancellation_final email failed:', err.message);
           }
@@ -3230,19 +3240,21 @@ app.post('/webhook', async (req, res) => {
         // Normalise to lowercase — see "Email-Case-Bug" notes
         if (email) email = email.toLowerCase().trim();
         if (email && justCancelled) {
-          // Email A: Cancellation confirmed — premium continues until period end
+          // Email A: Cancellation confirmed — paid plan continues until period end
           const periodEnd = sub.cancel_at || sub.current_period_end;
           const endDate = periodEnd ? new Date(periodEnd * 1000) : null;
-          // Pull lang first so date and email both render in user's language.
-          // Without this, endDate is always rendered in German ("5. Mai 2026")
-          // even for English users, and sendEmail's heuristic may also pick wrong.
+          // Pull lang AND tier so emails read correctly. Tier matters here:
+          // a Basic user cancelling shouldn't see "Your Premium ends" in
+          // the email body — we pass the actual tier and the template
+          // adapts ("Basic" / "Premium" / "Plan" if unknown).
           const { data: existing } = await supabase
             .from('users')
-            .select('lang')
+            .select('lang, tier')
             .eq('email', email)
             .maybeSingle();
           const userLang = (existing?.lang === 'de' || existing?.lang === 'en')
             ? existing.lang : 'de';
+          const userTier = existing?.tier || 'premium';
           // Mark in DB as pending cancellation + store end date for reminder cron.
           // Reset cancel_reminder_sent so a fresh reminder is queued for this
           // cancellation cycle (relevant if user previously reactivated).
@@ -3256,8 +3268,8 @@ app.post('/webhook', async (req, res) => {
             const endDateStr = endDate
               ? endDate.toLocaleDateString(userLang === 'de' ? 'de-DE' : 'en-US', { day: '2-digit', month: 'long', year: 'numeric' })
               : '';
-            await sendEmail(email, 'cancellation_confirmed', { endDate: endDateStr, lang: userLang });
-            console.log(`📧 Cancellation confirmed → ${email} (ends ${endDateStr}, ${userLang})`);
+            await sendEmail(email, 'cancellation_confirmed', { endDate: endDateStr, lang: userLang, tier: userTier });
+            console.log(`📧 Cancellation confirmed → ${email} (ends ${endDateStr}, ${userLang}, ${userTier})`);
           } catch (err) {
             console.error('⚠️  cancellation_confirmed email failed:', err.message);
           }
@@ -3359,10 +3371,20 @@ app.post('/webhook', async (req, res) => {
           .select('name, lang')
           .eq('email', email)
           .maybeSingle();
+        // Compute trial length from Stripe sub timestamps so the email
+        // reads correctly for non-default trials (vouchers like LAUNCH4W
+        // give 28 days; previously the body said "7-day trial" no matter
+        // what, which contradicted the actual end date and confused users).
+        let trialDaysCount = null;
+        if (sub.trial_start && sub.trial_end) {
+          const ms = (sub.trial_end - sub.trial_start) * 1000;
+          trialDaysCount = Math.round(ms / (1000 * 60 * 60 * 24));
+        }
         await sendEmail(email, 'trial_ending', {
           name: user?.name || '',
           lang: user?.lang || 'de',
           trialEnd: sub.trial_end ? new Date(sub.trial_end * 1000) : null,
+          trialDays: trialDaysCount,
         });
         console.log(`📧 Trial-ending email → ${email}`);
       }
@@ -3627,7 +3649,12 @@ async function sendEmail(to, type, data) {
         return 'Du bist bereits eingeloggt — diese Mail ist dein Backup. Speicher sie, falls du PEAK auf einem anderen Gerät öffnen willst (Handy, Tablet). Klick einfach unten auf den Button und du landest direkt in deinem Plan, ohne Passwort.';
       }
       const days = trialDays && trialDays > 0 ? trialDays : 7;
-      let intro = `Deine ${days}-Tage-Testphase läuft — keine Abbuchung bis Tag ${days + 1}. `;
+      // Lead with the auto-login note — same logic as Free, just shorter.
+      // Most paid signups happen on the device they'll use day-to-day, so
+      // we acknowledge that and frame the email as a backup link, not a
+      // "click here to start" CTA. Keeps Welcome consistent across tiers.
+      let intro = `Du bist bereits eingeloggt — der Button unten ist dein Backup-Link für andere Geräte (Handy, Tablet). `;
+      intro += `Deine ${days}-Tage-Testphase läuft — keine Abbuchung bis Tag ${days + 1}. `;
       if (sport && goal) intro += `Dein individueller ${sport}-Plan ist abgestimmt auf „${goal}".`;
       else if (sport) intro += `Dein individueller ${sport}-Plan ist bereit.`;
       else if (goal) intro += `Maßgeschneidert auf dein Ziel: „${goal}".`;
@@ -3659,17 +3686,20 @@ async function sendEmail(to, type, data) {
     step3Free: 'Mahlzeit protokollieren für Fortschritts-Tracking',
     step3Paid: 'Regenerations-Protokoll lesen',
     boxFree: '<strong>Gratis-Plan.</strong> Keine Karte, keine Abbuchung. Mit Basic schaltest du den vollen Plan inkl. Regeneration & Tools frei. Mit Premium kommen 12-Wochen-Progression, Mobility, KI-Anpassung und mehr dazu.',
-    boxPaid: (trialDays) => `<strong>${trialDays && trialDays > 0 ? trialDays : 7} Tage kostenlos.</strong> Erst ab Tag ${(trialDays && trialDays > 0 ? trialDays : 7) + 1} wird abgebucht. Erinnerungen 2 Tage und 1 Tag vor Ende.`,
-    ctaOpen: 'Plan öffnen',
-    day5Subject: 'Noch 2 Tage — deine PEAK-Testphase',
-    day5Label: '48 Stunden übrig',
-    day5H1: (n) => (n ? n + ',<br>' : '') + 'deine Testphase<br>endet bald.',
-    day5Body: (sport, goal) => {
-      const what = sport ? `dein ${sport}-Training, Ernährungsplan und Regenerations-Protokoll` : 'dein Ernährungsplan, Training und Regenerations-Protokoll';
-      return `Noch 2 Tage auf deiner 7-Tage-Testphase. ${what} wird pausiert, wenn du nicht weitermachst${goal ? '. Du bist auf dem Weg zu: „' + goal + '".' : '.'}`;
+    boxPaid: (trialDays, voucherCode) => {
+      const days = trialDays && trialDays > 0 ? trialDays : 7;
+      let txt = `<strong>${days} Tage kostenlos.</strong> Erst ab Tag ${days + 1} wird abgebucht.`;
+      // If a voucher gave them a longer-than-default trial, call it out so
+      // they know why they got the extra time. Helps reduce "warum bin ich
+      // erst in 28 Tagen dran?" support questions when LAUNCH4W or partner
+      // codes are active.
+      if (voucherCode && days > 7) {
+        txt += ` Mit deinem Code <strong>${voucherCode}</strong> hast du ${days - 7} Bonustage geschenkt bekommen.`;
+      }
+      txt += ' Erinnerung 1 Tag vor Ende.';
+      return txt;
     },
-    day5CTA: 'Weitermachen',
-    day5Cancel: 'Kündigen: PEAK öffnen → Einstellungen → Abonnement → Kündigen. 10 Sekunden, kein Telefonat.',
+    ctaOpen: 'Plan öffnen',
     day6Subject: 'Letzter Tag — deine Testphase endet morgen',
     day6Label: 'Letzte 24 Stunden',
     day6H1: (n) => (n ? n + ',<br>' : '') + 'morgen<br>geht es los.',
@@ -3677,28 +3707,49 @@ async function sendEmail(to, type, data) {
     day6Box: '<strong>Kündigen:</strong> PEAK öffnen → Einstellungen → Abonnement → Testphase beenden. In 10 Sekunden erledigt.',
     day6CTA: 'Plan behalten',
     // ── CANCELLATION EMAILS (DE) ──
+    // Tier-aware: a Basic user shouldn't read "Premium ends" (was confusing
+    // and wrong). Helper renders the correct plan label in either language.
+    cancelTierLabel: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
     cancelConfirmedSubject: 'Deine PEAK-Kündigung ist bestätigt',
     cancelConfirmedLabel: 'Kündigung bestätigt',
     cancelConfirmedH1a: 'Schade,',
     cancelConfirmedH1b: 'dass du gehst.',
-    cancelConfirmedBody: (endDate) => `Deine Kündigung wurde registriert. Dein Premium-Zugang bleibt bis zum <strong>${endDate}</strong> aktiv — dann wird dein Account automatisch auf den Free-Plan umgestellt.`,
+    cancelConfirmedBody: (endDate, tier) => {
+      const label = tier === 'basic' ? 'Basic' : 'Premium';
+      return `Deine Kündigung wurde registriert. Dein ${label}-Zugang bleibt bis zum <strong>${endDate}</strong> aktiv — dann wird dein Account automatisch auf den Free-Plan umgestellt.`;
+    },
     cancelConfirmedNote: 'Bis dahin kannst du PEAK in vollem Umfang nutzen. Deine Daten, Pläne und Fortschritte bleiben erhalten.',
     cancelConfirmedReactivateBox: '<strong>Wieder aktivieren?</strong> Kein Problem — öffne einfach PEAK und wähle einen Plan. Dein Profil ist gespeichert.',
     cancelConfirmedCTA: 'PEAK öffnen',
-    cancelReminderSubject: (days) => days === 3 ? 'Dein Premium endet in 3 Tagen' : 'Dein Premium endet bald',
-    cancelReminderLabel: (days) => `Noch ${days} Tage Premium`,
+    cancelReminderSubject: (days, tier) => {
+      const label = tier === 'basic' ? 'Basic' : 'Premium';
+      return days === 3 ? `Dein ${label} endet in 3 Tagen` : `Dein ${label} endet bald`;
+    },
+    cancelReminderLabel: (days, tier) => {
+      const label = tier === 'basic' ? 'Basic' : 'Premium';
+      return `Noch ${days} Tage ${label}`;
+    },
     cancelReminderH1a: 'Nutze deine',
     cancelReminderH1b: 'letzten Tage.',
-    cancelReminderBody: (endDate) => `Am <strong>${endDate}</strong> endet dein Premium-Zugang. Bis dahin: volle Power — Pläne anpassen, Workouts tracken, Rezepte checken.`,
+    cancelReminderBody: (endDate, tier) => {
+      const label = tier === 'basic' ? 'Basic' : 'Premium';
+      return `Am <strong>${endDate}</strong> endet dein ${label}-Zugang. Bis dahin: volle Power — Pläne anpassen, Workouts tracken, Rezepte checken.`;
+    },
     cancelReminderBox: '💡 <strong>Noch nicht sicher?</strong> Du kannst jederzeit zurückkehren — dein Profil und deine Fortschritte bleiben 30 Tage erhalten.',
     cancelReminderCTA: 'Jetzt PEAK nutzen',
-    cancelFinalSubject: 'Dein PEAK Premium ist beendet',
-    cancelFinalLabel: 'Premium beendet',
-    cancelFinalH1a: 'Premium',
+    cancelFinalSubject: (tier) => {
+      const label = tier === 'basic' ? 'Basic' : 'Premium';
+      return `Dein PEAK ${label} ist beendet`;
+    },
+    cancelFinalLabel: (tier) => `${tier === 'basic' ? 'Basic' : 'Premium'} beendet`,
+    cancelFinalH1a: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
     cancelFinalH1b: 'ist beendet.',
-    cancelFinalBody: 'Dein Premium-Abo ist heute ausgelaufen. Dein Profil bleibt gespeichert — du kannst jederzeit upgraden und genau dort weitermachen, wo du aufgehört hast.',
-    cancelFinalReactivate: 'Premium vermissen? Hol es dir mit einem Klick zurück.',
-    cancelFinalCTA: 'Premium zurückholen',
+    cancelFinalBody: (tier) => {
+      const label = tier === 'basic' ? 'Basic' : 'Premium';
+      return `Dein ${label}-Abo ist heute ausgelaufen. Dein Profil bleibt gespeichert — du kannst jederzeit upgraden und genau dort weitermachen, wo du aufgehört hast.`;
+    },
+    cancelFinalReactivate: 'Plan vermissen? Hol ihn dir mit einem Klick zurück.',
+    cancelFinalCTA: 'Plan zurückholen',
     accountDeletedSubject: 'Dein PEAK-Konto wurde gelöscht',
     accountDeletedLabel: 'Konto gelöscht',
     accountDeletedH1a: 'Dein Konto',
@@ -3715,11 +3766,16 @@ async function sendEmail(to, type, data) {
     paymentFailedBox: '<strong>Was du tun kannst:</strong> Öffne PEAK, gehe zu Einstellungen → Abonnement → Zahlungsmethode und hinterlege eine aktuelle Karte. Sobald die Zahlung durchgeht, läuft dein Abo nahtlos weiter.',
     paymentFailedCTA: 'Karte aktualisieren',
     // ── TRIAL ENDING (DE) — fired by Stripe 3 days before trial_end ──
+    // Body uses actual trial length from Stripe sub, not a hardcoded "7"
+    // — vouchers (LAUNCH4W = 28d) make any fixed number wrong.
     trialEndingSubject: 'Deine Testphase endet in 3 Tagen',
     trialEndingLabel: 'Noch 3 Tage gratis',
     trialEndingH1a: 'In 3 Tagen',
     trialEndingH1b: 'startet dein Abo.',
-    trialEndingBody: (name, dateStr) => (name ? name + ', d' : 'D') + 'eine 7-tägige Testphase endet ' + (dateStr ? 'am <strong>' + dateStr + '</strong>' : 'in 3 Tagen') + '. Danach startet dein PEAK-Abo automatisch — du musst nichts tun, um weiterzumachen.',
+    trialEndingBody: (name, dateStr, trialDays) => {
+      const dur = trialDays && trialDays > 0 ? `${trialDays}-tägige` : '';
+      return (name ? name + ', d' : 'D') + 'eine ' + dur + ' Testphase endet ' + (dateStr ? 'am <strong>' + dateStr + '</strong>' : 'in 3 Tagen') + '. Danach startet dein PEAK-Abo automatisch — du musst nichts tun, um weiterzumachen.';
+    },
     trialEndingBox: '<strong>Möchtest du nicht weitermachen?</strong> Öffne PEAK → Einstellungen → Abonnement → Testphase beenden. 10 Sekunden, kein Telefonat.',
     trialEndingCTA: 'PEAK öffnen',
   } : {
@@ -3733,7 +3789,9 @@ async function sendEmail(to, type, data) {
         return 'You\'re already logged in — this email is your backup. Save it if you ever want to open PEAK on another device (phone, tablet). Just tap the button below and you\'ll land straight in your plan, no password.';
       }
       const days = trialDays && trialDays > 0 ? trialDays : 7;
-      let intro = `Your ${days}-day trial is running — no charge until Day ${days + 1}. `;
+      // Same auto-login framing as Free, just compact for paid tiers.
+      let intro = `You're already logged in — the button below is your backup link for other devices (phone, tablet). `;
+      intro += `Your ${days}-day trial is running — no charge until Day ${days + 1}. `;
       if (sport && goal) intro += `Your custom ${sport} plan is tuned to "${goal}".`;
       else if (sport) intro += `Your custom ${sport} programme is ready.`;
       else if (goal) intro += `Built around your goal: "${goal}".`;
@@ -3760,17 +3818,16 @@ async function sendEmail(to, type, data) {
     step3Free: 'Log a meal to track progress',
     step3Paid: 'Read your recovery protocol',
     boxFree: '<strong>Free plan.</strong> No card, no charge. Basic unlocks the full plan including recovery & tools. Premium adds 12-week progression, mobility, AI adaptation and more.',
-    boxPaid: (trialDays) => `<strong>${trialDays && trialDays > 0 ? trialDays : 7} days free.</strong> No charge until Day ${(trialDays && trialDays > 0 ? trialDays : 7) + 1}. Reminders 2 days and 1 day before end.`,
-    ctaOpen: 'Open my plan',
-    day5Subject: 'Two days left on your PEAK trial',
-    day5Label: '48 hours left',
-    day5H1: (n) => (n ? n + ',<br>' : '') + 'your trial<br>ends soon.',
-    day5Body: (sport, goal) => {
-      const what = sport ? `your ${sport} training, nutrition plan and recovery protocol` : 'your nutrition plan, training and recovery protocol';
-      return `Two days remain on your free 7-day trial. ${what} will pause unless you continue${goal ? '. You\'re on the way to: "' + goal + '".' : '.'}`;
+    boxPaid: (trialDays, voucherCode) => {
+      const days = trialDays && trialDays > 0 ? trialDays : 7;
+      let txt = `<strong>${days} days free.</strong> No charge until Day ${days + 1}.`;
+      if (voucherCode && days > 7) {
+        txt += ` Your code <strong>${voucherCode}</strong> added ${days - 7} bonus days.`;
+      }
+      txt += ' Reminder 1 day before end.';
+      return txt;
     },
-    day5CTA: 'Continue my journey',
-    day5Cancel: 'To cancel: open PEAK → Settings → Subscription → Cancel. 10 seconds, no phone calls.',
+    ctaOpen: 'Open my plan',
     day6Subject: 'Final day — your PEAK trial ends tomorrow',
     day6Label: 'Final 24 hours',
     day6H1: (n) => (n ? n + ',<br>' : '') + 'tomorrow<br>it begins.',
@@ -3778,28 +3835,44 @@ async function sendEmail(to, type, data) {
     day6Box: '<strong>To cancel:</strong> Open PEAK → Settings → Subscription → Cancel trial. Done in 10 seconds.',
     day6CTA: 'Keep my plan',
     // ── CANCELLATION EMAILS (EN) ──
+    cancelTierLabel: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
     cancelConfirmedSubject: 'Your PEAK cancellation is confirmed',
     cancelConfirmedLabel: 'Cancellation confirmed',
     cancelConfirmedH1a: 'Sorry to',
     cancelConfirmedH1b: 'see you go.',
-    cancelConfirmedBody: (endDate) => `Your cancellation has been processed. Your Premium access remains active until <strong>${endDate}</strong> — then your account switches to the Free plan automatically.`,
+    cancelConfirmedBody: (endDate, tier) => {
+      const label = tier === 'basic' ? 'Basic' : 'Premium';
+      return `Your cancellation has been processed. Your ${label} access remains active until <strong>${endDate}</strong> — then your account switches to the Free plan automatically.`;
+    },
     cancelConfirmedNote: 'Until then, use PEAK to the fullest. Your data, plans and progress are safe.',
     cancelConfirmedReactivateBox: '<strong>Changed your mind?</strong> No problem — open PEAK and pick a plan. Your profile is saved.',
     cancelConfirmedCTA: 'Open PEAK',
-    cancelReminderSubject: (days) => days === 3 ? 'Your Premium ends in 3 days' : 'Your Premium ends soon',
-    cancelReminderLabel: (days) => `${days} days of Premium left`,
+    cancelReminderSubject: (days, tier) => {
+      const label = tier === 'basic' ? 'Basic' : 'Premium';
+      return days === 3 ? `Your ${label} ends in 3 days` : `Your ${label} ends soon`;
+    },
+    cancelReminderLabel: (days, tier) => {
+      const label = tier === 'basic' ? 'Basic' : 'Premium';
+      return `${days} days of ${label} left`;
+    },
     cancelReminderH1a: 'Use your',
     cancelReminderH1b: 'final days.',
-    cancelReminderBody: (endDate) => `Your Premium access ends on <strong>${endDate}</strong>. Until then: full power — tune plans, track workouts, check recipes.`,
+    cancelReminderBody: (endDate, tier) => {
+      const label = tier === 'basic' ? 'Basic' : 'Premium';
+      return `Your ${label} access ends on <strong>${endDate}</strong>. Until then: full power — tune plans, track workouts, check recipes.`;
+    },
     cancelReminderBox: '💡 <strong>Still deciding?</strong> You can come back anytime — your profile and progress are kept for 30 days.',
     cancelReminderCTA: 'Use PEAK now',
-    cancelFinalSubject: 'Your PEAK Premium has ended',
-    cancelFinalLabel: 'Premium ended',
-    cancelFinalH1a: 'Premium',
+    cancelFinalSubject: (tier) => `Your PEAK ${tier === 'basic' ? 'Basic' : 'Premium'} has ended`,
+    cancelFinalLabel: (tier) => `${tier === 'basic' ? 'Basic' : 'Premium'} ended`,
+    cancelFinalH1a: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
     cancelFinalH1b: 'has ended.',
-    cancelFinalBody: 'Your Premium subscription ended today. Your profile stays saved — you can upgrade any time and pick up exactly where you left off.',
-    cancelFinalReactivate: 'Missing Premium? Bring it back with one click.',
-    cancelFinalCTA: 'Bring back Premium',
+    cancelFinalBody: (tier) => {
+      const label = tier === 'basic' ? 'Basic' : 'Premium';
+      return `Your ${label} subscription ended today. Your profile stays saved — you can upgrade any time and pick up exactly where you left off.`;
+    },
+    cancelFinalReactivate: 'Missing your plan? Bring it back with one click.',
+    cancelFinalCTA: 'Bring back my plan',
     accountDeletedSubject: 'Your PEAK account has been deleted',
     accountDeletedLabel: 'Account deleted',
     accountDeletedH1a: 'Your account',
@@ -3820,7 +3893,10 @@ async function sendEmail(to, type, data) {
     trialEndingLabel: '3 days of trial left',
     trialEndingH1a: 'In 3 days',
     trialEndingH1b: 'your plan starts.',
-    trialEndingBody: (name, dateStr) => (name ? name + ', y' : 'Y') + 'our 7-day trial ends ' + (dateStr ? 'on <strong>' + dateStr + '</strong>' : 'in 3 days') + '. After that, your PEAK subscription starts automatically — you don\'t need to do anything to continue.',
+    trialEndingBody: (name, dateStr, trialDays) => {
+      const dur = trialDays && trialDays > 0 ? `${trialDays}-day` : '';
+      return (name ? name + ', y' : 'Y') + 'our ' + dur + ' trial ends ' + (dateStr ? 'on <strong>' + dateStr + '</strong>' : 'in 3 days') + '. After that, your PEAK subscription starts automatically — you don\'t need to do anything to continue.';
+    },
     trialEndingBox: '<strong>Don\'t want to continue?</strong> Open PEAK → Settings → Subscription → End trial. Ten seconds, no phone call.',
     trialEndingCTA: 'Open PEAK',
   };
@@ -3918,7 +3994,7 @@ async function sendEmail(to, type, data) {
         <tr><td class="email-pad" style="padding:8px 40px 36px;">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};">
             <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
-              ${isFree ? L.boxFree : L.boxPaid(trialDays)}
+              ${isFree ? L.boxFree : L.boxPaid(trialDays, data?.voucherCode || '')}
             </td></tr>
           </table>
         </td></tr>
@@ -3930,34 +4006,6 @@ async function sendEmail(to, type, data) {
         <tr><td>${emailFooter(to)}</td></tr>
       `;
       })())
-    },
-
-    day5: {
-      subject: L.day5Subject,
-      html: emailShell(RESPONSIVE_CSS + `
-        <tr><td>${emailHeader()}</td></tr>
-        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
-          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.day5Label}</p>
-          <h1 class="email-h1" style="margin:0 0 20px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
-            ${L.day5H1(name)}
-          </h1>
-          <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
-            ${L.day5Body(sport, goal)}
-          </p>
-        </td></tr>
-
-        <tr><td class="email-cta" align="center" style="padding:0 40px 24px;">
-          ${emailButton(FRONTEND_URL, L.day5CTA)}
-        </td></tr>
-
-        <tr><td class="email-pad" style="padding:0 40px 48px;">
-          <p style="margin:0;font-family:${FONT_BODY};font-size:12px;line-height:1.6;color:${BRAND.faint};text-align:center;">
-            ${L.day5Cancel}
-          </p>
-        </td></tr>
-
-        <tr><td>${emailFooter(to)}</td></tr>
-      `)
     },
 
     day6: {
@@ -3999,7 +4047,7 @@ async function sendEmail(to, type, data) {
             ${L.cancelConfirmedH1a}<br>${L.cancelConfirmedH1b}
           </h1>
           <p style="margin:0 0 24px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
-            ${L.cancelConfirmedBody(data?.endDate || '')}
+            ${L.cancelConfirmedBody(data?.endDate || '', data?.tier || 'premium')}
           </p>
           <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:14px;line-height:1.65;color:${BRAND.ink2};">
             ${L.cancelConfirmedNote}
@@ -4022,16 +4070,16 @@ async function sendEmail(to, type, data) {
 
     // ── CANCELLATION EMAIL B: Reminder (3 days before end) ──
     cancellation_reminder: {
-      subject: L.cancelReminderSubject(data?.daysLeft || 3),
+      subject: L.cancelReminderSubject(data?.daysLeft || 3, data?.tier || 'premium'),
       html: emailShell(RESPONSIVE_CSS + `
         <tr><td>${emailHeader()}</td></tr>
         <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
-          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.cancelReminderLabel(data?.daysLeft || 3)}</p>
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.cancelReminderLabel(data?.daysLeft || 3, data?.tier || 'premium')}</p>
           <h1 class="email-h1" style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
             ${L.cancelReminderH1a}<br>${L.cancelReminderH1b}
           </h1>
           <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
-            ${L.cancelReminderBody(data?.endDate || '')}
+            ${L.cancelReminderBody(data?.endDate || '', data?.tier || 'premium')}
           </p>
 
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};margin-bottom:32px;">
@@ -4051,16 +4099,16 @@ async function sendEmail(to, type, data) {
 
     // ── CANCELLATION EMAIL C: Final (when subscription actually ends) ──
     cancellation_final: {
-      subject: L.cancelFinalSubject,
+      subject: L.cancelFinalSubject(data?.tier || 'premium'),
       html: emailShell(RESPONSIVE_CSS + `
         <tr><td>${emailHeader()}</td></tr>
         <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
-          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.cancelFinalLabel}</p>
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.cancelFinalLabel(data?.tier || 'premium')}</p>
           <h1 class="email-h1" style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
-            ${L.cancelFinalH1a}<br>${L.cancelFinalH1b}
+            ${L.cancelFinalH1a(data?.tier || 'premium')}<br>${L.cancelFinalH1b}
           </h1>
           <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
-            ${L.cancelFinalBody}
+            ${L.cancelFinalBody(data?.tier || 'premium')}
           </p>
         </td></tr>
 
@@ -4143,7 +4191,7 @@ async function sendEmail(to, type, data) {
             ${L.trialEndingH1a}<br>${L.trialEndingH1b}
           </h1>
           <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
-            ${L.trialEndingBody(name, data?.trialEnd ? data.trialEnd.toLocaleDateString(de ? 'de-DE' : 'en-GB', { day: '2-digit', month: 'long', year: 'numeric' }) : '')}
+            ${L.trialEndingBody(name, data?.trialEnd ? data.trialEnd.toLocaleDateString(de ? 'de-DE' : 'en-GB', { day: '2-digit', month: 'long', year: 'numeric' }) : '', data?.trialDays)}
           </p>
 
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};margin-bottom:32px;">
@@ -4180,6 +4228,12 @@ cron.schedule('0 10 * * *', async () => {
   const now = new Date();
 
   // ── 1. TRIAL REMINDERS ──
+  // Stripe fires `customer.subscription.trial_will_end` 3 days before
+  // trial_end → we send `trial_ending` from the webhook handler. To avoid
+  // mailbox spam (3 mails in 3 days), we only add ONE additional cron-
+  // driven reminder: day6 = "1 day left, plan starts tomorrow". This works
+  // for any trial length (default 7d, voucher 28d, etc.) since it's based
+  // on daysLeft, not absolute trial_start.
   try {
     const { data: trialUsers } = await supabase
       .from('users')
@@ -4190,8 +4244,7 @@ cron.schedule('0 10 * * *', async () => {
       if (!user.trial_end) continue;
       const userLang = (user.lang === 'de' || user.lang === 'en') ? user.lang : 'de';
       const daysLeft = Math.ceil((new Date(user.trial_end) - now) / (1000 * 60 * 60 * 24));
-      if (daysLeft === 2) await sendEmail(user.email, 'day5', { name: user.name, lang: userLang });
-      else if (daysLeft === 1) await sendEmail(user.email, 'day6', { name: user.name, lang: userLang });
+      if (daysLeft === 1) await sendEmail(user.email, 'day6', { name: user.name, lang: userLang });
     }
   } catch (err) {
     console.error('❌ Trial reminder cron error:', err.message);
@@ -4224,6 +4277,7 @@ cron.schedule('0 10 * * *', async () => {
             daysLeft: daysLeft,
             endDate: endDateStr,
             lang: userLang,
+            tier: user.tier || 'premium',
           });
           // Mark as sent so we don't repeat
           await supabase.from('users').update({
