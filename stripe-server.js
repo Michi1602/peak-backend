@@ -4294,6 +4294,33 @@ cron.schedule('0 10 * * *', async () => {
   }
 });
 
+// ── SHARED CONTENT CLEANUP ────────────────────────────────────────
+// Sharing-Feature (recipe/workout/stretch share links) stores entries
+// in the `shared_content` table with an `expires_at` column. Without
+// periodic cleanup, expired rows accumulate forever — minor cost
+// concern for now, but easy to address with a weekly sweep.
+//
+// Runs every Monday at 03:00 UTC (low-traffic window). Deletes rows
+// where expires_at is in the past. Last-write-wins is fine here: we
+// never undelete shares, so a stale row that gets sweeped seconds
+// after expiry is correct behaviour.
+cron.schedule('0 3 * * 1', async () => {
+  try {
+    const cutoff = new Date().toISOString();
+    const { data, error, count } = await supabase
+      .from('shared_content')
+      .delete({ count: 'exact' })
+      .lt('expires_at', cutoff);
+    if (error) {
+      console.error('❌ shared_content cleanup error:', error.message);
+      return;
+    }
+    console.log(`🧹 shared_content cleanup: removed ${count || 0} expired rows`);
+  } catch (err) {
+    console.error('❌ shared_content cleanup crashed:', err.message);
+  }
+});
+
 // ── PROCESS-LEVEL ERROR HANDLERS (prevent silent crashes) ────────────
 // Render restarts the process on crash, but in-flight requests get 502s.
 // These handlers log + keep the process alive when an async failure
