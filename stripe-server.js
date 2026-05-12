@@ -770,13 +770,31 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
       return res.status(500).json({ error: upsertErr.message });
     }
 
-    // Generate magic link + send welcome
-    const { data: linkData } = await supabase.auth.admin.generateLink({
+    // Generate TWO magic links:
+    //   1. magicLinkAuto — returned to the client, consumed immediately by
+    //      window.location.href = magicLinkAuto in the onboarding flow.
+    //      One-time use, dies on first click.
+    //   2. magicLinkEmail — embedded in the welcome email button. Must stay
+    //      valid because users frequently open PEAK on a second device
+    //      (phone after onboarding on laptop, or vice versa). If we used
+    //      the same link for both, the auto-login would already have
+    //      consumed it by the time the email arrives — user clicks the
+    //      mail button → Supabase rejects with "link expired" → user is
+    //      bounced to the login screen and has to do OTP. This was the
+    //      Free-signup double-login bug reported May 12.
+    const { data: linkAutoData } = await supabase.auth.admin.generateLink({
       type: 'magiclink',
       email: normalizedEmail,
       options: { redirectTo: `${FRONTEND_URL}/` },
     });
-    const magicLink = linkData?.properties?.action_link || null;
+    const magicLinkAuto = linkAutoData?.properties?.action_link || null;
+
+    const { data: linkEmailData } = await supabase.auth.admin.generateLink({
+      type: 'magiclink',
+      email: normalizedEmail,
+      options: { redirectTo: `${FRONTEND_URL}/` },
+    });
+    const magicLinkEmail = linkEmailData?.properties?.action_link || null;
 
     try {
       await sendEmail(normalizedEmail, 'welcome', {
@@ -784,7 +802,7 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
         goal: userData?.goal || '',
         goals: Array.isArray(userData?.goals) ? userData.goals : [],
         sport: userData?.sport || '',
-        magicLink,
+        magicLink: magicLinkEmail,
         isFree: true,
         tier: 'free',
         lang: lang === 'de' ? 'de' : (lang === 'en' ? 'en' : undefined),
@@ -794,11 +812,9 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
     }
 
     console.log(`✅ Free signup complete: ${normalizedEmail} (${authUserId})`);
-    // Send magicLink back to the frontend too — that way the client can
-    // exchange it for a session immediately and the user lands logged in
-    // straight from the onboarding flow, without having to open the
-    // welcome email. The email is purely a backup for cross-device cases.
-    res.json({ success: true, userId: authUserId, magicLink });
+    // Return the auto-login link to the client. The email link is the
+    // backup and stays valid independently.
+    res.json({ success: true, userId: authUserId, magicLink: magicLinkAuto });
   } catch (err) {
     console.error('❌ signup-free error:', err.message);
     res.status(500).json({ error: err.message });
