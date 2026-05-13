@@ -893,6 +893,153 @@ app.post('/customer-portal', authLimiter, async (req, res) => {
   }
 });
 
+// ── SHARING ENDPOINTS ─────────────────────────────────────────────────
+// Users on Basic+ can share individual recipes, workouts and stretch
+// routines via a short link. Flow:
+//   1. Frontend POSTs to /share with {type, payload}
+//   2. Backend generates a short ID, stores payload + expiry in
+//      `shared_content` table, returns {url}
+//   3. Recipient opens FRONTEND_URL/?share=ID
+//   4. Frontend reads the ?share= param, calls /share/:id/data, and
+//      shows the content in a modal
+//
+// Expiry: 30 days. Stored payload is a JSON snapshot (recipes/workouts
+// are user-mutable, we freeze them at share time). Cron job sweeps
+// expired rows weekly (see cleanup_shared_content cron).
+
+// Generates a URL-safe short ID for share links. 8 characters from a
+// 62-char alphabet → 62^8 ≈ 2.18 × 10^14 unique IDs. Collisions are
+// astronomically unlikely at our scale; we don't bother with retry-on-
+// collision because the chance is ~0 even after a billion shares.
+function generateShareId() {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let id = '';
+  for (let i = 0; i < 8; i++) {
+    id += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return id;
+}
+
+// POST /share — create a new share entry
+// Auth: optional. Email is taken from the JWT if present, else from the
+// body. Free-tier users can't share (tier check below); Basic+ can.
+app.post('/share', authLimiter, async (req, res) => {
+  try {
+    const { type, payload, email: bodyEmail, lang } = req.body || {};
+    // Validate type
+    if (!type || !['recipe', 'workout', 'stretch'].includes(type)) {
+      return res.status(400).json({ error: 'invalid type' });
+    }
+    if (!payload || typeof payload !== 'object') {
+      return res.status(400).json({ error: 'payload required' });
+    }
+    // Resolve user (optional auth — if a Bearer token is present, use it
+    // to find the authenticated user; otherwise fall back to body.email).
+    let email = bodyEmail ? String(bodyEmail).toLowerCase().trim() : null;
+    let authedUser = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.slice(7);
+      try {
+        const { data: { user } } = await supabase.auth.getUser(token);
+        if (user) {
+          authedUser = user;
+          email = user.email.toLowerCase().trim();
+        }
+      } catch (_) {}
+    }
+    if (!email) {
+      return res.status(401).json({ error: 'authentication required' });
+    }
+    // Tier-gate: only basic+ can share. Free users get a 402 so the
+    // frontend can show the upgrade prompt.
+    const { data: userRow } = await supabase
+      .from('users')
+      .select('tier, status')
+      .eq('email', email)
+      .maybeSingle();
+    if (!userRow) {
+      return res.status(404).json({ error: 'user not found' });
+    }
+    if (userRow.tier === 'free') {
+      return res.status(402).json({ error: 'sharing requires Basic or Premium' });
+    }
+    // Insert with retry-on-collision (rare but possible)
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
+    let id, insertErr;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      id = generateShareId();
+      const { error } = await supabase.from('shared_content').insert({
+        id,
+        type,
+        payload,
+        creator_email: email,
+        creator_tier: userRow.tier,
+        expires_at: expiresAt.toISOString(),
+      });
+      if (!error) { insertErr = null; break; }
+      // 23505 = unique violation → retry with new ID. Anything else → abort.
+      if (error.code !== '23505') { insertErr = error; break; }
+      insertErr = error;
+    }
+    if (insertErr) {
+      console.error('❌ /share insert failed:', insertErr.message);
+      return res.status(500).json({ error: 'could not create share link' });
+    }
+    const url = `${FRONTEND_URL}/?share=${id}`;
+    console.log(`📤 Share created: ${type} by ${email} → ${id}`);
+    res.json({ success: true, id, url });
+  } catch (err) {
+    console.error('❌ /share error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /share/:id — redirect to the frontend with ?share= param.
+// Useful if someone shares the bare /share/ID URL instead of the
+// /?share=ID frontend URL. We don't render HTML server-side — the
+// frontend handles the share modal once loaded.
+app.get('/share/:id', (req, res) => {
+  const id = req.params.id;
+  if (!/^[A-Za-z0-9]{4,16}$/.test(id)) {
+    return res.status(400).send('invalid share id');
+  }
+  res.redirect(302, `${FRONTEND_URL}/?share=${id}`);
+});
+
+// GET /share/:id/data — return the stored payload as JSON.
+// Public endpoint (no auth needed — anyone with the link can view).
+// Returns 404 if expired or not found.
+app.get('/share/:id/data', async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!/^[A-Za-z0-9]{4,16}$/.test(id)) {
+      return res.status(400).json({ error: 'invalid id' });
+    }
+    const { data, error } = await supabase
+      .from('shared_content')
+      .select('id, type, payload, expires_at')
+      .eq('id', id)
+      .maybeSingle();
+    if (error) {
+      console.error('❌ /share/:id/data error:', error.message);
+      return res.status(500).json({ error: error.message });
+    }
+    if (!data) {
+      return res.status(404).json({ error: 'not found' });
+    }
+    // Expired? Treat as 404 so the frontend renders the "expired" state
+    // the same way as missing rows. Cron will sweep these eventually.
+    if (data.expires_at && new Date(data.expires_at) < new Date()) {
+      return res.status(404).json({ error: 'expired' });
+    }
+    res.json({ type: data.type, payload: data.payload });
+  } catch (err) {
+    console.error('❌ /share/:id/data error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── AI PROXY ──────────────────────────────────────────────────────────
 // Frontend can't call Anthropic directly (CORS + API key must stay server-side).
 // This endpoint proxies requests. Max tokens clamped 100-2000 to prevent abuse.
