@@ -2380,6 +2380,31 @@ app.delete('/user/account', async (req, res) => {
       console.warn(`   ⚠ login_codes delete failed: ${err.message}`);
     }
 
+    // 4.5 Leave family group cleanly. The ON DELETE CASCADE on family_memberships
+    // would handle row removal automatically when we delete the users row below,
+    // but doing it explicitly here means: (a) the cleanup_empty_family_group
+    // trigger fires before user-row removal so the foreign-key references are
+    // all still valid, (b) regenerateFutureMealsAfterMemberChange can run for
+    // the remaining members, (c) we log it for audit purposes.
+    try {
+      const { data: activeMembership } = await supabase
+        .from('family_memberships')
+        .select('id, group_id')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .maybeSingle();
+      if (activeMembership) {
+        await supabase.from('family_memberships')
+          .update({ status: 'left', left_at: new Date().toISOString() })
+          .eq('id', activeMembership.id);
+        console.log(`   ✓ Family membership ended (group ${activeMembership.group_id})`);
+        // Best-effort: clean stale future meals for the remaining members
+        await regenerateFutureMealsAfterMemberChange(activeMembership.group_id).catch(() => {});
+      }
+    } catch (err) {
+      console.warn(`   ⚠ Family leave during deletion failed (continuing): ${err.message}`);
+    }
+
     // 5. Delete public.users row
     try {
       const { error: delProfileErr } = await supabase
@@ -3501,6 +3526,37 @@ app.post('/webhook', async (req, res) => {
         } else if (isAccountDeletion || !userStillExists) {
           console.log(`ℹ️  Skipping cancellation_final for ${email}: account deletion in progress`);
         }
+        // ── Family Plan: suspend any active membership ─────────────────
+        // Premium-only feature, so losing tier must remove the user from
+        // their family group. We use 'suspended' (not 'left') so the row
+        // is recoverable if they re-subscribe within a grace window — the
+        // family tab can show "Anna lost Premium" and offer re-invite.
+        // Trigger drops the empty group automatically if this was the last
+        // active member; otherwise regenerateFutureMealsAfterMemberChange
+        // clears stale meals so they get rebuilt without the suspended user.
+        if (userStillExists && updated[0]?.id) {
+          try {
+            const { data: activeMembership } = await supabase
+              .from('family_memberships')
+              .select('id, group_id')
+              .eq('user_id', updated[0].id)
+              .eq('status', 'active')
+              .maybeSingle();
+            if (activeMembership) {
+              await supabase.from('family_memberships')
+                .update({ status: 'suspended', left_at: new Date().toISOString() })
+                .eq('id', activeMembership.id);
+              await supabase.from('users')
+                .update({ family_group_id: null })
+                .eq('id', updated[0].id);
+              // Best-effort: clear stale meals so they regenerate without this user
+              setImmediate(() => regenerateFutureMealsAfterMemberChange(activeMembership.group_id).catch(() => {}));
+              console.log(`👨‍👩‍👧 Family membership suspended for ${email} (group ${activeMembership.group_id})`);
+            }
+          } catch (err) {
+            console.error('⚠️  Family membership suspend failed:', err.message);
+          }
+        }
       }
     } else if (event.type === 'customer.subscription.updated') {
       // Detect when user initiates cancellation at period end
@@ -3553,6 +3609,10 @@ app.post('/webhook', async (req, res) => {
           // Pull trial_end from the live Stripe sub so the DB stays in sync
           // even when the Customer Portal cleared/extended trial.
           const trialEndIso = sub.trial_end ? new Date(sub.trial_end * 1000).toISOString() : null;
+          // Capture prior tier so we can detect Premium→Basic downgrade
+          const { data: priorRow } = await supabase
+            .from('users').select('id, tier').eq('email', email).maybeSingle();
+          const priorTier = priorRow?.tier || null;
           const updates = {
             tier: newTier,
             plan: newPlan,
@@ -3562,6 +3622,33 @@ app.post('/webhook', async (req, res) => {
           const { error } = await supabase.from('users').update(updates).eq('email', email);
           if (error) console.error('❌ Plan-change DB update failed:', error.message);
           else console.log(`🔄 Plan changed: ${email} → ${newTier}/${newPlan} (trial_end=${trialEndIso || 'unchanged'})`);
+          // ── Family Plan: suspend membership if dropping below Premium ──
+          // Family Plan is Premium-only. If the user just moved from
+          // Premium to Basic (or anything else), pull them out of the
+          // group. Same 'suspended' status as on full cancellation so a
+          // future re-upgrade can re-activate them with one click.
+          if (priorTier === 'premium' && newTier !== 'premium' && priorRow?.id) {
+            try {
+              const { data: activeMembership } = await supabase
+                .from('family_memberships')
+                .select('id, group_id')
+                .eq('user_id', priorRow.id)
+                .eq('status', 'active')
+                .maybeSingle();
+              if (activeMembership) {
+                await supabase.from('family_memberships')
+                  .update({ status: 'suspended', left_at: new Date().toISOString() })
+                  .eq('id', activeMembership.id);
+                await supabase.from('users')
+                  .update({ family_group_id: null })
+                  .eq('id', priorRow.id);
+                setImmediate(() => regenerateFutureMealsAfterMemberChange(activeMembership.group_id).catch(() => {}));
+                console.log(`👨‍👩‍👧 Family membership suspended (downgrade): ${email}`);
+              }
+            } catch (err) {
+              console.error('⚠️  Family suspend on downgrade failed:', err.message);
+            }
+          }
         }
       }
 
