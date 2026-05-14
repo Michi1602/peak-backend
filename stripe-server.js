@@ -2706,6 +2706,143 @@ app.post('/user/meal-pool', async (req, res) => {
   }
 });
 
+// ── LITE-SYNC ENDPOINT (May 2026) ──────────────────────────────────────
+// Single endpoint that persists the small per-user cross-device state
+// pieces that don't need their own dedicated endpoint: meal ratings,
+// workout ratings, food log, and weekly shopping check-offs.
+//
+// All four are Basic+ only (same tier policy as meal-pool/meal-track).
+// Each field is independently optional in the payload — clients send
+// whatever they want to update. Backend stores them as JSONB columns.
+//
+// Size guards: ratings are small (<200 entries), food log is bounded to
+// 200 entries, weekly-shop-checks bounded to 500 keys. Anything bigger
+// is rejected — we don't store unbounded user payloads.
+app.post('/user/lite-sync', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    // Tier gate
+    const { data: u } = await supabase
+      .from('users').select('tier, status').eq('id', userData.user.id).maybeSingle();
+    if (u?.status === 'blocked_voucher_abuse') {
+      return res.status(403).json({ error: 'account_blocked', code: 'ACCOUNT_BLOCKED' });
+    }
+    if (!u || u.tier === 'free') {
+      return res.status(403).json({ error: 'basic_required', code: 'BASIC_REQUIRED' });
+    }
+
+    const { meal_ratings, workout_ratings, food_log, weekly_shop_checks } = req.body || {};
+    const updates = { updated_at: new Date().toISOString() };
+
+    // Validate + sanitise each field independently. Anything malformed is
+    // rejected wholesale — we don't half-save a payload because that would
+    // make state hard to reason about on the next client read.
+    if (meal_ratings !== undefined) {
+      if (!meal_ratings || typeof meal_ratings !== 'object' || Array.isArray(meal_ratings)) {
+        return res.status(400).json({ error: 'meal_ratings must be an object' });
+      }
+      const keys = Object.keys(meal_ratings);
+      if (keys.length > 200) {
+        return res.status(400).json({ error: 'meal_ratings too large' });
+      }
+      const cleaned = {};
+      for (const k of keys) {
+        const v = meal_ratings[k];
+        // Keys are small integers (meal idx), values are 1-5 ratings
+        if (/^\d{1,3}$/.test(k) && typeof v === 'number' && v >= 1 && v <= 5) {
+          cleaned[k] = v;
+        }
+      }
+      updates.meal_ratings = cleaned;
+    }
+
+    if (workout_ratings !== undefined) {
+      if (!workout_ratings || typeof workout_ratings !== 'object' || Array.isArray(workout_ratings)) {
+        return res.status(400).json({ error: 'workout_ratings must be an object' });
+      }
+      const keys = Object.keys(workout_ratings);
+      if (keys.length > 200) {
+        return res.status(400).json({ error: 'workout_ratings too large' });
+      }
+      const cleaned = {};
+      for (const k of keys) {
+        const v = workout_ratings[k];
+        // Keys can be week-day strings ("w1d2") or numeric — string check is broader
+        if (typeof k === 'string' && k.length <= 24 && typeof v === 'number' && v >= 1 && v <= 5) {
+          cleaned[k] = v;
+        }
+      }
+      updates.workout_ratings = cleaned;
+    }
+
+    if (food_log !== undefined) {
+      if (!Array.isArray(food_log)) {
+        return res.status(400).json({ error: 'food_log must be an array' });
+      }
+      if (food_log.length > 200) {
+        return res.status(400).json({ error: 'food_log too large' });
+      }
+      // Each entry: {text, emoji, kcal, time}. Shallow-validate types.
+      const cleaned = [];
+      for (const entry of food_log) {
+        if (!entry || typeof entry !== 'object') continue;
+        const text = typeof entry.text === 'string' ? entry.text.slice(0, 200) : '';
+        const emoji = typeof entry.emoji === 'string' ? entry.emoji.slice(0, 8) : '';
+        const kcal = Number.isFinite(entry.kcal) ? Math.round(entry.kcal) : 0;
+        const time = typeof entry.time === 'string' ? entry.time.slice(0, 16) : '';
+        if (text) cleaned.push({ text, emoji, kcal, time });
+      }
+      updates.food_log = cleaned;
+    }
+
+    if (weekly_shop_checks !== undefined) {
+      if (!weekly_shop_checks || typeof weekly_shop_checks !== 'object' || Array.isArray(weekly_shop_checks)) {
+        return res.status(400).json({ error: 'weekly_shop_checks must be an object' });
+      }
+      const keys = Object.keys(weekly_shop_checks);
+      if (keys.length > 500) {
+        return res.status(400).json({ error: 'weekly_shop_checks too large' });
+      }
+      const cleaned = {};
+      for (const k of keys) {
+        // Keys can be long (item|qty composite) — cap at 400 chars
+        if (k.length > 400) continue;
+        const v = weekly_shop_checks[k];
+        // Values are timestamp millis from Date.now() — must be a number
+        if (typeof v === 'number' && v > 0) cleaned[k] = v;
+      }
+      updates.weekly_shop_checks = cleaned;
+    }
+
+    // No fields → no-op (avoid pointless updated_at bump)
+    if (Object.keys(updates).length === 1) {
+      return res.json({ ok: true, noop: true });
+    }
+
+    const { error } = await supabase
+      .from('users')
+      .update(updates)
+      .eq('id', userData.user.id);
+
+    if (error) {
+      console.error('❌ /user/lite-sync failed:', error.message);
+      return res.status(500).json({ error: 'Failed to save state' });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('❌ /user/lite-sync error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── STRETCH POOL ENDPOINT (May 2026, Phase 3) ──────────────────────────
 // Same pattern as /user/meal-pool, but premium-only and with a different
 // pool shape: each slot is an OBJECT (training/rest), not an array.
