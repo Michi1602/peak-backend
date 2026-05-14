@@ -4850,7 +4850,7 @@ function generateInviteToken() {
 // ─── POST /family/create ──────────────────────────────────────────────
 // Create a new group with caller as first member. Caller must be Premium.
 // Optional body: { name, shared_meals_pattern }.
-app.post('/family/create', async (req, res) => {
+app.post('/family/create', aiLimiter, async (req, res) => {
   try {
     const auth = await resolveAuthAndTier(req, { requirePremium: true });
     if (!auth.ok) return res.status(auth.status).json(auth.body);
@@ -4957,7 +4957,7 @@ app.get('/family/group', async (req, res) => {
 // ─── POST /family/invite ──────────────────────────────────────────────
 // Generate a share-able invite token for the caller's active group.
 // Token expires in 7 days. Returns { token, url }.
-app.post('/family/invite', async (req, res) => {
+app.post('/family/invite', aiLimiter, async (req, res) => {
   try {
     const auth = await resolveAuthAndTier(req, { requirePremium: true });
     if (!auth.ok) return res.status(auth.status).json(auth.body);
@@ -5052,6 +5052,22 @@ app.post('/family/accept-invite', async (req, res) => {
         console.error('[family/accept-invite] insert failed:', error.message);
         return res.status(500).json({ error: 'join_failed' });
       }
+    }
+    // Race-condition guard: between the pre-check and the insert, another
+    // user could have raced in and pushed us over the 4-person cap. The
+    // sync_family_member_count trigger has now updated the count — re-read
+    // and roll back if we're over. Without this, 5+ users could theoretically
+    // squeeze into a "full" group during a concurrent invite burst.
+    const { data: gPost } = await supabase
+      .from('family_groups').select('member_count').eq('id', inv.group_id).maybeSingle();
+    if (gPost && gPost.member_count > 4) {
+      // We overshot. Roll back the activation/insert and tell the client.
+      await supabase.from('family_memberships')
+        .update({ status: 'left', left_at: new Date().toISOString() })
+        .eq('group_id', inv.group_id)
+        .eq('user_id', auth.userId)
+        .eq('status', 'active');
+      return res.status(409).json({ error: 'group_full', limit: 4 });
     }
     await supabase.from('users').update({ family_group_id: inv.group_id }).eq('id', auth.userId);
     res.json({ ok: true, group_id: inv.group_id });
@@ -5159,19 +5175,31 @@ app.patch('/family/shared-pattern', async (req, res) => {
 // Generate a shared meal for given date+slot with given participants.
 // Body: { meal_date: 'YYYY-MM-DD', meal_slot, participating_user_ids? }
 // If participating_user_ids omitted, defaults to all active members.
-app.post('/family/generate-meal', async (req, res) => {
+app.post('/family/generate-meal', aiLimiter, async (req, res) => {
   try {
     const auth = await resolveAuthAndTier(req, { requirePremium: true });
     if (!auth.ok) return res.status(auth.status).json(auth.body);
     const groupId = await getActiveFamilyGroupId(auth.userId);
     if (!groupId) return res.status(404).json({ error: 'no_active_group' });
     const { meal_date, meal_slot } = req.body || {};
-    let { participating_user_ids } = req.body || {};
+    let { participating_user_ids, mood_hint } = req.body || {};
     if (!/^\d{4}-\d{2}-\d{2}$/.test(meal_date || '')) {
       return res.status(400).json({ error: 'meal_date_invalid' });
     }
     if (!['breakfast', 'lunch', 'dinner', 'snack'].includes(meal_slot)) {
       return res.status(400).json({ error: 'meal_slot_invalid' });
+    }
+    // mood_hint sanitisation — small free-text from the user that flows
+    // into the AI prompt. Trim, length-cap, and strip any control chars
+    // that could mess with prompt boundaries. We don't try heroic prompt-
+    // injection defence — the user prompt is anyway sandboxed by the
+    // structured JSON contract we demand back.
+    if (mood_hint != null) {
+      if (typeof mood_hint !== 'string') mood_hint = null;
+      else {
+        mood_hint = mood_hint.trim().replace(/[\x00-\x1f]/g, '').slice(0, 120);
+        if (!mood_hint) mood_hint = null;
+      }
     }
     // Load all active members of the group for cooking context
     const members = await loadGroupMembersForCooking(groupId);
@@ -5225,6 +5253,7 @@ app.post('/family/generate-meal', async (req, res) => {
       avoid_allergens: allergiesUnion,
       diet_restrictions: dietsUnion,
       preferred_cuisines: cuisinesIntersection,
+      mood_hint,
       meal_slot,
       lang: req.body.lang || 'de'
     });
@@ -5406,7 +5435,7 @@ function scaleQtyString(qty, share) {
 }
 
 // Recipe generation via Claude. Returns null on failure.
-async function generateFamilyRecipe({ total_kcal, portions, avoid_allergens, diet_restrictions, preferred_cuisines, meal_slot, lang }) {
+async function generateFamilyRecipe({ total_kcal, portions, avoid_allergens, diet_restrictions, preferred_cuisines, mood_hint, meal_slot, lang }) {
   try {
     const de = lang === 'de';
     const slotLabel = {
@@ -5415,29 +5444,54 @@ async function generateFamilyRecipe({ total_kcal, portions, avoid_allergens, die
       dinner: de ? 'Abendessen' : 'Dinner',
       snack: de ? 'Snack' : 'Snack'
     }[meal_slot];
+    // Free-text mood hint from the user. Could be a chip key
+    // ("mediterranean") or freeform ("schnell, low-carb", "thai curry").
+    // We pass it in the prompt as a guidance line; the AI is instructed
+    // to honour it WITHOUT violating allergies/diets/kcal constraints.
+    const moodLine = mood_hint
+      ? `User mood/preference: "${mood_hint}". Honour this preference IF it doesn't conflict with the allergies/diets/kcal constraints above. If it does conflict, find the closest compatible alternative.`
+      : '';
     const prompt = `Generate a single shared family ${slotLabel} recipe for ${portions} people, total ${total_kcal} kcal.
 Response language: ${de ? 'German' : 'English'}.
 ${avoid_allergens.length ? `MUST AVOID allergens: ${avoid_allergens.join(', ')}.` : ''}
 ${diet_restrictions.length ? `Respect diets: ${diet_restrictions.join(', ')}.` : ''}
 ${preferred_cuisines.length ? `Preferred cuisines: ${preferred_cuisines.join(', ')}.` : ''}
+${moodLine}
 The recipe must be ONE dish that scales naturally to ${portions} people — not individual portions of different dishes.
 JSON only, no markdown:
 {"name":"<recipe name>","kcal":${total_kcal},"protein":<g>,"carbs":<g>,"fat":<g>,"prepTime":<min>,"cookTime":<min>,"ingredients":[{"item":"<name>","qty":"<amount with unit>"}],"steps":["<step1>","<step2>","<step3>","<step4>"],"tip":"<chef tip>"}`;
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-5-20250929',
-        max_tokens: 2000,
-        messages: [{ role: 'user', content: prompt }]
-      })
-    });
+    // Use Sonnet 4.6 by default — Opus 4.7 is overkill for a recipe and
+    // ~3× more expensive per request. Sonnet handles structured-JSON
+    // recipes well with the same allergy/diet constraints. Override via
+    // ANTHROPIC_FAMILY_MODEL env if we ever want to A/B test.
+    const modelName = process.env.ANTHROPIC_FAMILY_MODEL || 'claude-sonnet-4-6';
+    // 45-second timeout — Anthropic should answer in ~5-10s for a recipe.
+    // If we hit 45s something is wrong and the user is staring at a
+    // spinner. Bail and let them retry.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 45000);
+    let r;
+    try {
+      r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: modelName,
+          max_tokens: 2000,
+          messages: [{ role: 'user', content: prompt }]
+        }),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
     if (!r.ok) {
-      console.error('[family/recipe] anthropic non-OK:', r.status);
+      const errText = await r.text().catch(() => '');
+      console.error(`[family/recipe] anthropic non-OK ${r.status} (model=${modelName}):`, errText.slice(0, 300));
       return null;
     }
     const data = await r.json();
@@ -5447,7 +5501,12 @@ JSON only, no markdown:
     const recipe = JSON.parse(cleaned);
     return recipe;
   } catch (e) {
-    console.error('[family/recipe] generation failed:', e.message);
+    // AbortError is what fires on timeout — handle separately so log is clearer
+    if (e.name === 'AbortError') {
+      console.error('[family/recipe] timeout after 45s');
+    } else {
+      console.error('[family/recipe] generation failed:', e.message);
+    }
     return null;
   }
 }
