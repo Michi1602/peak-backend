@@ -2739,7 +2739,7 @@ app.post('/user/lite-sync', async (req, res) => {
       return res.status(403).json({ error: 'basic_required', code: 'BASIC_REQUIRED' });
     }
 
-    const { meal_ratings, workout_ratings, food_log, weekly_shop_checks } = req.body || {};
+    const { meal_ratings, workout_ratings, food_log, weekly_shop_checks, meditation_log, mobility_log } = req.body || {};
     const updates = { updated_at: new Date().toISOString() };
 
     // Validate + sanitise each field independently. Anything malformed is
@@ -2820,6 +2820,43 @@ app.post('/user/lite-sync', async (req, res) => {
         if (typeof v === 'number' && v > 0) cleaned[k] = v;
       }
       updates.weekly_shop_checks = cleaned;
+    }
+
+    // ── Habit-streak logs (Bündel 3): meditation + mobility ────────────
+    // Shape: { 'YYYY-MM-DD': [id1, id2, ...] } — array entries are the
+    // exercise/routine IDs completed that day. Same shape for both
+    // categories. Capped at 100 dates (≈ 3 months of daily activity)
+    // and 30 entries per day (no realistic user does 30 sessions/day).
+    function validateDateLog(input, name) {
+      if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        return { error: name + ' must be an object' };
+      }
+      const dateKeys = Object.keys(input);
+      if (dateKeys.length > 100) {
+        return { error: name + ' too large (>100 days)' };
+      }
+      const cleaned = {};
+      for (const dk of dateKeys) {
+        // Keys must be YYYY-MM-DD — anything else rejected silently to
+        // avoid breaking the whole sync over a single malformed key.
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dk)) continue;
+        const arr = input[dk];
+        if (!Array.isArray(arr)) continue;
+        // Trim each day's array: max 30 entries, each ≤ 40 chars
+        const dayArr = arr.slice(0, 30).filter(v => typeof v === 'string' && v.length <= 40);
+        if (dayArr.length > 0) cleaned[dk] = dayArr;
+      }
+      return { value: cleaned };
+    }
+    if (meditation_log !== undefined) {
+      const r = validateDateLog(meditation_log, 'meditation_log');
+      if (r.error) return res.status(400).json({ error: r.error });
+      updates.meditation_log = r.value;
+    }
+    if (mobility_log !== undefined) {
+      const r = validateDateLog(mobility_log, 'mobility_log');
+      if (r.error) return res.status(400).json({ error: r.error });
+      updates.mobility_log = r.value;
     }
 
     // No fields → no-op (avoid pointless updated_at bump)
