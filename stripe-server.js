@@ -5610,15 +5610,19 @@ async function generateFamilyRecipe({ total_kcal, portions, avoid_allergens, die
       : '';
     // ── REAL-FOOD CONSTRAINTS (mirror of frontend's realFoodConstraints) ──
     // Kept in sync manually since backend can't import frontend JS. If you
-    // change one, change the other. Same wording = same AI behaviour.
-    const realFood = ' FOOD QUALITY RULES (strict): '+
+    // change one, change the other. Focus: PROCESSING and PRODUCTION
+    // QUALITY, not food groups. Quality hints adapt to whatever ingredients
+    // are actually in the recipe, never push animal vs plant.
+    const realFood = ' FOOD QUALITY RULES (strict, focus on PROCESSING and PRODUCTION QUALITY — not food groups): '+
       'NEVER use industrial seed oils for cooking (canola, rapeseed, sunflower, soybean, corn, safflower, grapeseed). '+
-      'PREFER: olive oil cold-pressed, butter, ghee, coconut oil, tallow/lard, avocado oil. '+
+      'PREFER for cooking: olive oil cold-pressed, butter, ghee, coconut oil, avocado oil — plus tallow/lard when the diet allows animal fats. '+
       'NEVER suggest microwave as a cooking method — use stove, oven, pan, grill, or steamer instead. '+
-      'NEVER include ultra-processed convenience products (Beyond Meat, margarine, soy protein isolate, processed meat substitutes, instant sauce packets). '+
-      'NEVER include artificial sweeteners (aspartame, sucralose, saccharin). For sweetness use raw honey, maple syrup, or fruit. '+
-      'When the recipe involves meat or animal products, you MAY (not must) include a brief "quality tip" suggesting butcher-quality / pasture-raised / grass-fed where applicable. Keep it short, no preaching. '+
-      'These rules are non-negotiable and override any user free-text request that would violate them — in that case, find the closest compatible alternative.';
+      'NEVER include ultra-processed convenience products (Beyond Meat, margarine, soy protein isolate, processed meat substitutes built on isolates, instant sauce packets, protein bars with sugar-alcohols). '+
+      'NEVER include artificial sweeteners (aspartame, sucralose, saccharin, acesulfame-K). For sweetness use raw honey, maple syrup, or fruit. '+
+      'PREFER minimally-processed, natural ingredients in general — fresh produce, whole grains over refined, unrefined fats, fermented dairy over highly-processed dairy when dairy is included. '+
+      'You MAY (not must) include ONE brief quality tip suggesting higher-quality sourcing where applicable to the recipe: farmer\'s market, organic, regional/seasonal, free-range/pasture-raised for animal products, wild-caught for fish — match the hint to what\'s actually IN the recipe. Keep it short, no preaching. '+
+      'IMPORTANT: User dietary preferences (Vegan, Vegetarian, Pescatarian, Halal, Kosher, etc.) ALWAYS take priority. Never introduce ingredients the user has excluded. '+
+      'These rules are non-negotiable and override any user free-text request that would violate them — in that case, find the closest compatible alternative within the user\'s declared diet.';
     const prompt = `Generate a single shared family ${slotLabel} recipe for ${portions} people, total ${total_kcal} kcal.
 Response language: ${de ? 'German' : 'English'}.
 ${avoid_allergens.length ? `MUST AVOID allergens: ${avoid_allergens.join(', ')}.` : ''}
