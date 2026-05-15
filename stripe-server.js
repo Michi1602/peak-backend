@@ -727,6 +727,7 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
       consent_health_data: true,
       consent_terms: true,
       consent_at: consentAt,
+      analytics_optin: consent && consent.analytics === true,
     };
 
     // Before upsert: check if a profile already exists for this auth id.
@@ -1830,6 +1831,9 @@ app.post('/create-checkout', authLimiter, async (req, res) => {
       consentHealthData: 'true',
       consentTerms: 'true',
       consentAt: consentAt,
+      // Stripe metadata values must be strings — cast bool to '1' / '0'.
+      // Read back in webhook profile-row creation (see meta.consentAnalytics).
+      consentAnalytics: (consent && consent.analytics === true) ? '1' : '0',
     };
 
     // ─── VOUCHER HANDLING ───────────────────────────────────────────────
@@ -2029,6 +2033,149 @@ app.post('/voucher/validate', authLimiter, async (req, res) => {
     res.status(500).json({ valid: false, error: err.message });
   }
 });
+
+// ── APPLY VOUCHER TO EXISTING SUBSCRIPTION ───────────────────────────
+// Use case: a paying user receives a Creator-Code AFTER checkout (e.g.
+// a friend shares a code, or a late-onboarding promo). Without this
+// endpoint they'd have nowhere to enter it.
+//
+// Behaviour by voucher type:
+//   - 'discount' (default): apply Stripe coupon to active subscription
+//     → next invoice gets the discount automatically
+//   - 'trial_extend': REJECTED — trial extension only makes sense at
+//     signup. Returning user already paid, so trial is moot.
+//   - 'trial_full': REJECTED — same reasoning
+//
+// Free users: REJECTED. They go through /create-checkout with the
+// voucher pre-filled instead. We tell the frontend to redirect them.
+//
+// Records the redemption in voucher_redemptions for abuse-tracking
+// (same table as new-signup vouchers, same email-uniqueness rule).
+app.post('/voucher/apply-existing', authLimiter, async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    const authUserId = userData.user.id;
+    const userEmail = (userData.user.email || '').trim().toLowerCase();
+
+    const { code } = req.body || {};
+    if (!code || typeof code !== 'string' || !code.trim()) {
+      return res.status(400).json({ error: 'Code required' });
+    }
+    const normalizedCode = code.trim().toUpperCase();
+
+    // ─── Look up user's current subscription state ───────────────────
+    const { data: u, error: uErr } = await supabase
+      .from('users')
+      .select('tier, status, stripe_subscription_id, stripe_customer_id')
+      .eq('id', authUserId)
+      .maybeSingle();
+    if (uErr || !u) {
+      return res.status(404).json({ error: 'User profile not found' });
+    }
+    if (u.status === 'blocked_voucher_abuse') {
+      return res.status(403).json({ error: 'Account is blocked', code: 'ACCOUNT_BLOCKED' });
+    }
+    // Free users → route them to checkout with voucher pre-filled.
+    // Frontend handles the redirect to the plan-picker step.
+    if (!u.tier || u.tier === 'free') {
+      return res.status(400).json({
+        error: 'Free users must use the voucher at checkout',
+        code: 'CHECKOUT_REQUIRED',
+        redirectToCheckout: true,
+      });
+    }
+    if (!u.stripe_subscription_id) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+
+    // ─── Look up Stripe promotion code ───────────────────────────────
+    const promos = await stripe.promotionCodes.list({ code: normalizedCode, active: true, limit: 1 });
+    if (promos.data.length === 0) {
+      return res.status(404).json({ error: 'Invalid or expired code' });
+    }
+    const promo = promos.data[0];
+    if (promo.max_redemptions && promo.times_redeemed >= promo.max_redemptions) {
+      return res.status(410).json({ error: 'Code has reached its redemption limit' });
+    }
+
+    // ─── Voucher type gating for existing subs ───────────────────────
+    const voucherType = promo.metadata?.type || promo.coupon?.metadata?.type || 'discount';
+    if (voucherType === 'trial_extend' || voucherType === 'trial_full') {
+      return res.status(400).json({
+        error: 'Trial-extension vouchers can only be used at signup',
+        code: 'TRIAL_VOUCHER_NOT_APPLICABLE',
+      });
+    }
+
+    // ─── Abuse check: same email already used this code? ────────────
+    try {
+      const { data: prior } = await supabase
+        .from('voucher_redemptions')
+        .select('id')
+        .eq('voucher_code', normalizedCode)
+        .eq('email', userEmail)
+        .limit(1);
+      if (prior && prior.length > 0) {
+        return res.status(409).json({ error: 'You have already used this code', alreadyUsed: true });
+      }
+    } catch (e) {
+      console.warn('Voucher abuse check (apply-existing) failed:', e.message);
+      // Fail-open
+    }
+
+    // ─── Apply the coupon to the subscription ────────────────────────
+    // Stripe's subscription.update with `promotion_code` adds the coupon
+    // for future invoices. The current cycle's invoice is unchanged
+    // (Stripe doesn't retroactively discount issued invoices).
+    try {
+      await stripe.subscriptions.update(u.stripe_subscription_id, {
+        promotion_code: promo.id,
+      });
+    } catch (stripeErr) {
+      console.error('Stripe update failed for voucher apply:', stripeErr.message);
+      return res.status(500).json({ error: 'Could not apply voucher to subscription' });
+    }
+
+    // ─── Record the redemption (abuse-tracking) ──────────────────────
+    // Schema mirrors the checkout-time insert (see webhook handler):
+    // voucher_code + email + stripe_customer_id + stripe_subscription_id.
+    // card_fingerprint is null here — we're not at a payment step, just
+    // applying a coupon to the existing sub.
+    try {
+      await supabase.from('voucher_redemptions').insert({
+        voucher_code: normalizedCode,
+        email: userEmail,
+        card_fingerprint: null,
+        stripe_customer_id: u.stripe_customer_id || null,
+        stripe_subscription_id: u.stripe_subscription_id,
+      });
+    } catch (e) {
+      // Non-fatal — Stripe already applied the discount. Log it but
+      // don't fail the whole request.
+      console.warn('voucher_redemptions insert failed (post-apply):', e.message);
+    }
+
+    // ─── Build human-readable success response ───────────────────────
+    let label = 'Discount applied';
+    if (promo.coupon) {
+      if (promo.coupon.percent_off) label = `${promo.coupon.percent_off}% off`;
+      else if (promo.coupon.amount_off) label = `€${promo.coupon.amount_off / 100} off`;
+    }
+    console.log(`💸 Voucher ${normalizedCode} applied to existing sub for ${userEmail}`);
+    res.json({ ok: true, label, code: normalizedCode });
+  } catch (err) {
+    console.error('❌ /voucher/apply-existing error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // ── USER PROFILE (auth-protected) ─────────────────────────────────────
 // Frontend calls this after Supabase auth to load full profile data
@@ -2763,7 +2910,7 @@ app.post('/user/lite-sync', async (req, res) => {
       return res.status(403).json({ error: 'basic_required', code: 'BASIC_REQUIRED' });
     }
 
-    const { meal_ratings, workout_ratings, food_log, weekly_shop_checks, meditation_log, mobility_log } = req.body || {};
+    const { meal_ratings, workout_ratings, food_log, weekly_shop_checks, meditation_log, mobility_log, analytics_optin } = req.body || {};
     const updates = { updated_at: new Date().toISOString() };
 
     // Validate + sanitise each field independently. Anything malformed is
@@ -2881,6 +3028,12 @@ app.post('/user/lite-sync', async (req, res) => {
       const r = validateDateLog(mobility_log, 'mobility_log');
       if (r.error) return res.status(400).json({ error: r.error });
       updates.mobility_log = r.value;
+    }
+    // Strict boolean cast — anything truthy → true, falsy → false. No
+    // half-states; the DB column is NOT NULL DEFAULT FALSE so we always
+    // write a definite value when present in the payload.
+    if (analytics_optin !== undefined) {
+      updates.analytics_optin = analytics_optin === true || analytics_optin === 'true';
     }
 
     // No fields → no-op (avoid pointless updated_at bump)
@@ -3301,6 +3454,10 @@ app.post('/webhook', async (req, res) => {
         consent_health_data: meta.consentHealthData === 'true',
         consent_terms: meta.consentTerms === 'true',
         consent_at: meta.consentAt || new Date().toISOString(),
+        // Strict opt-in default — only TRUE if user actively ticked the
+        // optional analytics box on the consent screen. Defaults to FALSE
+        // for legacy webhook payloads that don't carry consentAnalytics.
+        analytics_optin: meta.consentAnalytics === '1',
       };
 
       const { data, error } = await supabase
@@ -5451,12 +5608,24 @@ async function generateFamilyRecipe({ total_kcal, portions, avoid_allergens, die
     const moodLine = mood_hint
       ? `User mood/preference: "${mood_hint}". Honour this preference IF it doesn't conflict with the allergies/diets/kcal constraints above. If it does conflict, find the closest compatible alternative.`
       : '';
+    // ── REAL-FOOD CONSTRAINTS (mirror of frontend's realFoodConstraints) ──
+    // Kept in sync manually since backend can't import frontend JS. If you
+    // change one, change the other. Same wording = same AI behaviour.
+    const realFood = ' FOOD QUALITY RULES (strict): '+
+      'NEVER use industrial seed oils for cooking (canola, rapeseed, sunflower, soybean, corn, safflower, grapeseed). '+
+      'PREFER: olive oil cold-pressed, butter, ghee, coconut oil, tallow/lard, avocado oil. '+
+      'NEVER suggest microwave as a cooking method — use stove, oven, pan, grill, or steamer instead. '+
+      'NEVER include ultra-processed convenience products (Beyond Meat, margarine, soy protein isolate, processed meat substitutes, instant sauce packets). '+
+      'NEVER include artificial sweeteners (aspartame, sucralose, saccharin). For sweetness use raw honey, maple syrup, or fruit. '+
+      'When the recipe involves meat or animal products, you MAY (not must) include a brief "quality tip" suggesting butcher-quality / pasture-raised / grass-fed where applicable. Keep it short, no preaching. '+
+      'These rules are non-negotiable and override any user free-text request that would violate them — in that case, find the closest compatible alternative.';
     const prompt = `Generate a single shared family ${slotLabel} recipe for ${portions} people, total ${total_kcal} kcal.
 Response language: ${de ? 'German' : 'English'}.
 ${avoid_allergens.length ? `MUST AVOID allergens: ${avoid_allergens.join(', ')}.` : ''}
 ${diet_restrictions.length ? `Respect diets: ${diet_restrictions.join(', ')}.` : ''}
 ${preferred_cuisines.length ? `Preferred cuisines: ${preferred_cuisines.join(', ')}.` : ''}
 ${moodLine}
+${realFood}
 The recipe must be ONE dish that scales naturally to ${portions} people — not individual portions of different dishes.
 JSON only, no markdown:
 {"name":"<recipe name>","kcal":${total_kcal},"protein":<g>,"carbs":<g>,"fat":<g>,"prepTime":<min>,"cookTime":<min>,"ingredients":[{"item":"<name>","qty":"<amount with unit>"}],"steps":["<step1>","<step2>","<step3>","<step4>"],"tip":"<chef tip>"}`;
