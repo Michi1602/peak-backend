@@ -2910,7 +2910,7 @@ app.post('/user/lite-sync', async (req, res) => {
       return res.status(403).json({ error: 'basic_required', code: 'BASIC_REQUIRED' });
     }
 
-    const { meal_ratings, workout_ratings, food_log, weekly_shop_checks, meditation_log, mobility_log, analytics_optin } = req.body || {};
+    const { meal_ratings, workout_ratings, food_log, weekly_shop_checks, meditation_log, mobility_log, analytics_optin, hydration_log } = req.body || {};
     const updates = { updated_at: new Date().toISOString() };
 
     // Validate + sanitise each field independently. Anything malformed is
@@ -3034,6 +3034,51 @@ app.post('/user/lite-sync', async (req, res) => {
     // write a definite value when present in the payload.
     if (analytics_optin !== undefined) {
       updates.analytics_optin = analytics_optin === true || analytics_optin === 'true';
+    }
+    // Hydration log — JSONB keyed by YYYY-MM-DD with entries[] arrays.
+    // We trust the client to trim to last 3 days; here we just enforce
+    // size limits so a malformed payload can't bloat the row.
+    // Structure: { 'YYYY-MM-DD': { entries: [{ts, ml, type, label?, kcal?, protein?, carbs?, fat?}, ...] } }
+    if (hydration_log !== undefined) {
+      if (!hydration_log || typeof hydration_log !== 'object' || Array.isArray(hydration_log)) {
+        return res.status(400).json({ error: 'hydration_log must be an object' });
+      }
+      const dateKeys = Object.keys(hydration_log);
+      if (dateKeys.length > 10) {
+        return res.status(400).json({ error: 'hydration_log: too many date entries (max 10)' });
+      }
+      const cleaned = {};
+      for (const dk of dateKeys) {
+        // Validate date key format YYYY-MM-DD
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dk)) continue;
+        const day = hydration_log[dk];
+        if (!day || typeof day !== 'object' || !Array.isArray(day.entries)) continue;
+        if (day.entries.length > 50) {
+          return res.status(400).json({ error: 'hydration_log: too many entries per day (max 50)' });
+        }
+        // Validate each entry
+        const okEntries = [];
+        for (const e of day.entries) {
+          if (!e || typeof e !== 'object') continue;
+          if (typeof e.ml !== 'number' || e.ml < 0 || e.ml > 5000) continue;
+          // Allowed drink types — anything else gets dropped
+          const allowedTypes = ['water', 'tea', 'coffee', 'broth', 'juice', 'smoothie', 'shake'];
+          if (typeof e.type !== 'string' || allowedTypes.indexOf(e.type) === -1) continue;
+          const sanitised = {
+            ts: typeof e.ts === 'number' ? e.ts : Date.now(),
+            ml: Math.round(e.ml),
+            type: e.type
+          };
+          if (typeof e.label === 'string' && e.label.length <= 80) sanitised.label = e.label;
+          if (typeof e.kcal === 'number' && e.kcal >= 0 && e.kcal <= 2000) sanitised.kcal = Math.round(e.kcal);
+          if (typeof e.protein === 'number' && e.protein >= 0 && e.protein <= 200) sanitised.protein = Math.round(e.protein);
+          if (typeof e.carbs === 'number' && e.carbs >= 0 && e.carbs <= 500) sanitised.carbs = Math.round(e.carbs);
+          if (typeof e.fat === 'number' && e.fat >= 0 && e.fat <= 200) sanitised.fat = Math.round(e.fat);
+          okEntries.push(sanitised);
+        }
+        cleaned[dk] = { entries: okEntries };
+      }
+      updates.hydration_log = cleaned;
     }
 
     // No fields → no-op (avoid pointless updated_at bump)
