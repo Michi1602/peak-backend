@@ -5,6 +5,7 @@ const { Resend } = require('resend');
 const cron = require('node-cron');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
 
 // ── STARTUP ENV VALIDATION (Apr 2026 hardening) ──────────────────────
 // Fail loud at boot if a critical secret is missing instead of crashing
@@ -330,8 +331,6 @@ app.post('/auth/send-login-link', authLimiter, async (req, res) => {
 //   1. POST /auth/send-otp { email, lang }  → sends 6-digit code via email
 //   2. POST /auth/verify-otp { email, code } → returns Supabase session tokens
 //      on success. Frontend then calls supabase.auth.setSession(tokens).
-
-const crypto = require('crypto');
 
 function hashCode(code) {
   return crypto.createHash('sha256').update(String(code)).digest('hex');
@@ -728,6 +727,7 @@ app.post('/auth/signup-free', authLimiter, async (req, res) => {
       consent_health_data: true,
       consent_terms: true,
       consent_at: consentAt,
+      analytics_optin: consent && consent.analytics === true,
     };
 
     // Before upsert: check if a profile already exists for this auth id.
@@ -1454,6 +1454,13 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
       saturated_fat: round(satFatPer100 * factor),
       nutri_score: (p.nutriscore_grade || '').toUpperCase() || null,
       image: p.image_small_url || p.image_thumb_url || null,
+      // v71: send raw ingredient text for PEAK-Score evaluation client-
+      // side. OpenFoodFacts gives us both lang-specific (ingredients_text_de,
+      // ingredients_text_en) and a generic ingredients_text. We prefer
+      // lang-specific where available so PEAK_SCORE_PATTERNS can match
+      // German terms ("rapsöl") AND English terms ("canola oil") since
+      // either may appear.
+      ingredients_text: p.ingredients_text_de || p.ingredients_text_en || p.ingredients_text || '',
     };
 
     // Simple fit-rating — not AI, just heuristics (saves a roundtrip)
@@ -1831,6 +1838,9 @@ app.post('/create-checkout', authLimiter, async (req, res) => {
       consentHealthData: 'true',
       consentTerms: 'true',
       consentAt: consentAt,
+      // Stripe metadata values must be strings — cast bool to '1' / '0'.
+      // Read back in webhook profile-row creation (see meta.consentAnalytics).
+      consentAnalytics: (consent && consent.analytics === true) ? '1' : '0',
     };
 
     // ─── VOUCHER HANDLING ───────────────────────────────────────────────
@@ -2030,6 +2040,149 @@ app.post('/voucher/validate', authLimiter, async (req, res) => {
     res.status(500).json({ valid: false, error: err.message });
   }
 });
+
+// ── APPLY VOUCHER TO EXISTING SUBSCRIPTION ───────────────────────────
+// Use case: a paying user receives a Creator-Code AFTER checkout (e.g.
+// a friend shares a code, or a late-onboarding promo). Without this
+// endpoint they'd have nowhere to enter it.
+//
+// Behaviour by voucher type:
+//   - 'discount' (default): apply Stripe coupon to active subscription
+//     → next invoice gets the discount automatically
+//   - 'trial_extend': REJECTED — trial extension only makes sense at
+//     signup. Returning user already paid, so trial is moot.
+//   - 'trial_full': REJECTED — same reasoning
+//
+// Free users: REJECTED. They go through /create-checkout with the
+// voucher pre-filled instead. We tell the frontend to redirect them.
+//
+// Records the redemption in voucher_redemptions for abuse-tracking
+// (same table as new-signup vouchers, same email-uniqueness rule).
+app.post('/voucher/apply-existing', authLimiter, async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    const authUserId = userData.user.id;
+    const userEmail = (userData.user.email || '').trim().toLowerCase();
+
+    const { code } = req.body || {};
+    if (!code || typeof code !== 'string' || !code.trim()) {
+      return res.status(400).json({ error: 'Code required' });
+    }
+    const normalizedCode = code.trim().toUpperCase();
+
+    // ─── Look up user's current subscription state ───────────────────
+    const { data: u, error: uErr } = await supabase
+      .from('users')
+      .select('tier, status, stripe_subscription_id, stripe_customer_id')
+      .eq('id', authUserId)
+      .maybeSingle();
+    if (uErr || !u) {
+      return res.status(404).json({ error: 'User profile not found' });
+    }
+    if (u.status === 'blocked_voucher_abuse') {
+      return res.status(403).json({ error: 'Account is blocked', code: 'ACCOUNT_BLOCKED' });
+    }
+    // Free users → route them to checkout with voucher pre-filled.
+    // Frontend handles the redirect to the plan-picker step.
+    if (!u.tier || u.tier === 'free') {
+      return res.status(400).json({
+        error: 'Free users must use the voucher at checkout',
+        code: 'CHECKOUT_REQUIRED',
+        redirectToCheckout: true,
+      });
+    }
+    if (!u.stripe_subscription_id) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+
+    // ─── Look up Stripe promotion code ───────────────────────────────
+    const promos = await stripe.promotionCodes.list({ code: normalizedCode, active: true, limit: 1 });
+    if (promos.data.length === 0) {
+      return res.status(404).json({ error: 'Invalid or expired code' });
+    }
+    const promo = promos.data[0];
+    if (promo.max_redemptions && promo.times_redeemed >= promo.max_redemptions) {
+      return res.status(410).json({ error: 'Code has reached its redemption limit' });
+    }
+
+    // ─── Voucher type gating for existing subs ───────────────────────
+    const voucherType = promo.metadata?.type || promo.coupon?.metadata?.type || 'discount';
+    if (voucherType === 'trial_extend' || voucherType === 'trial_full') {
+      return res.status(400).json({
+        error: 'Trial-extension vouchers can only be used at signup',
+        code: 'TRIAL_VOUCHER_NOT_APPLICABLE',
+      });
+    }
+
+    // ─── Abuse check: same email already used this code? ────────────
+    try {
+      const { data: prior } = await supabase
+        .from('voucher_redemptions')
+        .select('id')
+        .eq('voucher_code', normalizedCode)
+        .eq('email', userEmail)
+        .limit(1);
+      if (prior && prior.length > 0) {
+        return res.status(409).json({ error: 'You have already used this code', alreadyUsed: true });
+      }
+    } catch (e) {
+      console.warn('Voucher abuse check (apply-existing) failed:', e.message);
+      // Fail-open
+    }
+
+    // ─── Apply the coupon to the subscription ────────────────────────
+    // Stripe's subscription.update with `promotion_code` adds the coupon
+    // for future invoices. The current cycle's invoice is unchanged
+    // (Stripe doesn't retroactively discount issued invoices).
+    try {
+      await stripe.subscriptions.update(u.stripe_subscription_id, {
+        promotion_code: promo.id,
+      });
+    } catch (stripeErr) {
+      console.error('Stripe update failed for voucher apply:', stripeErr.message);
+      return res.status(500).json({ error: 'Could not apply voucher to subscription' });
+    }
+
+    // ─── Record the redemption (abuse-tracking) ──────────────────────
+    // Schema mirrors the checkout-time insert (see webhook handler):
+    // voucher_code + email + stripe_customer_id + stripe_subscription_id.
+    // card_fingerprint is null here — we're not at a payment step, just
+    // applying a coupon to the existing sub.
+    try {
+      await supabase.from('voucher_redemptions').insert({
+        voucher_code: normalizedCode,
+        email: userEmail,
+        card_fingerprint: null,
+        stripe_customer_id: u.stripe_customer_id || null,
+        stripe_subscription_id: u.stripe_subscription_id,
+      });
+    } catch (e) {
+      // Non-fatal — Stripe already applied the discount. Log it but
+      // don't fail the whole request.
+      console.warn('voucher_redemptions insert failed (post-apply):', e.message);
+    }
+
+    // ─── Build human-readable success response ───────────────────────
+    let label = 'Discount applied';
+    if (promo.coupon) {
+      if (promo.coupon.percent_off) label = `${promo.coupon.percent_off}% off`;
+      else if (promo.coupon.amount_off) label = `€${promo.coupon.amount_off / 100} off`;
+    }
+    console.log(`💸 Voucher ${normalizedCode} applied to existing sub for ${userEmail}`);
+    res.json({ ok: true, label, code: normalizedCode });
+  } catch (err) {
+    console.error('❌ /voucher/apply-existing error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // ── USER PROFILE (auth-protected) ─────────────────────────────────────
 // Frontend calls this after Supabase auth to load full profile data
@@ -2379,6 +2532,31 @@ app.delete('/user/account', async (req, res) => {
       console.log(`   ✓ login_codes deleted for ${email}`);
     } catch (err) {
       console.warn(`   ⚠ login_codes delete failed: ${err.message}`);
+    }
+
+    // 4.5 Leave family group cleanly. The ON DELETE CASCADE on family_memberships
+    // would handle row removal automatically when we delete the users row below,
+    // but doing it explicitly here means: (a) the cleanup_empty_family_group
+    // trigger fires before user-row removal so the foreign-key references are
+    // all still valid, (b) regenerateFutureMealsAfterMemberChange can run for
+    // the remaining members, (c) we log it for audit purposes.
+    try {
+      const { data: activeMembership } = await supabase
+        .from('family_memberships')
+        .select('id, group_id')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .maybeSingle();
+      if (activeMembership) {
+        await supabase.from('family_memberships')
+          .update({ status: 'left', left_at: new Date().toISOString() })
+          .eq('id', activeMembership.id);
+        console.log(`   ✓ Family membership ended (group ${activeMembership.group_id})`);
+        // Best-effort: clean stale future meals for the remaining members
+        await regenerateFutureMealsAfterMemberChange(activeMembership.group_id).catch(() => {});
+      }
+    } catch (err) {
+      console.warn(`   ⚠ Family leave during deletion failed (continuing): ${err.message}`);
     }
 
     // 5. Delete public.users row
@@ -2739,7 +2917,7 @@ app.post('/user/lite-sync', async (req, res) => {
       return res.status(403).json({ error: 'basic_required', code: 'BASIC_REQUIRED' });
     }
 
-    const { meal_ratings, workout_ratings, food_log, weekly_shop_checks, meditation_log, mobility_log } = req.body || {};
+    const { meal_ratings, workout_ratings, food_log, weekly_shop_checks, meditation_log, mobility_log, analytics_optin, hydration_log } = req.body || {};
     const updates = { updated_at: new Date().toISOString() };
 
     // Validate + sanitise each field independently. Anything malformed is
@@ -2857,6 +3035,57 @@ app.post('/user/lite-sync', async (req, res) => {
       const r = validateDateLog(mobility_log, 'mobility_log');
       if (r.error) return res.status(400).json({ error: r.error });
       updates.mobility_log = r.value;
+    }
+    // Strict boolean cast — anything truthy → true, falsy → false. No
+    // half-states; the DB column is NOT NULL DEFAULT FALSE so we always
+    // write a definite value when present in the payload.
+    if (analytics_optin !== undefined) {
+      updates.analytics_optin = analytics_optin === true || analytics_optin === 'true';
+    }
+    // Hydration log — JSONB keyed by YYYY-MM-DD with entries[] arrays.
+    // We trust the client to trim to last 3 days; here we just enforce
+    // size limits so a malformed payload can't bloat the row.
+    // Structure: { 'YYYY-MM-DD': { entries: [{ts, ml, type, label?, kcal?, protein?, carbs?, fat?}, ...] } }
+    if (hydration_log !== undefined) {
+      if (!hydration_log || typeof hydration_log !== 'object' || Array.isArray(hydration_log)) {
+        return res.status(400).json({ error: 'hydration_log must be an object' });
+      }
+      const dateKeys = Object.keys(hydration_log);
+      if (dateKeys.length > 10) {
+        return res.status(400).json({ error: 'hydration_log: too many date entries (max 10)' });
+      }
+      const cleaned = {};
+      for (const dk of dateKeys) {
+        // Validate date key format YYYY-MM-DD
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dk)) continue;
+        const day = hydration_log[dk];
+        if (!day || typeof day !== 'object' || !Array.isArray(day.entries)) continue;
+        if (day.entries.length > 50) {
+          return res.status(400).json({ error: 'hydration_log: too many entries per day (max 50)' });
+        }
+        // Validate each entry
+        const okEntries = [];
+        for (const e of day.entries) {
+          if (!e || typeof e !== 'object') continue;
+          if (typeof e.ml !== 'number' || e.ml < 0 || e.ml > 5000) continue;
+          // Allowed drink types — anything else gets dropped
+          const allowedTypes = ['water', 'tea', 'coffee', 'broth', 'juice', 'smoothie', 'shake'];
+          if (typeof e.type !== 'string' || allowedTypes.indexOf(e.type) === -1) continue;
+          const sanitised = {
+            ts: typeof e.ts === 'number' ? e.ts : Date.now(),
+            ml: Math.round(e.ml),
+            type: e.type
+          };
+          if (typeof e.label === 'string' && e.label.length <= 80) sanitised.label = e.label;
+          if (typeof e.kcal === 'number' && e.kcal >= 0 && e.kcal <= 2000) sanitised.kcal = Math.round(e.kcal);
+          if (typeof e.protein === 'number' && e.protein >= 0 && e.protein <= 200) sanitised.protein = Math.round(e.protein);
+          if (typeof e.carbs === 'number' && e.carbs >= 0 && e.carbs <= 500) sanitised.carbs = Math.round(e.carbs);
+          if (typeof e.fat === 'number' && e.fat >= 0 && e.fat <= 200) sanitised.fat = Math.round(e.fat);
+          okEntries.push(sanitised);
+        }
+        cleaned[dk] = { entries: okEntries };
+      }
+      updates.hydration_log = cleaned;
     }
 
     // No fields → no-op (avoid pointless updated_at bump)
@@ -3277,6 +3506,10 @@ app.post('/webhook', async (req, res) => {
         consent_health_data: meta.consentHealthData === 'true',
         consent_terms: meta.consentTerms === 'true',
         consent_at: meta.consentAt || new Date().toISOString(),
+        // Strict opt-in default — only TRUE if user actively ticked the
+        // optional analytics box on the consent screen. Defaults to FALSE
+        // for legacy webhook payloads that don't carry consentAnalytics.
+        analytics_optin: meta.consentAnalytics === '1',
       };
 
       const { data, error } = await supabase
@@ -3502,6 +3735,37 @@ app.post('/webhook', async (req, res) => {
         } else if (isAccountDeletion || !userStillExists) {
           console.log(`ℹ️  Skipping cancellation_final for ${email}: account deletion in progress`);
         }
+        // ── Family Plan: suspend any active membership ─────────────────
+        // Premium-only feature, so losing tier must remove the user from
+        // their family group. We use 'suspended' (not 'left') so the row
+        // is recoverable if they re-subscribe within a grace window — the
+        // family tab can show "Anna lost Premium" and offer re-invite.
+        // Trigger drops the empty group automatically if this was the last
+        // active member; otherwise regenerateFutureMealsAfterMemberChange
+        // clears stale meals so they get rebuilt without the suspended user.
+        if (userStillExists && updated[0]?.id) {
+          try {
+            const { data: activeMembership } = await supabase
+              .from('family_memberships')
+              .select('id, group_id')
+              .eq('user_id', updated[0].id)
+              .eq('status', 'active')
+              .maybeSingle();
+            if (activeMembership) {
+              await supabase.from('family_memberships')
+                .update({ status: 'suspended', left_at: new Date().toISOString() })
+                .eq('id', activeMembership.id);
+              await supabase.from('users')
+                .update({ family_group_id: null })
+                .eq('id', updated[0].id);
+              // Best-effort: clear stale meals so they regenerate without this user
+              setImmediate(() => regenerateFutureMealsAfterMemberChange(activeMembership.group_id).catch(() => {}));
+              console.log(`👨‍👩‍👧 Family membership suspended for ${email} (group ${activeMembership.group_id})`);
+            }
+          } catch (err) {
+            console.error('⚠️  Family membership suspend failed:', err.message);
+          }
+        }
       }
     } else if (event.type === 'customer.subscription.updated') {
       // Detect when user initiates cancellation at period end
@@ -3554,6 +3818,10 @@ app.post('/webhook', async (req, res) => {
           // Pull trial_end from the live Stripe sub so the DB stays in sync
           // even when the Customer Portal cleared/extended trial.
           const trialEndIso = sub.trial_end ? new Date(sub.trial_end * 1000).toISOString() : null;
+          // Capture prior tier so we can detect Premium→Basic downgrade
+          const { data: priorRow } = await supabase
+            .from('users').select('id, tier').eq('email', email).maybeSingle();
+          const priorTier = priorRow?.tier || null;
           const updates = {
             tier: newTier,
             plan: newPlan,
@@ -3563,6 +3831,33 @@ app.post('/webhook', async (req, res) => {
           const { error } = await supabase.from('users').update(updates).eq('email', email);
           if (error) console.error('❌ Plan-change DB update failed:', error.message);
           else console.log(`🔄 Plan changed: ${email} → ${newTier}/${newPlan} (trial_end=${trialEndIso || 'unchanged'})`);
+          // ── Family Plan: suspend membership if dropping below Premium ──
+          // Family Plan is Premium-only. If the user just moved from
+          // Premium to Basic (or anything else), pull them out of the
+          // group. Same 'suspended' status as on full cancellation so a
+          // future re-upgrade can re-activate them with one click.
+          if (priorTier === 'premium' && newTier !== 'premium' && priorRow?.id) {
+            try {
+              const { data: activeMembership } = await supabase
+                .from('family_memberships')
+                .select('id, group_id')
+                .eq('user_id', priorRow.id)
+                .eq('status', 'active')
+                .maybeSingle();
+              if (activeMembership) {
+                await supabase.from('family_memberships')
+                  .update({ status: 'suspended', left_at: new Date().toISOString() })
+                  .eq('id', activeMembership.id);
+                await supabase.from('users')
+                  .update({ family_group_id: null })
+                  .eq('id', priorRow.id);
+                setImmediate(() => regenerateFutureMealsAfterMemberChange(activeMembership.group_id).catch(() => {}));
+                console.log(`👨‍👩‍👧 Family membership suspended (downgrade): ${email}`);
+              }
+            } catch (err) {
+              console.error('⚠️  Family suspend on downgrade failed:', err.message);
+            }
+          }
         }
       }
 
@@ -4672,6 +4967,812 @@ process.on('uncaughtException', (err) => {
   // Same philosophy — log and keep going. If we DO need to exit, Render
   // will restart us on health-check failure.
 });
+
+// ════════════════════════════════════════════════════════════════════════
+// FAMILY PLAN (May 2026)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Shared-meal feature for up to 4 Premium users. Concept:
+//   • Each user keeps their full INDIVIDUAL plan untouched
+//   • A separate set of family_meals lives in parallel
+//   • Tracking is bi-directional (handled in frontend / food_log)
+//   • Lifecycle: anyone can invite/remove anyone; last-out destroys the
+//     group (DB trigger). Lost-Premium → membership status = 'suspended'.
+//
+// All endpoints validate:
+//   1. Caller is authenticated
+//   2. Caller is Premium + status='active'
+//   3. For group-scoped endpoints: caller is an active member of that group
+//
+// Recipe generation uses Anthropic Claude (same pattern as individual
+// plan generation). Allergies + diets are unioned across all participants
+// to find the safe intersection.
+
+// Helper: fetch caller's active group ID, or null if not in one.
+async function getActiveFamilyGroupId(userId) {
+  if (!userId) return null;
+  try {
+    const { data } = await supabase
+      .from('family_memberships')
+      .select('group_id')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .maybeSingle();
+    return data?.group_id || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Helper: assert caller is active member of given group. Returns true/false.
+async function isActiveMember(userId, groupId) {
+  if (!userId || !groupId) return false;
+  try {
+    const { data } = await supabase
+      .from('family_memberships')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('group_id', groupId)
+      .eq('status', 'active')
+      .maybeSingle();
+    return !!data;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Helper: load full member list for a group, joined with their basic profile
+// data needed for recipe generation (al, di, weight, age, gender, dweight,
+// goal — enough to compute target kcal). NEVER returns email, name, or
+// other PII unrelated to meal planning.
+async function loadGroupMembersForCooking(groupId) {
+  try {
+    const { data: memberships } = await supabase
+      .from('family_memberships')
+      .select('user_id, display_name')
+      .eq('group_id', groupId)
+      .eq('status', 'active');
+    if (!memberships || memberships.length === 0) return [];
+    const userIds = memberships.map(m => m.user_id);
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, age, gender, weight, dweight, height, sport, level, sessions, goal, al, di, cu, plan_data, tier, status')
+      .in('id', userIds);
+    // Merge display_name from membership onto user record
+    const dnByUser = {};
+    memberships.forEach(m => { dnByUser[m.user_id] = m.display_name; });
+    return (users || []).map(u => ({ ...u, display_name: dnByUser[u.id] || null }));
+  } catch (e) {
+    console.error('[family] loadGroupMembersForCooking failed:', e.message);
+    return [];
+  }
+}
+
+// Helper: generate a URL-safe random token for invite links.
+function generateInviteToken() {
+  // 22 chars of base64url ≈ 130 bits of entropy — plenty for a 7-day token.
+  const buf = crypto.randomBytes(16);
+  return buf.toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// ─── POST /family/create ──────────────────────────────────────────────
+// Create a new group with caller as first member. Caller must be Premium.
+// Optional body: { name, shared_meals_pattern }.
+app.post('/family/create', aiLimiter, async (req, res) => {
+  try {
+    const auth = await resolveAuthAndTier(req, { requirePremium: true });
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    // Refuse if already in an active group — one group per user.
+    const existing = await getActiveFamilyGroupId(auth.userId);
+    if (existing) {
+      return res.status(409).json({ error: 'already_in_group', group_id: existing });
+    }
+    const { name, shared_meals_pattern } = req.body || {};
+    // Light validation — accept anything sane, reject huge payloads.
+    const safeName = (typeof name === 'string' && name.length <= 60) ? name.trim() : null;
+    const safePattern = (shared_meals_pattern && typeof shared_meals_pattern === 'object'
+      && !Array.isArray(shared_meals_pattern)) ? shared_meals_pattern : {};
+    const { data: group, error: gErr } = await supabase
+      .from('family_groups')
+      .insert({
+        created_by: auth.userId,
+        name: safeName,
+        shared_meals_pattern: safePattern,
+        member_count: 0  // trigger bumps to 1 when membership row lands
+      })
+      .select('id')
+      .single();
+    if (gErr || !group) {
+      console.error('[family/create] insert group failed:', gErr?.message);
+      return res.status(500).json({ error: 'create_group_failed' });
+    }
+    // Now add caller as active member
+    const { error: mErr } = await supabase
+      .from('family_memberships')
+      .insert({
+        group_id: group.id,
+        user_id: auth.userId,
+        status: 'active',
+        invited_by: auth.userId
+      });
+    if (mErr) {
+      console.error('[family/create] insert membership failed:', mErr.message);
+      // Rollback the orphan group
+      await supabase.from('family_groups').delete().eq('id', group.id);
+      return res.status(500).json({ error: 'create_membership_failed' });
+    }
+    // Maintain convenience pointer on users row
+    await supabase.from('users').update({ family_group_id: group.id }).eq('id', auth.userId);
+    res.json({ ok: true, group_id: group.id });
+  } catch (e) {
+    console.error('[family/create] error:', e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// ─── GET /family/group ────────────────────────────────────────────────
+// Fetch caller's active group with member list + recent meals.
+// Returns { group: {...}, members: [...], meals: [...] } or { group: null }.
+app.get('/family/group', async (req, res) => {
+  try {
+    const auth = await resolveAuthAndTier(req);
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const groupId = await getActiveFamilyGroupId(auth.userId);
+    if (!groupId) return res.json({ group: null });
+    const [groupResult, membersResult, mealsResult] = await Promise.all([
+      supabase.from('family_groups')
+        .select('id, name, shared_meals_pattern, member_count, created_at')
+        .eq('id', groupId).maybeSingle(),
+      supabase.from('family_memberships')
+        .select('user_id, display_name, joined_at, status')
+        .eq('group_id', groupId)
+        .eq('status', 'active'),
+      // Pull the next 14 days of meals (slightly more than needed for
+      // current week, leaves buffer for forward-planning UI)
+      supabase.from('family_meals')
+        .select('meal_date, meal_slot, participating_user_ids, recipe, per_user_breakdown')
+        .eq('group_id', groupId)
+        .gte('meal_date', new Date().toISOString().slice(0, 10))
+        .order('meal_date', { ascending: true })
+    ]);
+    // Enrich members with their display name from users.name (fallback)
+    let memberRows = membersResult.data || [];
+    if (memberRows.length > 0) {
+      const ids = memberRows.map(m => m.user_id);
+      const { data: profileNames } = await supabase
+        .from('users').select('id, name').in('id', ids);
+      const nameMap = {};
+      (profileNames || []).forEach(p => { nameMap[p.id] = p.name; });
+      memberRows = memberRows.map(m => ({
+        ...m,
+        // Prefer per-group display_name, fall back to profile name
+        name: m.display_name || nameMap[m.user_id] || null,
+        // Mark the caller — frontend uses this for "(you)" badges
+        is_self: m.user_id === auth.userId
+      }));
+    }
+    res.json({
+      group: groupResult.data || null,
+      members: memberRows,
+      meals: mealsResult.data || []
+    });
+  } catch (e) {
+    console.error('[family/group] error:', e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// ─── POST /family/invite ──────────────────────────────────────────────
+// Generate a share-able invite token for the caller's active group.
+// Token expires in 7 days. Returns { token, url }.
+app.post('/family/invite', aiLimiter, async (req, res) => {
+  try {
+    const auth = await resolveAuthAndTier(req, { requirePremium: true });
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const groupId = await getActiveFamilyGroupId(auth.userId);
+    if (!groupId) return res.status(404).json({ error: 'no_active_group' });
+    // Refuse if already at the 4-person cap
+    const { data: g } = await supabase
+      .from('family_groups').select('member_count').eq('id', groupId).maybeSingle();
+    if (!g) return res.status(404).json({ error: 'group_gone' });
+    if (g.member_count >= 4) {
+      return res.status(409).json({ error: 'group_full', limit: 4 });
+    }
+    const token = generateInviteToken();
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    const { error } = await supabase
+      .from('family_invite_tokens')
+      .insert({
+        token,
+        group_id: groupId,
+        created_by: auth.userId,
+        expires_at: expiresAt
+      });
+    if (error) {
+      console.error('[family/invite] insert failed:', error.message);
+      return res.status(500).json({ error: 'token_create_failed' });
+    }
+    // Build the share URL. FRONTEND_URL must be set in env (e.g. https://peak-mj-performance.app)
+    const baseUrl = process.env.FRONTEND_URL || 'https://peak-mj-performance.app';
+    const url = `${baseUrl}/?invite=${encodeURIComponent(token)}`;
+    res.json({ ok: true, token, url, expires_at: expiresAt });
+  } catch (e) {
+    console.error('[family/invite] error:', e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// ─── POST /family/accept-invite ───────────────────────────────────────
+// Redeem an invite token. Caller must be Premium + active. Token must be
+// valid (not expired, not revoked, group not full).
+// Body: { token }
+app.post('/family/accept-invite', async (req, res) => {
+  try {
+    const auth = await resolveAuthAndTier(req, { requirePremium: true });
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const { token } = req.body || {};
+    if (!token || typeof token !== 'string' || token.length > 64) {
+      return res.status(400).json({ error: 'invalid_token_format' });
+    }
+    // Validate token
+    const { data: inv } = await supabase
+      .from('family_invite_tokens')
+      .select('token, group_id, expires_at, revoked_at')
+      .eq('token', token)
+      .maybeSingle();
+    if (!inv) return res.status(404).json({ error: 'token_not_found' });
+    if (inv.revoked_at) return res.status(410).json({ error: 'token_revoked' });
+    if (new Date(inv.expires_at) < new Date()) {
+      return res.status(410).json({ error: 'token_expired' });
+    }
+    // Refuse if caller is already in any active group
+    const existing = await getActiveFamilyGroupId(auth.userId);
+    if (existing) {
+      if (existing === inv.group_id) return res.json({ ok: true, group_id: existing, already_member: true });
+      return res.status(409).json({ error: 'already_in_other_group', group_id: existing });
+    }
+    // Refuse if group is full
+    const { data: g } = await supabase
+      .from('family_groups').select('member_count').eq('id', inv.group_id).maybeSingle();
+    if (!g) return res.status(404).json({ error: 'group_gone' });
+    if (g.member_count >= 4) {
+      return res.status(409).json({ error: 'group_full', limit: 4 });
+    }
+    // Check for prior membership (left/suspended) → re-activate that row
+    const { data: prior } = await supabase
+      .from('family_memberships')
+      .select('id, status')
+      .eq('group_id', inv.group_id)
+      .eq('user_id', auth.userId)
+      .maybeSingle();
+    if (prior) {
+      await supabase.from('family_memberships')
+        .update({ status: 'active', left_at: null })
+        .eq('id', prior.id);
+    } else {
+      const { error } = await supabase.from('family_memberships').insert({
+        group_id: inv.group_id,
+        user_id: auth.userId,
+        status: 'active',
+        invited_by: null  // unknown — token doesn't track inviter beyond creator
+      });
+      if (error) {
+        console.error('[family/accept-invite] insert failed:', error.message);
+        return res.status(500).json({ error: 'join_failed' });
+      }
+    }
+    // Race-condition guard: between the pre-check and the insert, another
+    // user could have raced in and pushed us over the 4-person cap. The
+    // sync_family_member_count trigger has now updated the count — re-read
+    // and roll back if we're over. Without this, 5+ users could theoretically
+    // squeeze into a "full" group during a concurrent invite burst.
+    const { data: gPost } = await supabase
+      .from('family_groups').select('member_count').eq('id', inv.group_id).maybeSingle();
+    if (gPost && gPost.member_count > 4) {
+      // We overshot. Roll back the activation/insert and tell the client.
+      await supabase.from('family_memberships')
+        .update({ status: 'left', left_at: new Date().toISOString() })
+        .eq('group_id', inv.group_id)
+        .eq('user_id', auth.userId)
+        .eq('status', 'active');
+      return res.status(409).json({ error: 'group_full', limit: 4 });
+    }
+    await supabase.from('users').update({ family_group_id: inv.group_id }).eq('id', auth.userId);
+    res.json({ ok: true, group_id: inv.group_id });
+  } catch (e) {
+    console.error('[family/accept-invite] error:', e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// ─── POST /family/leave ───────────────────────────────────────────────
+// Caller leaves their active group. Sets status='left'. Trigger cleans
+// up empty groups automatically.
+app.post('/family/leave', async (req, res) => {
+  try {
+    const auth = await resolveAuthAndTier(req);
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const groupId = await getActiveFamilyGroupId(auth.userId);
+    if (!groupId) return res.status(404).json({ error: 'no_active_group' });
+    const { error } = await supabase.from('family_memberships')
+      .update({ status: 'left', left_at: new Date().toISOString() })
+      .eq('user_id', auth.userId)
+      .eq('group_id', groupId)
+      .eq('status', 'active');
+    if (error) {
+      console.error('[family/leave] update failed:', error.message);
+      return res.status(500).json({ error: 'leave_failed' });
+    }
+    await supabase.from('users').update({ family_group_id: null }).eq('id', auth.userId);
+    // Re-generate any future meals where this user was participating —
+    // best-effort, done in background (no await on the response path).
+    setImmediate(() => regenerateFutureMealsAfterMemberChange(groupId).catch(() => {}));
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[family/leave] error:', e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// ─── DELETE /family/remove-member ────────────────────────────────────
+// Remove another user from the caller's active group. Caller must be
+// active member of same group. Body: { user_id }
+app.delete('/family/remove-member', async (req, res) => {
+  try {
+    const auth = await resolveAuthAndTier(req);
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const { user_id: targetId } = req.body || {};
+    if (!targetId || typeof targetId !== 'string') {
+      return res.status(400).json({ error: 'user_id_required' });
+    }
+    if (targetId === auth.userId) {
+      return res.status(400).json({ error: 'use_leave_endpoint_for_self' });
+    }
+    const groupId = await getActiveFamilyGroupId(auth.userId);
+    if (!groupId) return res.status(404).json({ error: 'no_active_group' });
+    // Verify target is in the same active group
+    const targetActive = await isActiveMember(targetId, groupId);
+    if (!targetActive) return res.status(404).json({ error: 'target_not_in_group' });
+    const { error } = await supabase.from('family_memberships')
+      .update({ status: 'left', left_at: new Date().toISOString() })
+      .eq('user_id', targetId)
+      .eq('group_id', groupId)
+      .eq('status', 'active');
+    if (error) {
+      console.error('[family/remove-member] update failed:', error.message);
+      return res.status(500).json({ error: 'remove_failed' });
+    }
+    await supabase.from('users').update({ family_group_id: null }).eq('id', targetId);
+    setImmediate(() => regenerateFutureMealsAfterMemberChange(groupId).catch(() => {}));
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[family/remove-member] error:', e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// ─── PATCH /family/shared-pattern ────────────────────────────────────
+// Update the group's default-shared-meals pattern (4×7 boolean matrix).
+// Body: { shared_meals_pattern: {...} }
+app.patch('/family/shared-pattern', async (req, res) => {
+  try {
+    const auth = await resolveAuthAndTier(req, { requirePremium: true });
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const groupId = await getActiveFamilyGroupId(auth.userId);
+    if (!groupId) return res.status(404).json({ error: 'no_active_group' });
+    const { shared_meals_pattern } = req.body || {};
+    if (!shared_meals_pattern || typeof shared_meals_pattern !== 'object'
+        || Array.isArray(shared_meals_pattern)) {
+      return res.status(400).json({ error: 'pattern_required' });
+    }
+    const { error } = await supabase.from('family_groups')
+      .update({ shared_meals_pattern })
+      .eq('id', groupId);
+    if (error) {
+      console.error('[family/shared-pattern] update failed:', error.message);
+      return res.status(500).json({ error: 'update_failed' });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[family/shared-pattern] error:', e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// ─── POST /family/generate-meal ───────────────────────────────────────
+// Generate a shared meal for given date+slot with given participants.
+// Body: { meal_date: 'YYYY-MM-DD', meal_slot, participating_user_ids? }
+// If participating_user_ids omitted, defaults to all active members.
+app.post('/family/generate-meal', aiLimiter, async (req, res) => {
+  try {
+    const auth = await resolveAuthAndTier(req, { requirePremium: true });
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const groupId = await getActiveFamilyGroupId(auth.userId);
+    if (!groupId) return res.status(404).json({ error: 'no_active_group' });
+    const { meal_date, meal_slot } = req.body || {};
+    let { participating_user_ids, mood_hint } = req.body || {};
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(meal_date || '')) {
+      return res.status(400).json({ error: 'meal_date_invalid' });
+    }
+    if (!['breakfast', 'lunch', 'dinner', 'snack'].includes(meal_slot)) {
+      return res.status(400).json({ error: 'meal_slot_invalid' });
+    }
+    // mood_hint sanitisation — small free-text from the user that flows
+    // into the AI prompt. Trim, length-cap, and strip any control chars
+    // that could mess with prompt boundaries. We don't try heroic prompt-
+    // injection defence — the user prompt is anyway sandboxed by the
+    // structured JSON contract we demand back.
+    if (mood_hint != null) {
+      if (typeof mood_hint !== 'string') mood_hint = null;
+      else {
+        mood_hint = mood_hint.trim().replace(/[\x00-\x1f]/g, '').slice(0, 120);
+        if (!mood_hint) mood_hint = null;
+      }
+    }
+    // Load all active members of the group for cooking context
+    const members = await loadGroupMembersForCooking(groupId);
+    if (members.length === 0) {
+      return res.status(404).json({ error: 'no_members' });
+    }
+    // Default participants = all active members
+    if (!Array.isArray(participating_user_ids) || participating_user_ids.length === 0) {
+      participating_user_ids = members.map(m => m.id);
+    } else {
+      // Sanity check — every requested participant must be in the group
+      // and Premium-active. Drop any that aren't.
+      const validSet = new Set(members.filter(m => m.tier === 'premium' && m.status === 'active').map(m => m.id));
+      participating_user_ids = participating_user_ids.filter(id => validSet.has(id));
+      if (participating_user_ids.length === 0) {
+        return res.status(400).json({ error: 'no_valid_participants' });
+      }
+    }
+    // Caller must be a participant — otherwise weird state
+    if (!participating_user_ids.includes(auth.userId)) {
+      return res.status(403).json({ error: 'caller_not_participant' });
+    }
+    const participants = members.filter(m => participating_user_ids.includes(m.id));
+    // Schnittmenge der Allergien + Diäten = jede Restriktion, die min. einer hat
+    // (jeder muss sicher essen können → Vereinigung der Verbote)
+    const allergiesUnion = [...new Set(participants.flatMap(p => p.al || []))];
+    const dietsUnion     = [...new Set(participants.flatMap(p => p.di || []))];
+    // For cuisines, take the INTERSECTION (only cuisines everyone likes).
+    // If empty, fall back to no restriction — better than a bug here.
+    const cuisinesPerUser = participants.map(p => new Set(p.cu || []));
+    let cuisinesIntersection = [];
+    if (cuisinesPerUser.length > 0 && cuisinesPerUser.every(s => s.size > 0)) {
+      const first = [...cuisinesPerUser[0]];
+      cuisinesIntersection = first.filter(c => cuisinesPerUser.every(s => s.has(c)));
+    }
+    // Compute target kcal for this slot per participant. We use a simple
+    // share of daily target — breakfast 25%, lunch 35%, dinner 30%, snack 10%.
+    const slotShare = { breakfast: 0.25, lunch: 0.35, dinner: 0.30, snack: 0.10 }[meal_slot];
+    const perUserSlotKcal = {};
+    let totalKcal = 0;
+    participants.forEach(p => {
+      const dailyKcal = getEstimatedDailyKcal(p);
+      const slotKcal = Math.round(dailyKcal * slotShare);
+      perUserSlotKcal[p.id] = slotKcal;
+      totalKcal += slotKcal;
+    });
+    // Recipe generation via Claude — same pattern as single-plan meals
+    const recipe = await generateFamilyRecipe({
+      total_kcal: totalKcal,
+      portions: participants.length,
+      avoid_allergens: allergiesUnion,
+      diet_restrictions: dietsUnion,
+      preferred_cuisines: cuisinesIntersection,
+      mood_hint,
+      meal_slot,
+      lang: req.body.lang || 'de'
+    });
+    if (!recipe) {
+      return res.status(502).json({ error: 'recipe_generation_failed' });
+    }
+    // Per-user breakdown by proportional split
+    const perUserBreakdown = {};
+    participants.forEach(p => {
+      const share = perUserSlotKcal[p.id] / totalKcal;
+      perUserBreakdown[p.id] = {
+        kcal: Math.round((recipe.kcal || totalKcal) * share),
+        protein: Math.round((recipe.protein || 0) * share),
+        carbs: Math.round((recipe.carbs || 0) * share),
+        fat: Math.round((recipe.fat || 0) * share),
+        // Per-person ingredient quantities — scale every ingredient
+        // proportionally. Keep ingredient names verbatim, scale qty
+        // numbers where parseable, leave others ("nach Geschmack") as-is.
+        ingredients: scaleIngredients(recipe.ingredients || [], share)
+      };
+    });
+    // UPSERT — overwrites prior meal at same group/date/slot
+    const { error: upErr } = await supabase.from('family_meals').upsert({
+      group_id: groupId,
+      meal_date,
+      meal_slot,
+      participating_user_ids,
+      recipe,
+      per_user_breakdown
+    }, { onConflict: 'group_id,meal_date,meal_slot' });
+    if (upErr) {
+      console.error('[family/generate-meal] upsert failed:', upErr.message);
+      return res.status(500).json({ error: 'save_failed' });
+    }
+    res.json({ ok: true, recipe, per_user_breakdown, participating_user_ids });
+  } catch (e) {
+    console.error('[family/generate-meal] error:', e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// ─── DELETE /family/meal ──────────────────────────────────────────────
+// Remove a shared meal (e.g. caller wants to revert this slot to individual).
+// Body: { meal_date, meal_slot }
+app.delete('/family/meal', async (req, res) => {
+  try {
+    const auth = await resolveAuthAndTier(req);
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const groupId = await getActiveFamilyGroupId(auth.userId);
+    if (!groupId) return res.status(404).json({ error: 'no_active_group' });
+    const { meal_date, meal_slot } = req.body || {};
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(meal_date || '')) {
+      return res.status(400).json({ error: 'meal_date_invalid' });
+    }
+    if (!['breakfast', 'lunch', 'dinner', 'snack'].includes(meal_slot)) {
+      return res.status(400).json({ error: 'meal_slot_invalid' });
+    }
+    const { error } = await supabase.from('family_meals')
+      .delete()
+      .eq('group_id', groupId)
+      .eq('meal_date', meal_date)
+      .eq('meal_slot', meal_slot);
+    if (error) {
+      console.error('[family/meal DELETE] failed:', error.message);
+      return res.status(500).json({ error: 'delete_failed' });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[family/meal DELETE] error:', e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// ─── GET /family/shopping-list ───────────────────────────────────────
+// Return aggregated shopping list for caller's active group covering
+// the next N days (default 7). Returns per-day buckets so the frontend
+// can render same UX as individual shopping list.
+app.get('/family/shopping-list', async (req, res) => {
+  try {
+    const auth = await resolveAuthAndTier(req);
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const groupId = await getActiveFamilyGroupId(auth.userId);
+    if (!groupId) return res.status(404).json({ error: 'no_active_group' });
+    const days = Math.min(parseInt(req.query.days || '7', 10) || 7, 14);
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const endStr = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+    const { data: meals } = await supabase.from('family_meals')
+      .select('meal_date, meal_slot, recipe, per_user_breakdown, participating_user_ids')
+      .eq('group_id', groupId)
+      .gte('meal_date', todayStr)
+      .lte('meal_date', endStr)
+      .order('meal_date', { ascending: true });
+    // Group meals by date; frontend will then sum ingredients per day
+    // using its own category-sort logic (same shopCategoryOf helpers).
+    const byDay = {};
+    (meals || []).forEach(m => {
+      if (!byDay[m.meal_date]) byDay[m.meal_date] = [];
+      byDay[m.meal_date].push(m);
+    });
+    res.json({ days: byDay });
+  } catch (e) {
+    console.error('[family/shopping-list] error:', e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// ─── Family-Helpers (internal) ───────────────────────────────────────
+
+// Estimate daily kcal for a user from their stored profile data.
+// This mirrors the individual-plan logic — Mifflin-St Jeor BMR × activity
+// factor × goal adjustment. Defensive fallback to 2000 kcal if data missing.
+function getEstimatedDailyKcal(u) {
+  try {
+    const w = Number(u.weight) || 70;
+    const h = Number(u.height) || 175;
+    const a = Number(u.age) || 30;
+    const isMale = (u.gender || '').toLowerCase().startsWith('m');
+    // BMR (Mifflin-St Jeor)
+    let bmr = isMale
+      ? 10 * w + 6.25 * h - 5 * a + 5
+      : 10 * w + 6.25 * h - 5 * a - 161;
+    // Activity multiplier from sessions/week (proxy for activity level)
+    const sessions = Number(u.sessions) || 3;
+    const activityMult = sessions >= 6 ? 1.725
+      : sessions >= 4 ? 1.55
+      : sessions >= 2 ? 1.375
+      : 1.2;
+    let tdee = bmr * activityMult;
+    // Goal adjustment — same direction as our single-plan logic
+    const goal = (u.goal || '').toLowerCase();
+    if (goal.includes('lose') || goal.includes('abnehm') || goal.includes('cut')) {
+      tdee -= 400;
+    } else if (goal.includes('gain') || goal.includes('muskelaufbau') || goal.includes('bulk')) {
+      tdee += 400;
+    }
+    return Math.max(1200, Math.round(tdee));
+  } catch (_) {
+    return 2000;
+  }
+}
+
+// Scale ingredient quantities proportionally. Each ingredient is either
+// "200g Tomato" string or {item, qty} object. We re-write the numeric
+// part of qty by the share factor; leave non-numeric quantities verbatim.
+function scaleIngredients(ingredients, share) {
+  if (!Array.isArray(ingredients)) return [];
+  return ingredients.map(ing => {
+    const obj = (typeof ing === 'string')
+      ? parseIngredientString(ing)
+      : { item: ing.item || ing.name || '', qty: ing.qty || '' };
+    const qtyScaled = scaleQtyString(obj.qty, share);
+    return { item: obj.item, qty: qtyScaled };
+  });
+}
+// Try to parse "200g Tomato" → { item: 'Tomato', qty: '200g' }
+function parseIngredientString(s) {
+  const m = String(s).match(/^([\d.,/]+\s*[a-zA-ZäöüÄÖÜß]*)\s+(.+)$/);
+  if (m) return { item: m[2].trim(), qty: m[1].trim() };
+  return { item: String(s), qty: '' };
+}
+// Scale "200g" by 0.4 → "80g". Pass-through for "nach Geschmack", "Prise" etc.
+function scaleQtyString(qty, share) {
+  if (!qty || typeof qty !== 'string') return qty || '';
+  if (/^(nach\s|to\s|prise|pinch|etwas|some|optional)/i.test(qty.trim())) return qty;
+  const m = qty.trim().match(/^(\d+(?:[.,]\d+)?|\d+\/\d+)\s*(.*)$/);
+  if (!m) return qty;
+  let n;
+  if (m[1].includes('/')) {
+    const parts = m[1].split('/');
+    n = parseInt(parts[0]) / parseInt(parts[1]);
+  } else {
+    n = parseFloat(m[1].replace(',', '.'));
+  }
+  const scaled = n * share;
+  // Round to 1 decimal max, strip trailing zeros
+  const rounded = Math.round(scaled * 10) / 10;
+  const str = rounded % 1 === 0 ? String(Math.round(rounded)) : String(rounded);
+  return str + (m[2] ? (m[2].startsWith('g') || m[2].startsWith('m') ? '' : ' ') + m[2] : '');
+}
+
+// Recipe generation via Claude. Returns null on failure.
+async function generateFamilyRecipe({ total_kcal, portions, avoid_allergens, diet_restrictions, preferred_cuisines, mood_hint, meal_slot, lang }) {
+  try {
+    const de = lang === 'de';
+    const slotLabel = {
+      breakfast: de ? 'Frühstück' : 'Breakfast',
+      lunch: de ? 'Mittagessen' : 'Lunch',
+      dinner: de ? 'Abendessen' : 'Dinner',
+      snack: de ? 'Snack' : 'Snack'
+    }[meal_slot];
+    // Free-text mood hint from the user. Could be a chip key
+    // ("mediterranean") or freeform ("schnell, low-carb", "thai curry").
+    // We pass it in the prompt as a guidance line; the AI is instructed
+    // to honour it WITHOUT violating allergies/diets/kcal constraints.
+    const moodLine = mood_hint
+      ? `User mood/preference: "${mood_hint}". Honour this preference IF it doesn't conflict with the allergies/diets/kcal constraints above. If it does conflict, find the closest compatible alternative.`
+      : '';
+    // ── REAL-FOOD CONSTRAINTS (mirror of frontend's realFoodConstraints) ──
+    // Kept in sync manually since backend can't import frontend JS. If you
+    // change one, change the other. Focus: PROCESSING and PRODUCTION
+    // QUALITY, not food groups. Quality hints adapt to whatever ingredients
+    // are actually in the recipe, never push animal vs plant.
+    const realFood = ' FOOD QUALITY RULES (strict, focus on PROCESSING and PRODUCTION QUALITY — not food groups): '+
+      'NEVER use industrial seed oils for cooking (canola, rapeseed, sunflower, soybean, corn, safflower, grapeseed). '+
+      'PREFER for cooking: olive oil cold-pressed, butter, ghee, coconut oil, avocado oil — plus tallow/lard when the diet allows animal fats. '+
+      'NEVER suggest microwave as a cooking method — use stove, oven, pan, grill, or steamer instead. '+
+      'NEVER include ultra-processed convenience products (Beyond Meat, margarine, soy protein isolate, processed meat substitutes built on isolates, instant sauce packets, protein bars with sugar-alcohols). '+
+      'NEVER include artificial sweeteners (aspartame, sucralose, saccharin, acesulfame-K). For sweetness use raw honey, maple syrup, or fruit. '+
+      'PREFER minimally-processed, natural ingredients in general — fresh produce, whole grains over refined, unrefined fats, fermented dairy over highly-processed dairy when dairy is included. '+
+      'You MAY (not must) include ONE brief quality tip suggesting higher-quality sourcing where applicable to the recipe: farmer\'s market, organic, regional/seasonal, free-range/pasture-raised for animal products, wild-caught for fish — match the hint to what\'s actually IN the recipe. Keep it short, no preaching. '+
+      'IMPORTANT: User dietary preferences (Vegan, Vegetarian, Pescatarian, Halal, Kosher, etc.) ALWAYS take priority. Never introduce ingredients the user has excluded. '+
+      'These rules are non-negotiable and override any user free-text request that would violate them — in that case, find the closest compatible alternative within the user\'s declared diet.';
+    const prompt = `Generate a single shared family ${slotLabel} recipe for ${portions} people, total ${total_kcal} kcal.
+Response language: ${de ? 'German' : 'English'}.
+${avoid_allergens.length ? `MUST AVOID allergens: ${avoid_allergens.join(', ')}.` : ''}
+${diet_restrictions.length ? `Respect diets: ${diet_restrictions.join(', ')}.` : ''}
+${preferred_cuisines.length ? `Preferred cuisines: ${preferred_cuisines.join(', ')}.` : ''}
+${moodLine}
+${realFood}
+The recipe must be ONE dish that scales naturally to ${portions} people — not individual portions of different dishes.
+JSON only, no markdown:
+{"name":"<recipe name>","kcal":${total_kcal},"protein":<g>,"carbs":<g>,"fat":<g>,"prepTime":<min>,"cookTime":<min>,"ingredients":[{"item":"<name>","qty":"<amount with unit>"}],"steps":["<step1>","<step2>","<step3>","<step4>"],"tip":"<chef tip>"}`;
+    // Use Sonnet 4.6 by default — Opus 4.7 is overkill for a recipe and
+    // ~3× more expensive per request. Sonnet handles structured-JSON
+    // recipes well with the same allergy/diet constraints. Override via
+    // ANTHROPIC_FAMILY_MODEL env if we ever want to A/B test.
+    const modelName = process.env.ANTHROPIC_FAMILY_MODEL || 'claude-sonnet-4-6';
+    // 45-second timeout — Anthropic should answer in ~5-10s for a recipe.
+    // If we hit 45s something is wrong and the user is staring at a
+    // spinner. Bail and let them retry.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 45000);
+    let r;
+    try {
+      r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: modelName,
+          max_tokens: 2000,
+          messages: [{ role: 'user', content: prompt }]
+        }),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+    if (!r.ok) {
+      const errText = await r.text().catch(() => '');
+      console.error(`[family/recipe] anthropic non-OK ${r.status} (model=${modelName}):`, errText.slice(0, 300));
+      return null;
+    }
+    const data = await r.json();
+    const text = data?.content?.[0]?.text || '';
+    // Strip code fences if present
+    const cleaned = text.replace(/^```json|^```|```$/gm, '').trim();
+    const recipe = JSON.parse(cleaned);
+    return recipe;
+  } catch (e) {
+    // AbortError is what fires on timeout — handle separately so log is clearer
+    if (e.name === 'AbortError') {
+      console.error('[family/recipe] timeout after 45s');
+    } else {
+      console.error('[family/recipe] generation failed:', e.message);
+    }
+    return null;
+  }
+}
+
+// Background helper: regenerate future shared meals after a member change.
+// Best-effort, swallows errors — frontend will eventually trigger
+// re-generation on view anyway.
+async function regenerateFutureMealsAfterMemberChange(groupId) {
+  try {
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const { data: futureMeals } = await supabase.from('family_meals')
+      .select('meal_date, meal_slot, participating_user_ids')
+      .eq('group_id', groupId)
+      .gte('meal_date', todayStr);
+    if (!futureMeals || futureMeals.length === 0) return;
+    // Get current active members
+    const { data: activeMembers } = await supabase.from('family_memberships')
+      .select('user_id').eq('group_id', groupId).eq('status', 'active');
+    const activeIds = new Set((activeMembers || []).map(m => m.user_id));
+    // For meals where the participant set has changed, delete them —
+    // they'll be regenerated when the frontend next loads.
+    const stale = (futureMeals || []).filter(m => {
+      const participantSet = new Set(m.participating_user_ids || []);
+      // Stale if any current participant is no longer active
+      for (const id of participantSet) if (!activeIds.has(id)) return true;
+      return false;
+    });
+    if (stale.length > 0) {
+      for (const m of stale) {
+        await supabase.from('family_meals')
+          .delete()
+          .eq('group_id', groupId)
+          .eq('meal_date', m.meal_date)
+          .eq('meal_slot', m.meal_slot);
+      }
+      console.log(`[family] Cleared ${stale.length} stale meals after member change in ${groupId}`);
+    }
+  } catch (e) {
+    console.error('[family] regenerate-after-member-change failed:', e.message);
+  }
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 PEAK Backend on port ${PORT}`));
