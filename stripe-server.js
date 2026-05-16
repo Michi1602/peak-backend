@@ -1454,6 +1454,13 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
       saturated_fat: round(satFatPer100 * factor),
       nutri_score: (p.nutriscore_grade || '').toUpperCase() || null,
       image: p.image_small_url || p.image_thumb_url || null,
+      // v71: send raw ingredient text for PEAK-Score evaluation client-
+      // side. OpenFoodFacts gives us both lang-specific (ingredients_text_de,
+      // ingredients_text_en) and a generic ingredients_text. We prefer
+      // lang-specific where available so PEAK_SCORE_PATTERNS can match
+      // German terms ("rapsöl") AND English terms ("canola oil") since
+      // either may appear.
+      ingredients_text: p.ingredients_text_de || p.ingredients_text_en || p.ingredients_text || '',
     };
 
     // Simple fit-rating — not AI, just heuristics (saves a roundtrip)
