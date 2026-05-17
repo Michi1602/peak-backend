@@ -19,6 +19,18 @@ const crypto = require('crypto');
 // price would only surface when a user tried to upgrade, returning a
 // 500 they couldn't recover from. Failing at boot makes deploy
 // problems visible immediately.
+// Audit Pass 5 #8.4: Stripe price IDs added to the required list. They
+// were previously checked lazily inside /create-checkout — a missing
+// price would only surface when a user tried to upgrade, returning a
+// 500 they couldn't recover from. Failing at boot makes deploy
+// problems visible immediately.
+//
+// Naming convention note: this codebase supports BOTH naming styles
+// for the Premium price IDs:
+//   • STRIPE_PRICE_PREMIUM_MONTHLY / STRIPE_PRICE_PREMIUM_ANNUAL (new)
+//   • STRIPE_PRICE_MONTHLY / STRIPE_PRICE_ANNUAL (legacy — Premium-only era)
+// Either pair satisfies the boot check. The Basic price IDs must use
+// the explicit STRIPE_PRICE_BASIC_* names — there's no legacy form.
 const REQUIRED_ENV = [
   'STRIPE_SECRET_KEY',
   'STRIPE_WEBHOOK_SECRET',
@@ -28,10 +40,15 @@ const REQUIRED_ENV = [
   'RESEND_API_KEY',
   'STRIPE_PRICE_BASIC_MONTHLY',
   'STRIPE_PRICE_BASIC_ANNUAL',
-  'STRIPE_PRICE_PREMIUM_MONTHLY',
-  'STRIPE_PRICE_PREMIUM_ANNUAL',
 ];
 const MISSING_ENV = REQUIRED_ENV.filter(k => !process.env[k]);
+// Premium price IDs: accept either new or legacy naming, but require one of each.
+if (!process.env.STRIPE_PRICE_PREMIUM_MONTHLY && !process.env.STRIPE_PRICE_MONTHLY) {
+  MISSING_ENV.push('STRIPE_PRICE_PREMIUM_MONTHLY (or legacy STRIPE_PRICE_MONTHLY)');
+}
+if (!process.env.STRIPE_PRICE_PREMIUM_ANNUAL && !process.env.STRIPE_PRICE_ANNUAL) {
+  MISSING_ENV.push('STRIPE_PRICE_PREMIUM_ANNUAL (or legacy STRIPE_PRICE_ANNUAL)');
+}
 if (MISSING_ENV.length) {
   console.error('═══════════════════════════════════════════════════════════════');
   console.error('❌ FATAL: Missing required environment variables:');
@@ -6043,6 +6060,37 @@ process.on('uncaughtException', (err) => {
   // Hard ceiling — never block restart longer than this.
   setTimeout(() => process.exit(1), 10000).unref();
 });
+
+// ── SIGTERM / SIGINT GRACEFUL SHUTDOWN (audit Pass 7 §2.2) ────────────
+// Render sends SIGTERM at the start of every redeploy. Without this
+// handler, in-flight requests get an abrupt connection-reset (visible
+// as 502 to the client). With it, the server stops accepting new
+// connections, lets existing ones finish, then exits cleanly. The 10s
+// ceiling matches the uncaughtException handler so a wedged request
+// can never block redeploys indefinitely.
+//
+// SIGINT is included so Ctrl+C during local dev does the same thing.
+// exit code 0 here (planned shutdown) vs 1 above (crash).
+function __gracefulShutdown(signal) {
+  if (__shuttingDown) return;
+  __shuttingDown = true;
+  console.log(`🛑 ${signal} received — draining in-flight requests and shutting down.`);
+  try {
+    if (typeof __peakServer !== 'undefined' && __peakServer && __peakServer.close) {
+      __peakServer.close(() => process.exit(0));
+    } else {
+      process.exit(0);
+    }
+  } catch (_) {
+    process.exit(0);
+  }
+  setTimeout(() => {
+    console.warn('⚠️  Forced exit after 10s drain ceiling.');
+    process.exit(0);
+  }, 10000).unref();
+}
+process.on('SIGTERM', () => __gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => __gracefulShutdown('SIGINT'));
 
 // ════════════════════════════════════════════════════════════════════════
 // FAMILY PLAN (May 2026)
