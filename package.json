@@ -1,6 +1,6 @@
 {
   "name": "peak-backend",
-  "version": "1.0.0",
+  "version": "1.0.72",
   "main": "stripe-server.js",
   "scripts": {
     "start": "node stripe-server.js",
@@ -16,8 +16,6 @@
     "express-rate-limit": "^7.4.0",
     "helmet": "^7.1.0",
     "node-cron": "^3.0.3",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
     "resend": "^3.2.0",
     "stripe": "^14.0.0"
   }
