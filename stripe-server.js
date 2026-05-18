@@ -2437,10 +2437,8 @@ Beispiele für zu vage:
 Nicht zu vage sind: konkrete Gerichte mit Zutaten ("Putenschnitzel mit Kartoffelsalat"), Alltagsprodukte ("2 Bier", "ein Apfel"), zusammengesetzte Angaben.
 ${isFollowup ? 'DIES IST BEREITS EINE PRÄZISIERUNG — schätze jetzt, stelle KEINE weitere Rückfrage mehr.' : ''}
 
-EMOJI: Wähle passendes Emoji aus: 🍽️ (allgemein), 🥩 (Fleisch), 🍗 (Geflügel), 🐟 (Fisch), 🥗 (Salat), 🍝 (Pasta), 🍕 (Pizza), 🍔 (Burger), 🌯 (Wrap), 🍜 (Suppe), 🍲 (Eintopf), 🥘 (Hauptgericht), 🍚 (Reis), 🥐 (Gebäck), 🥖 (Brot), 🍳 (Eier), 🥞 (Pancakes), 🍫 (Schokolade), 🍪 (Süß), 🍎 (Obst), 🥜 (Nüsse), 🍺 (Bier), 🍷 (Wein), ☕ (Kaffee), 🍵 (Tee), 💧 (Wasser).
-
 Antworte AUSSCHLIESSLICH als JSON (kein Markdown, keine Erklärung):
-- Bei klarem Input: {"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>,"emoji":"<emoji>","label":"<kurze Beschreibung max 50 Zeichen>"}
+- Bei klarem Input: {"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>,"label":"<kurze Beschreibung max 50 Zeichen>"}
 - Bei zu vagem Input: {"needsClarification":true,"question":"<eine prägnante Rückfrage>"}`
       : `You are a precise nutrition analyst. User entered:${userInputBlock}
 
@@ -2473,10 +2471,8 @@ Examples of too vague:
 Not too vague: specific dishes with ingredients ("turkey schnitzel with potato salad"), everyday items ("2 beers", "an apple"), composed descriptions.
 ${isFollowup ? 'THIS IS ALREADY A CLARIFICATION — estimate now, DO NOT ask further questions.' : ''}
 
-EMOJI: Pick fitting emoji from: 🍽️ (general), 🥩 (meat), 🍗 (poultry), 🐟 (fish), 🥗 (salad), 🍝 (pasta), 🍕 (pizza), 🍔 (burger), 🌯 (wrap), 🍜 (soup), 🍲 (stew), 🥘 (main), 🍚 (rice), 🥐 (pastry), 🥖 (bread), 🍳 (eggs), 🥞 (pancakes), 🍫 (chocolate), 🍪 (sweet), 🍎 (fruit), 🥜 (nuts), 🍺 (beer), 🍷 (wine), ☕ (coffee), 🍵 (tea), 💧 (water).
-
 Respond ONLY as JSON (no markdown, no explanation):
-- Clear input: {"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>,"emoji":"<emoji>","label":"<short description max 50 chars>"}
+- Clear input: {"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>,"label":"<short description max 50 chars>"}
 - Too vague: {"needsClarification":true,"question":"<one concise follow-up question>"}`;
 
     const modelName = resolveModel('quicklog', 'claude-haiku-4-5-20251001');
@@ -2530,7 +2526,6 @@ Respond ONLY as JSON (no markdown, no explanation):
       protein: Math.max(0, Math.round(Number(parsed.protein) || 0)),
       carbs: Math.max(0, Math.round(Number(parsed.carbs) || 0)),
       fat: Math.max(0, Math.round(Number(parsed.fat) || 0)),
-      emoji: (typeof parsed.emoji === 'string' && parsed.emoji.length <= 4) ? parsed.emoji : '🍽️',
       label: (typeof parsed.label === 'string' ? parsed.label : combinedText).slice(0, 80),
     };
 
@@ -5365,7 +5360,7 @@ async function sendEmail(to, type, data) {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return `Am <strong>${endDate}</strong> endet dein ${label}-Zugang. Bis dahin: volle Power — Pläne anpassen, Workouts tracken, Rezepte checken.`;
     },
-    cancelReminderBox: '💡 <strong>Noch nicht sicher?</strong> Du kannst jederzeit zurückkehren — dein Profil und deine Fortschritte bleiben 30 Tage erhalten.',
+    cancelReminderBox: '<strong>Noch nicht sicher?</strong> Du kannst jederzeit zurückkehren — dein Profil und deine Fortschritte bleiben 30 Tage erhalten.',
     cancelReminderCTA: 'Jetzt PEAK nutzen',
     cancelFinalSubject: (tier) => {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
@@ -5491,7 +5486,7 @@ async function sendEmail(to, type, data) {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return `Your ${label} access ends on <strong>${endDate}</strong>. Until then: full power — tune plans, track workouts, check recipes.`;
     },
-    cancelReminderBox: '💡 <strong>Still deciding?</strong> You can come back anytime — your profile and progress are kept for 30 days.',
+    cancelReminderBox: '<strong>Still deciding?</strong> You can come back anytime — your profile and progress are kept for 30 days.',
     cancelReminderCTA: 'Use PEAK now',
     cancelFinalSubject: (tier) => `Your PEAK ${tier === 'basic' ? 'Basic' : 'Premium'} has ended`,
     cancelFinalLabel: (tier) => `${tier === 'basic' ? 'Basic' : 'Premium'} ended`,
@@ -5565,7 +5560,7 @@ async function sendEmail(to, type, data) {
           <h1 class="email-h1" style="margin:0 0 14px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
             ${L.welcomeH1a}<br>${isFree ? L.welcomeH1FreeB : L.welcomeH1b}
           </h1>
-          ${goalHeadline ? `<p style="margin:0 0 18px;font-family:${FONT_HEAD};font-size:13px;font-weight:700;letter-spacing:2px;color:${BRAND.red};text-transform:uppercase;">🎯 ${goalHeadline}</p>` : ''}
+          ${goalHeadline ? `<p style="margin:0 0 18px;font-family:${FONT_HEAD};font-size:13px;font-weight:700;letter-spacing:2px;color:${BRAND.red};text-transform:uppercase;">${goalHeadline}</p>` : ''}
           <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
             ${L.welcomeIntro(tier, goal, sport, trialDays)}
           </p>
