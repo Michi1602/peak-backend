@@ -695,20 +695,27 @@ app.get('/unsubscribe', async (req, res) => {
   const email = verifyUnsubscribeToken(token);
   if (!email) {
     return res.status(400).send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><title>Link ungültig</title>
-    <style>body{font-family:sans-serif;max-width:480px;margin:80px auto;padding:0 20px;text-align:center}</style>
+    <style>
+      body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;max-width:480px;margin:80px auto;padding:0 20px;text-align:center;background:#F0EBE0;color:#1A1410}
+      h1{font-family:'Cinzel','Georgia',serif;font-weight:600;letter-spacing:2px;text-transform:uppercase;font-size:18px;color:#0A1420}
+      a.btn{display:inline-block;background:#E8B86B;color:#0A1420;padding:14px 28px;text-decoration:none;font-family:'Cinzel','Georgia',serif;font-weight:600;font-size:12px;letter-spacing:2.5px;text-transform:uppercase;margin-top:20px}
+    </style>
     </head><body>
     <h1>Link ungültig oder abgelaufen</h1>
-    <p style="color:#666">Bitte logge dich in der App ein und melde dich in den Einstellungen ab.<br><br>This link is invalid or expired. Please log in and unsubscribe from settings.</p>
-    <a href="${FRONTEND_URL}" style="display:inline-block;background:#2D6A4F;color:#fff;padding:12px 24px;border-radius:10px;text-decoration:none;font-weight:600;margin-top:20px">Zur App</a>
+    <p style="color:#6B5D4A">Bitte logge dich in der App ein und melde dich in den Einstellungen ab.<br><br>This link is invalid or expired. Please log in and unsubscribe from settings.</p>
+    <a href="${FRONTEND_URL}" class="btn">Zur App</a>
     </body></html>`);
   }
   await supabase.from('users').update({ unsubscribed: true }).eq('email', email);
   res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><title>Abgemeldet</title>
-  <style>body{font-family:sans-serif;max-width:480px;margin:80px auto;padding:0 20px;text-align:center}
-  .btn{display:inline-block;background:#2D6A4F;color:#fff;padding:12px 24px;border-radius:10px;text-decoration:none;font-weight:600;margin-top:20px}</style>
+  <style>
+    body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;max-width:480px;margin:80px auto;padding:0 20px;text-align:center;background:#F0EBE0;color:#1A1410}
+    h1{font-family:'Cinzel','Georgia',serif;font-weight:600;letter-spacing:2px;text-transform:uppercase;font-size:18px;color:#0A1420}
+    .btn{display:inline-block;background:#E8B86B;color:#0A1420;padding:14px 28px;text-decoration:none;font-family:'Cinzel','Georgia',serif;font-weight:600;font-size:12px;letter-spacing:2.5px;text-transform:uppercase;margin-top:20px}
+  </style>
   </head><body>
-  <h1>✅ Du wurdest abgemeldet</h1>
-  <p style="color:#666">Du erhältst keine weiteren E-Mails von PEAK.<br><br>You have been unsubscribed from PEAK emails.</p>
+  <h1>Du wurdest abgemeldet</h1>
+  <p style="color:#6B5D4A">Du erhältst keine weiteren E-Mails von PEAK.<br><br>You have been unsubscribed from PEAK emails.</p>
   <a href="${FRONTEND_URL}" class="btn">Zurück zur App</a>
   </body></html>`);
 });
