@@ -2071,7 +2071,12 @@ app.post('/ai/generate', aiLimiter, mediumJson, async (req, res) => {
       return res.status(500).json({ error: 'AI service not configured' });
     }
 
-    const modelName = resolveModel('plan', 'claude-opus-4-7');
+    // Plan generation uses Sonnet 4.6 (not Opus): structured JSON with
+    // detailed but well-defined schema, Sonnet handles it cleanly and
+    // costs ~5x less per call than Opus. Opus 4.7 stays available via
+    // ANTHROPIC_PLAN_MODEL env override if a future plan-gen workload
+    // needs the extra reasoning headroom.
+    const modelName = resolveModel('plan', 'claude-sonnet-4-6');
     // Token cap: 2000 was the legacy default for single-meal/day plans.
     // Raised to 12000 so the 14-day meal pool (≈9k output) fits with
     // headroom. 12k is a deliberate ceiling — anything over that signals
