@@ -129,6 +129,11 @@ const ALLOWED_ORIGINS = [
   // production alias https://peak-frontend.vercel.app was blocked,
   // breaking every backend call from any user who landed on that URL.
   'https://peak-frontend.vercel.app',
+  // Explicit staging alias — added May 2026 after staging CORS rejection
+  // surfaced live. The Vercel regex below SHOULD also match this, but
+  // hardcoding the known-stable staging alias removes one moving part.
+  'https://peak-frontend-env-staging-michi1602s-projects.vercel.app',
+  'https://peak-frontend-env-staging.vercel.app',
 ];
 
 // Audit Pass 2 #5.13: Vercel user-slug for preview-deploy CORS regex,
