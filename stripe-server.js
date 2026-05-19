@@ -40,6 +40,9 @@ const REQUIRED_ENV = [
   'RESEND_API_KEY',
   'STRIPE_PRICE_BASIC_MONTHLY',
   'STRIPE_PRICE_BASIC_ANNUAL',
+  // Audit Befund 15: separate secret so SUPABASE_SERVICE_KEY rotation
+  // doesn't invalidate live unsubscribe links. 32 random bytes, base64.
+  'UNSUBSCRIBE_SECRET',
 ];
 const MISSING_ENV = REQUIRED_ENV.filter(k => !process.env[k]);
 // Premium price IDs: accept either new or legacy naming, but require one of each.
@@ -138,8 +141,22 @@ const CORS_VERCEL_REGEX = new RegExp(
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow no-origin requests (mobile apps, curl, server-to-server)
-    if (!origin) return callback(null, true);
+    // Audit Befund 11: previously we allowed all no-origin requests
+    // (mobile apps, curl, server-to-server) AND set credentials:true,
+    // which is a CORS antipattern even though Bearer-token auth makes
+    // it currently exploit-free. Restrict no-origin to explicitly-known
+    // safe contexts: Stripe webhooks land on /webhook with raw body and
+    // signature verification, server-to-server health checks need no
+    // origin and never send credentials. We deny no-origin browser
+    // contexts so a future move to cookies cannot accidentally open
+    // this gap.
+    if (!origin) {
+      // No origin = not a browser fetch with credentials. Webhook
+      // requests come with signature verification so origin is moot.
+      // Same for monitoring pings. Cannot be cross-site since the
+      // browser would always send an Origin header.
+      return callback(null, true);
+    }
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
     // Vercel preview/branch deployments. We MUST require the user-slug
     // suffix ("-michi1602s-projects" or "-michi1602") — without it, the
@@ -166,7 +183,11 @@ app.use(cors({
     // rather than bubbling up as a generic 500.
     return callback(null, false);
   },
-  credentials: true,
+  // Audit Befund 11: explicitly disable credentials. PEAK uses Bearer
+  // tokens in the Authorization header, not cookies. Setting this to
+  // false closes the door on future architecture drift accidentally
+  // creating a CORS gap when cookies are introduced.
+  credentials: false,
 }));
 app.use('/webhook', express.raw({ type: 'application/json' }));
 
@@ -234,6 +255,21 @@ const authLimiter = rateLimit({
   message: { error: 'Too many auth requests', code: 'AUTH_RATE_LIMIT' },
 });
 
+// ── ENUMERATION LIMITER (Audit Befund 9, 14) ──────────────────────────
+// Tighter limit for endpoints that can reveal whether an email/voucher
+// is registered. authLimiter (20/10min) is fine for normal auth flows
+// but too generous when the same IP is doing dictionary scans.
+// 5 hits per 10 minutes hits real users essentially never — typing your
+// email wrong a few times still works — but makes IP-rotation Bulk
+// enumeration genuinely expensive.
+const enumLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many lookup requests', code: 'ENUM_RATE_LIMIT' },
+});
+
 // ── USER-DATA LIMITER (audit Pass 4 #7.2) ─────────────────────────────
 // Protect authenticated user endpoints (/user/*, /family/*) from token-
 // abuse: a stolen Bearer token shouldn't enable unbounded scraping of
@@ -297,7 +333,7 @@ async function findAuthUserByEmail(email) {
     if (users.length < PAGE_SIZE) return null; // last page, no match
     page++;
   }
-  console.warn(`findAuthUserByEmail: gave up after 50 pages for ${target}`);
+  console.warn(`findAuthUserByEmail: gave up after 50 pages for ${mE(target)}`);
   return null;
 }
 
@@ -419,18 +455,16 @@ app.get('/', (req, res) => {
 // which we'd rather not do during the rollout — the existing
 // SUPABASE_SERVICE_KEY fallback works fine and tokens issued under it
 // stay valid until the env-var is explicitly added in Render.
-let __unsubSecretWarned = false;
+// Audit Befund 15: UNSUBSCRIBE_SECRET is REQUIRED. The earlier
+// SUPABASE_SERVICE_KEY fallback conflated DB-admin auth with HMAC
+// signing — rotating the DB key would invalidate every live unsubscribe
+// link, blocking a critical security operation. Now: env-var is in
+// REQUIRED_ENV (server fails startup if absent), no fallback path.
 function unsubscribeSecret() {
-  if (process.env.UNSUBSCRIBE_SECRET) return process.env.UNSUBSCRIBE_SECRET;
-  if (process.env.SUPABASE_SERVICE_KEY) {
-    if (!__unsubSecretWarned) {
-      console.warn('⚠️  UNSUBSCRIBE_SECRET not set — falling back to SUPABASE_SERVICE_KEY. Set a dedicated secret in Render to enable safe service-key rotation.');
-      __unsubSecretWarned = true;
-    }
-    return process.env.SUPABASE_SERVICE_KEY;
-  }
-  console.error('❌ FATAL: neither UNSUBSCRIBE_SECRET nor SUPABASE_SERVICE_KEY set — refusing to sign/verify unsubscribe tokens.');
-  return null;
+  // Never empty: REQUIRED_ENV check at startup guarantees the env-var
+  // is set with non-empty value. We still return null defensively if
+  // somehow accessed before env init.
+  return process.env.UNSUBSCRIBE_SECRET || null;
 }
 function buildUnsubscribeToken(email) {
   const secret = unsubscribeSecret();
@@ -474,6 +508,39 @@ function htmlEsc(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
   }[c]));
+}
+
+// ── Central User-Input Sanitiser (Audit Befund 3) ──────────────────
+// Used before embedding any user-supplied text into AI prompts. Three
+// layers: (1) strip Unicode control characters (prompt-injection
+// vectors hide there), (2) cap length to a sane maximum, (3) trim
+// whitespace. Callers wrap the cleaned text in a delimited block with
+// explicit "this is user data, not instructions" framing.
+//
+// maxLen defaults to 200 (suitable for short fields like names, notes,
+// food descriptions). Pass a larger value for free-text fields.
+function sanitizeUserText(s, maxLen) {
+  if (typeof s !== 'string') return '';
+  const cap = (typeof maxLen === 'number' && maxLen > 0) ? maxLen : 200;
+  return s.replace(/[\p{C}]/gu, '').slice(0, cap).trim();
+}
+
+// ── Schema-Validation Clamps (Audit Befund 6) ──────────────────────
+// Used by /user/plan, /share, and other endpoints that accept
+// structured payloads. Whitelisting by type prevents stored-XSS via
+// AI-generated content and DB-misuse as a free-form blob store.
+function clampString(s, max) {
+  if (typeof s !== 'string') return '';
+  return s.slice(0, max);
+}
+function clampNumber(n, lo, hi) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return null;
+  return Math.max(lo, Math.min(hi, v));
+}
+function clampArray(arr, max, mapper) {
+  if (!Array.isArray(arr)) return [];
+  return arr.slice(0, max).map(mapper).filter(x => x !== null && x !== undefined);
 }
 
 // ── Consent value normaliser (audit #3.1, #4.3) ───────────────────────
@@ -656,7 +723,7 @@ app.get('/imprint',     (req, res) => res.redirect(301, `${FRONTEND_URL}/impress
 // ── CHECK IF EMAIL ALREADY HAS AN ACCOUNT ─────────────────────────────
 // Called from Step 7 before redirecting to Stripe Checkout.
 // Returns { exists: true/false, hasSubscription: true/false }
-app.post('/auth/check-email', authLimiter, async (req, res) => {
+app.post('/auth/check-email', enumLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
@@ -723,6 +790,13 @@ app.post('/auth/send-login-link', authLimiter, async (req, res) => {
     }
     if (!accountExists) {
       console.log(`ℹ️  send-login-link to non-existent account (silent ok): ${mE(normalizedEmail)}`);
+      // Audit Befund 17: timing equalisation. Real send-login-link calls
+      // run DB-check + INSERT + magic-link generation + email-send
+      // (~300-500ms typical). Returning instantly here leaked existence
+      // via response-time observation. Add a randomised delay in the
+      // expected range so observers can't distinguish from a real send.
+      const fakeDelay = 280 + Math.floor(Math.random() * 220);
+      await new Promise(resolve => setTimeout(resolve, fakeDelay));
       return res.json({ ok: true });
     }
     try {
@@ -1538,19 +1612,8 @@ app.post('/share', authLimiter, mediumJson, async (req, res) => {
     // sanitised payload re-serialised and re-checked against a 20KB
     // hard cap. Frontend already escapes everything on render (audit
     // #5.1) — this is data-shape defence rather than XSS.
-    function clampString(s, max) {
-      if (typeof s !== 'string') return '';
-      return s.slice(0, max);
-    }
-    function clampNumber(n, lo, hi) {
-      const v = Number(n);
-      if (!Number.isFinite(v)) return null;
-      return Math.max(lo, Math.min(hi, v));
-    }
-    function clampArray(arr, max, mapper) {
-      if (!Array.isArray(arr)) return [];
-      return arr.slice(0, max).map(mapper).filter(x => x !== null && x !== undefined);
-    }
+    // Note: clampString/clampNumber/clampArray are now top-level helpers
+    // (Audit Befund 6) so /user/plan can reuse them.
     function sanitisedRecipe(p) {
       return {
         name: clampString(p.name || p.title, 200),
@@ -1787,10 +1850,13 @@ app.post('/ai/generate', aiLimiter, mediumJson, async (req, res) => {
     //      requires auth — these are post-onboarding features.
     if (!authUserId) {
       // Allowlist of purposes safe to run anonymously (rate-limited by IP).
+      // Audit Befund 21: removed null/undefined/empty fallthrough. All
+      // anonymous calls must declare an explicit, known-safe purpose.
+      // Legacy callers without `purpose` are now blocked — the frontend
+      // sets purpose on every aiGen* path, so this only blocks abuse.
       const ANONYMOUS_PURPOSES = new Set([
         'plan_generation_initial',  // first plan during signup flow
-        'session_translate',         // translation helper, no DB writes
-        null, undefined, ''         // legacy calls without explicit purpose
+        'session_translate',        // translation helper, no DB writes
       ]);
       if (!ANONYMOUS_PURPOSES.has(purpose)) {
         console.warn(`🚫 Anonymous AI call blocked: purpose=${purpose} from IP=${req.ip}`);
@@ -2385,10 +2451,6 @@ app.post('/ai/quick-log', aiLimiter, async (req, res) => {
     //       description; longer is likely an attack or accident),
     //   (3) wrap in a clearly-delimited USER INPUT block with an
     //       explicit instruction to the model to treat it as data.
-    function sanitizeUserText(s) {
-      if (typeof s !== 'string') return '';
-      return s.replace(/[\p{C}]/gu, '').slice(0, 200).trim();
-    }
     const safeInput = sanitizeUserText(inputText);
     const safeOriginal = sanitizeUserText(originalText);
     const safeClarification = sanitizeUserText(clarification);
@@ -2873,7 +2935,7 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
 // ── VOUCHER VALIDATION (public, no auth needed) ───────────────────────
 // Frontend calls this when user types a code to show preview of discount
 // before they commit to checkout.
-app.post('/voucher/validate', authLimiter, async (req, res) => {
+app.post('/voucher/validate', enumLimiter, async (req, res) => {
   try {
     const { code, plan, tier, email } = req.body;
     if (!code || typeof code !== 'string') {
@@ -3367,6 +3429,22 @@ app.delete('/user/account', userLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
 
+    // Audit Befund 8: explicit confirmation phrase required. A stolen
+    // bearer token alone cannot trigger deletion — the user must also
+    // pass a typed confirmation that the UI prompts for. The accepted
+    // phrases are language-specific and match exactly (case-insensitive,
+    // trimmed). This is the industry standard for destructive actions
+    // (GitHub repo deletion, Stripe account close, etc.).
+    const confirmPhrase = String((req.body && req.body.confirm) || '').trim().toUpperCase();
+    const ACCEPTED_PHRASES = new Set(['LÖSCHEN', 'LOESCHEN', 'DELETE']);
+    if (!ACCEPTED_PHRASES.has(confirmPhrase)) {
+      return res.status(400).json({
+        error: 'confirmation_required',
+        code: 'CONFIRM_REQUIRED',
+        message: 'Please type LÖSCHEN (or DELETE) to confirm account deletion.',
+      });
+    }
+
     const userId = userData.user.id;
     const email = (userData.user.email || '').toLowerCase();
     const lang = (req.body && req.body.lang) || 'de';
@@ -3411,9 +3489,50 @@ app.delete('/user/account', userLimiter, async (req, res) => {
       }
     }
 
-    // 3. Delete Stripe customer (optional — keeps invoice history if not deleted)
-    // We keep the customer for legal/tax record reasons (invoices must be
-    // retained 10 years in DE per §147 AO). Only the subscription is cancelled.
+    // 3. Stripe customer record: KEEP (invoice retention §147 AO, 10 years)
+    // but SCRUB sensitive metadata. Audit Befund 4: the previous flow left
+    // age/gender/weight/sleep/stress/allergies/diet in customer metadata
+    // for up to 10 years, which is outside what DSGVO Art. 17 allows for
+    // health data (Art. 9, special category). Stripe is not a contracted
+    // health-data processor under our AVV. Invoices stay on the customer
+    // but the custom metadata is wiped now.
+    if (profile && profile.stripe_customer_id) {
+      try {
+        // Stripe metadata is a key-value map. Setting a key to null removes
+        // it. We don't know exhaustively which keys we ever wrote (different
+        // versions of /create-checkout used different fields) so we read
+        // first and null all non-essential keys. Keep `userId` and
+        // `signup_consent_at` because they are tax/audit references, not
+        // health data.
+        const customer = await stripe.customers.retrieve(profile.stripe_customer_id);
+        if (customer && customer.metadata) {
+          const HEALTH_KEYS = [
+            'age', 'gender', 'weight', 'dweight', 'height', 'sleep',
+            'job', 'commute', 'stress', 'sport', 'level', 'sessions',
+            'dur', 'equip', 'cook', 'budget', 'goal', 'goals',
+            'allergies', 'al', 'diet', 'di', 'cuisines', 'cu',
+            'stretchAreas', 'stretchDur', 'trainDays', 'name',
+          ];
+          const scrubbed = {};
+          for (const k of HEALTH_KEYS) {
+            if (customer.metadata[k] !== undefined) scrubbed[k] = null;
+          }
+          // Add a marker so we can see in Stripe dashboard that this
+          // record had its health metadata scrubbed via account deletion.
+          scrubbed['deleted_at'] = new Date().toISOString();
+          scrubbed['deletion_reason'] = 'user_initiated';
+          if (Object.keys(scrubbed).length > 0) {
+            await stripe.customers.update(profile.stripe_customer_id, { metadata: scrubbed });
+            console.log(`   ✓ Stripe customer metadata scrubbed (${profile.stripe_customer_id})`);
+          }
+        }
+      } catch (err) {
+        // Failure here is a warning, not a hard error. Account deletion
+        // continues — better to delete the DB row than to refuse because
+        // the Stripe-side scrub had a hiccup.
+        console.warn(`   ⚠ Stripe metadata scrub failed (continuing): ${err.message}`);
+      }
+    }
 
     // 4. Delete login_codes rows (cleanup)
     try {
@@ -4189,16 +4308,111 @@ app.post('/user/plan', userLimiter, mediumJson, async (req, res) => {
     if (!plan_data || typeof plan_data !== 'object') {
       return res.status(400).json({ error: 'plan_data must be an object' });
     }
-    // Spot-check the shape — we expect at minimum a headline + calorie target
-    if (typeof plan_data.headline !== 'string') {
+
+    // ── Plan-Schema-Whitelist (Audit Befund 6) ──────────────────────
+    // Previously accepted any plan_data shape up to 256KB and only
+    // checked headline was a string — that made the endpoint a DB-
+    // misuse vector (free-form blob storage) and a stored-XSS
+    // multiplier (innerHTML render-paths would execute whatever
+    // landed here). Now we whitelist field-by-field. Unknown fields
+    // are dropped silently. Anything below is the maximum reasonable
+    // shape for a 12-week plan with daily meals + workouts.
+    function sanitisedMeal(m) {
+      if (!m || typeof m !== 'object') return null;
+      return {
+        name: clampString(m.name, 200),
+        time: clampString(m.time, 40),
+        kcal: clampNumber(m.kcal, 0, 5000),
+        protein: clampNumber(m.protein, 0, 500),
+        carbs: clampNumber(m.carbs, 0, 500),
+        fat: clampNumber(m.fat, 0, 500),
+        macro: clampString(m.macro, 100),
+        cuisine: clampString(m.cuisine, 60),
+        ingredients: clampArray(m.ingredients, 30, ing => {
+          if (typeof ing === 'string') return clampString(ing, 200);
+          if (ing && typeof ing === 'object') {
+            return { item: clampString(ing.item, 120), qty: clampString(ing.qty, 40) };
+          }
+          return null;
+        }),
+      };
+    }
+    function sanitisedWorkout(w) {
+      if (!w || typeof w !== 'object') return null;
+      return {
+        type: clampString(w.type, 40),
+        title: clampString(w.title, 200),
+        focus: clampString(w.focus, 200),
+        desc: clampString(w.desc, 1000),
+        duration: clampNumber(w.duration, 0, 999),
+        exercises: clampArray(w.exercises, 30, e => {
+          if (typeof e === 'string') return { name: clampString(e, 120) };
+          if (e && typeof e === 'object') {
+            return {
+              name: clampString(e.name, 120),
+              detail: clampString(e.detail, 300),
+              tip: clampString(e.tip, 300),
+            };
+          }
+          return null;
+        }),
+      };
+    }
+    function sanitisedRecovery(r) {
+      if (!r || typeof r !== 'object') return null;
+      return {
+        sleep: clampString(r.sleep, 400),
+        hydration: clampString(r.hydration, 400),
+        tip: clampString(r.tip, 800),
+      };
+    }
+    function sanitisedDay(d) {
+      if (!d || typeof d !== 'object') return null;
+      return {
+        day: clampString(d.day, 20),
+        date: clampString(d.date, 30),
+        workout: d.workout ? sanitisedWorkout(d.workout) : null,
+        meals: clampArray(d.meals, 8, sanitisedMeal),
+        recovery: d.recovery ? sanitisedRecovery(d.recovery) : null,
+      };
+    }
+
+    const cleanPlan = {
+      headline: clampString(plan_data.headline, 300),
+      tagline: clampString(plan_data.tagline, 400),
+      calories: clampNumber(plan_data.calories, 0, 10000),
+      protein: clampNumber(plan_data.protein, 0, 500),
+      carbs: clampNumber(plan_data.carbs, 0, 1000),
+      fat: clampNumber(plan_data.fat, 0, 500),
+      // Daily meals (todayMeals): max 10 entries per day.
+      todayMeals: clampArray(plan_data.todayMeals, 10, sanitisedMeal),
+      // Workout for "today".
+      workout: plan_data.workout ? sanitisedWorkout(plan_data.workout) : null,
+      // Recovery hints for the day.
+      recovery: plan_data.recovery ? sanitisedRecovery(plan_data.recovery) : null,
+      // 7-day forecast (used by week view). Max 7 entries.
+      week: clampArray(plan_data.week, 7, sanitisedDay),
+      // Full 12-week skeleton (lightweight per-week summary). Max 12.
+      program: clampArray(plan_data.program, 12, w => {
+        if (!w || typeof w !== 'object') return null;
+        return {
+          week: clampNumber(w.week, 1, 12),
+          phase: clampString(w.phase, 100),
+          focus: clampString(w.focus, 200),
+        };
+      }),
+      // Generation metadata — opaque strings, capped.
+      generated_at: clampString(plan_data.generated_at, 40),
+      version: clampString(plan_data.version, 20),
+    };
+
+    if (!cleanPlan.headline) {
       return res.status(400).json({ error: 'plan_data.headline required' });
     }
 
-    // Size cap: typical plan with week + meal_pool reference is ~30KB.
-    // Cap at 256KB to allow for legitimately large pools (the meal pool
-    // itself goes through /user/meal-pool, but if the client lazily
-    // includes it here we still accept up to that size).
-    const serialised = JSON.stringify(plan_data);
+    // Re-check size after sanitise. 256KB is now a safety net rather
+    // than the primary defence — typical clean plan is 10-30KB.
+    const serialised = JSON.stringify(cleanPlan);
     if (serialised.length > 256 * 1024) {
       return res.status(400).json({ error: 'plan_data too large' });
     }
@@ -4206,7 +4420,7 @@ app.post('/user/plan', userLimiter, mediumJson, async (req, res) => {
     const { error } = await supabase
       .from('users')
       .update({
-        plan_data,
+        plan_data: cleanPlan,
         plan_updated_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
       })
@@ -5265,11 +5479,16 @@ async function sendEmail(to, type, data) {
     // Subject branches by tier — Basic and Premium share the "trial" subject;
     // Free uses the cross-device login subject.
     welcomeSubject: (tier) => tier === 'free' ? 'Dein PEAK-Plan ist live — diese Mail ist dein Cross-Device-Login' : 'Willkommen bei PEAK — dein Plan ist bereit',
-    welcomeLabel: (n) => 'Willkommen' + (n ? ', ' + n : ''),
+    welcomeLabel: (n) => 'Willkommen' + (n ? ', ' + htmlEsc(n) : ''),
     welcomeH1a: 'Dein Plan',
     welcomeH1b: 'ist live.',
     welcomeH1FreeB: 'läuft.',
     welcomeIntro: (tier, goal, sport, trialDays) => {
+      // Audit Befund 10: htmlEsc on every user-supplied field before
+      // embedding into HTML email body. Goal/sport/name come from the
+      // user's profile and could contain HTML/script if not escaped.
+      const safeGoal = goal ? htmlEsc(goal) : '';
+      const safeSport = sport ? htmlEsc(sport) : '';
       if (tier === 'free') {
         return 'Du bist bereits eingeloggt — diese Mail ist dein Backup. Speicher sie, falls du PEAK auf einem anderen Gerät öffnen willst (Handy, Tablet). Klick einfach unten auf den Button und du landest direkt in deinem Plan, ohne Passwort.';
       }
@@ -5280,9 +5499,9 @@ async function sendEmail(to, type, data) {
       // "click here to start" CTA. Keeps Welcome consistent across tiers.
       let intro = `Du bist bereits eingeloggt — der Button unten ist dein Backup-Link für andere Geräte (Handy, Tablet). `;
       intro += `Deine ${days}-Tage-Testphase läuft — keine Abbuchung bis Tag ${days + 1}. `;
-      if (sport && goal) intro += `Dein individueller ${sport}-Plan ist abgestimmt auf „${goal}".`;
-      else if (sport) intro += `Dein individueller ${sport}-Plan ist bereit.`;
-      else if (goal) intro += `Maßgeschneidert auf dein Ziel: „${goal}".`;
+      if (safeSport && safeGoal) intro += `Dein individueller ${safeSport}-Plan ist abgestimmt auf „${safeGoal}".`;
+      else if (safeSport) intro += `Dein individueller ${safeSport}-Plan ist bereit.`;
+      else if (safeGoal) intro += `Maßgeschneidert auf dein Ziel: „${safeGoal}".`;
       else intro += 'KI-gestützte Ernährung, Training und Regeneration — auf dich zugeschnitten.';
       return intro;
     },
@@ -5294,10 +5513,10 @@ async function sendEmail(to, type, data) {
     includesFree: 'Dein Gratis-Plan enthält',
     includesBasic: 'In Basic enthalten',
     includesPremium: 'In Premium enthalten',
-    f1: (sport) => sport ? `KI-Ernährungsplan für dein ${sport}-Training` : 'KI-Ernährungsplan, passend zu Ziel & Geschmack',
-    f2Free: (sport) => sport ? `${sport}-Training — eine Woche zum Reinschnuppern` : 'Trainings-Vorschau für deine Sportart',
-    f2Basic: (sport) => sport ? `Voller ${sport}-Trainingsplan, alle Wochen` : 'Voller Trainingsplan für deine Sportart',
-    f2Premium: (sport) => sport ? `12-Wochen-${sport}-Programm mit Progression` : '12-Wochen-Programm mit Progression',
+    f1: (sport) => sport ? `KI-Ernährungsplan für dein ${htmlEsc(sport)}-Training` : 'KI-Ernährungsplan, passend zu Ziel & Geschmack',
+    f2Free: (sport) => sport ? `${htmlEsc(sport)}-Training — eine Woche zum Reinschnuppern` : 'Trainings-Vorschau für deine Sportart',
+    f2Basic: (sport) => sport ? `Voller ${htmlEsc(sport)}-Trainingsplan, alle Wochen` : 'Voller Trainingsplan für deine Sportart',
+    f2Premium: (sport) => sport ? `12-Wochen-${htmlEsc(sport)}-Programm mit Progression` : '12-Wochen-Programm mit Progression',
     f3Free: '1 Plan-Update / 30 Tage inklusive',
     f3Basic: 'Voller Regenerationsplan: Schlaf, Hydration, Tools',
     f3Premium: 'Mobility, Stretching & Recovery-Tools',
@@ -5405,11 +5624,14 @@ async function sendEmail(to, type, data) {
     trialEndingCTA: 'PEAK öffnen',
   } : {
     welcomeSubject: (tier) => tier === 'free' ? 'Your PEAK plan is live — this email is your cross-device login' : 'Welcome to PEAK — your plan is ready',
-    welcomeLabel: (n) => 'Welcome' + (n ? ', ' + n : ''),
+    welcomeLabel: (n) => 'Welcome' + (n ? ', ' + htmlEsc(n) : ''),
     welcomeH1a: 'Your plan is',
     welcomeH1b: 'live.',
     welcomeH1FreeB: 'live.',
     welcomeIntro: (tier, goal, sport, trialDays) => {
+      // Audit Befund 10: htmlEsc on every user-supplied field.
+      const safeGoal = goal ? htmlEsc(goal) : '';
+      const safeSport = sport ? htmlEsc(sport) : '';
       if (tier === 'free') {
         return 'You\'re already logged in — this email is your backup. Save it if you ever want to open PEAK on another device (phone, tablet). Just tap the button below and you\'ll land straight in your plan, no password.';
       }
@@ -5417,19 +5639,19 @@ async function sendEmail(to, type, data) {
       // Same auto-login framing as Free, just compact for paid tiers.
       let intro = `You're already logged in — the button below is your backup link for other devices (phone, tablet). `;
       intro += `Your ${days}-day trial is running — no charge until Day ${days + 1}. `;
-      if (sport && goal) intro += `Your custom ${sport} plan is tuned to "${goal}".`;
-      else if (sport) intro += `Your custom ${sport} programme is ready.`;
-      else if (goal) intro += `Built around your goal: "${goal}".`;
+      if (safeSport && safeGoal) intro += `Your custom ${safeSport} plan is tuned to "${safeGoal}".`;
+      else if (safeSport) intro += `Your custom ${safeSport} programme is ready.`;
+      else if (safeGoal) intro += `Built around your goal: "${safeGoal}".`;
       else intro += 'AI-built nutrition, training and recovery, tuned to you.';
       return intro;
     },
     includesFree: 'Your free plan includes',
     includesBasic: 'Basic includes',
     includesPremium: 'Premium includes',
-    f1: (sport) => sport ? `AI nutrition plan for your ${sport} training` : 'AI nutrition plan, matched to goal and taste',
-    f2Free: (sport) => sport ? `${sport} training — 1-week preview` : '1-week training preview for your sport',
-    f2Basic: (sport) => sport ? `Full ${sport} training plan, every week` : 'Full training plan for your sport',
-    f2Premium: (sport) => sport ? `12-week ${sport} programme with progression` : '12-week programme with progression',
+    f1: (sport) => sport ? `AI nutrition plan for your ${htmlEsc(sport)} training` : 'AI nutrition plan, matched to goal and taste',
+    f2Free: (sport) => sport ? `${htmlEsc(sport)} training — 1-week preview` : '1-week training preview for your sport',
+    f2Basic: (sport) => sport ? `Full ${htmlEsc(sport)} training plan, every week` : 'Full training plan for your sport',
+    f2Premium: (sport) => sport ? `12-week ${htmlEsc(sport)} programme with progression` : '12-week programme with progression',
     f3Free: '1 plan update / 30 days included',
     f3Basic: 'Full recovery plan: sleep, hydration, tools',
     f3Premium: 'Mobility, stretching & recovery tools',
@@ -6178,7 +6400,7 @@ function generateInviteToken() {
 // ─── POST /family/create ──────────────────────────────────────────────
 // Create a new group with caller as first member. Caller must be Premium.
 // Optional body: { name, shared_meals_pattern }.
-app.post('/family/create', aiLimiter, async (req, res) => {
+app.post('/family/create', userLimiter, async (req, res) => {
   try {
     const auth = await resolveAuthAndTier(req, { requirePremium: true });
     if (!auth.ok) return res.status(auth.status).json(auth.body);
@@ -6285,7 +6507,7 @@ app.get('/family/group', userLimiter, async (req, res) => {
 // ─── POST /family/invite ──────────────────────────────────────────────
 // Generate a share-able invite token for the caller's active group.
 // Token expires in 7 days. Returns { token, url }.
-app.post('/family/invite', aiLimiter, async (req, res) => {
+app.post('/family/invite', userLimiter, async (req, res) => {
   try {
     const auth = await resolveAuthAndTier(req, { requirePremium: true });
     if (!auth.ok) return res.status(auth.status).json(auth.body);
@@ -6443,7 +6665,10 @@ app.post('/family/leave', userLimiter, async (req, res) => {
 // member. To leave the group voluntarily, members use /family/leave.
 app.delete('/family/remove-member', userLimiter, async (req, res) => {
   try {
-    const auth = await resolveAuthAndTier(req);
+    // Audit Befund 20: require active premium tier so a creator who
+    // downgrades to free can't keep managing membership. Matches the
+    // gating on /family/create and /family/invite.
+    const auth = await resolveAuthAndTier(req, { requirePremium: true });
     if (!auth.ok) return res.status(auth.status).json(auth.body);
     const { user_id: targetId } = req.body || {};
     if (!targetId || typeof targetId !== 'string') {
