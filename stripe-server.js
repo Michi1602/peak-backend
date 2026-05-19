@@ -2950,20 +2950,20 @@ app.post('/voucher/validate', enumLimiter, async (req, res) => {
     const normalizedCode = code.trim().toUpperCase();
     const promos = await stripe.promotionCodes.list({ code: normalizedCode, active: true, limit: 1 });
     if (promos.data.length === 0) {
-      return res.status(404).json({ valid: false, error: 'Invalid or expired code' });
+      return res.status(404).json({ valid: false, error: 'Invalid or expired code', code: 'INVALID_CODE' });
     }
     const promo = promos.data[0];
     if (promo.max_redemptions && promo.times_redeemed >= promo.max_redemptions) {
-      return res.status(410).json({ valid: false, error: 'Code has reached its redemption limit' });
+      return res.status(410).json({ valid: false, error: 'Code has reached its redemption limit', code: 'REDEMPTION_LIMIT' });
     }
     // Annual-only / Premium-only restrictions (checked if user already chose plan/tier)
     const annualOnly = promo.metadata?.annual_only === 'true' || promo.coupon?.metadata?.annual_only === 'true';
     const premiumOnly = promo.metadata?.premium_only === 'true' || promo.coupon?.metadata?.premium_only === 'true';
     if (annualOnly && plan && plan !== 'annual') {
-      return res.status(400).json({ valid: false, error: 'This code is only valid for the annual plan', requiresAnnual: true });
+      return res.status(400).json({ valid: false, error: 'This code is only valid for the annual plan', requiresAnnual: true, code: 'ANNUAL_ONLY' });
     }
     if (premiumOnly && tier && tier !== 'premium') {
-      return res.status(400).json({ valid: false, error: 'This code is only valid for Premium', requiresPremium: true });
+      return res.status(400).json({ valid: false, error: 'This code is only valid for Premium', requiresPremium: true, code: 'PREMIUM_ONLY' });
     }
     // ─── ABUSE CHECK: email already redeemed this code? ─────────────────
     if (email && typeof email === 'string') {
@@ -2976,7 +2976,7 @@ app.post('/voucher/validate', enumLimiter, async (req, res) => {
           .eq('email', normalizedEmail)
           .limit(1);
         if (!error && prior && prior.length > 0) {
-          return res.status(409).json({ valid: false, error: 'This code has already been used with this email', alreadyUsed: true });
+          return res.status(409).json({ valid: false, error: 'This code has already been used with this email', alreadyUsed: true, code: 'ALREADY_USED' });
         }
       } catch (e) {
         console.warn('Voucher abuse check (email) failed:', e.message);
@@ -5235,32 +5235,39 @@ app.post('/webhook', async (req, res) => {
 // ── EMAIL ─────────────────────────────────────────────────────────────
 // Design tokens — kept close to app brand (Barlow Condensed + Signal Red)
 // Using table layout + inline styles for Outlook/Gmail compatibility.
+// UX-Buglist Punkt 1: Email-Theme auf Atlantis aktualisiert. Vorher
+// reines Schwarz/Rot — passte nicht zum App-Atlantis-Theme (Marble +
+// Aurum). Jetzt: dunkle Header bleiben für Email-Inbox-Anker, aber
+// Aurum statt Rot, Marble-Hintergrund, warmes Ink-Anthrazit für Body.
 const BRAND = {
-  ink: '#0E0E0E',      // near-black, matches app --bg
-  ink2: '#333333',     // body text
-  dim: '#666666',      // secondary text
-  faint: '#999999',    // footer/meta
-  border: '#E5E5E5',   // subtle divider
-  red: '#E8001A',      // Signal Red — matches app --red
-  rdk: '#A50013',      // darker red for hover/emphasis
-  white: '#FFFFFF',
-  light: '#F7F7F7',    // soft background for panels
+  ink: '#0A1420',      // Atlantis Depth — header bar, headlines
+  ink2: '#1A1410',     // Warm anthracite — body text (matches app Light theme)
+  dim: '#6B5D4A',      // Secondary text
+  faint: '#9B9285',    // Footer/meta
+  border: '#DFD9CB',   // Marble-toned divider
+  red: '#E8B86B',      // Aurum gold (legacy name kept for back-compat)
+  rdk: '#B8893E',      // Darker aurum for hover/emphasis
+  white: '#FFFFFF',    // Pure white for contrast on dark header
+  light: '#F0EBE0',    // Marble — body background
 };
 
-// Fonts — Barlow from Google Fonts falls back gracefully in Outlook
-const FONT_BODY = `'Barlow', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif`;
-const FONT_HEAD = `'Barlow Condensed', 'Barlow', -apple-system, 'Segoe UI', Arial, sans-serif`;
+// Fonts — Atlantis uses Cinzel (Serif) for display + Inter for body.
+// Outlook/Gmail strip @font-face so we list system fallbacks for both.
+const FONT_BODY = `'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif`;
+const FONT_HEAD = `'Cinzel', 'Georgia', 'Times New Roman', serif`;
 
 function emailHeader() {
-  // Black header bar with PEAK logo — red underline like in the app
+  // Dark Atlantis-Depth header — Aurum underline matches the app logo.
+  // The dark band gives the email inbox a clear visual anchor; Aurum is
+  // the only accent.
   return `
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
     <tr>
       <td align="center" style="padding:32px 20px 28px;">
         <div style="display:inline-block;text-align:center;">
-          <div style="font-family:${FONT_HEAD};font-weight:900;font-size:32px;letter-spacing:7px;color:${BRAND.white};line-height:1;">PEAK</div>
-          <div style="width:60px;height:2px;background:${BRAND.red};margin:6px auto 4px;"></div>
-          <div style="font-family:${FONT_BODY};font-size:9px;font-weight:700;letter-spacing:3px;color:#888;text-transform:uppercase;">by MJ Performance</div>
+          <div style="font-family:${FONT_HEAD};font-weight:600;font-size:32px;letter-spacing:7px;color:${BRAND.white};line-height:1;">PEAK</div>
+          <div style="width:60px;height:1px;background:${BRAND.red};margin:6px auto 4px;"></div>
+          <div style="font-family:${FONT_BODY};font-size:9px;font-weight:500;letter-spacing:2.5px;color:#9B9285;text-transform:uppercase;">by MJ Performance</div>
         </div>
       </td>
     </tr>
@@ -5329,25 +5336,26 @@ function buildOtpEmail(code, email, lang) {
   const codePretty = code.slice(0, 3) + ' ' + code.slice(3);
 
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${L.subject}</title></head>
-<body style="margin:0;padding:0;background:#F5F5F1;font-family:'Helvetica Neue',Arial,sans-serif">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#F5F5F1;padding:40px 20px"><tr><td align="center">
-<table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;background:#fff;border:1px solid #E6E6E1">
-  <tr><td style="background:#0E0E0E;padding:28px 32px">
-    <div style="color:#fff;font-family:'Helvetica Neue',Arial,sans-serif;font-weight:900;font-size:28px;letter-spacing:4px">PEAK</div>
-    <div style="color:#E8001A;font-weight:700;font-size:10px;letter-spacing:3px;margin-top:4px">BY MJ PERFORMANCE</div>
+<body style="margin:0;padding:0;background:${BRAND.light};font-family:${FONT_BODY}">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:${BRAND.light};padding:40px 20px"><tr><td align="center">
+<table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;background:${BRAND.white};border:1px solid ${BRAND.border}">
+  <tr><td style="background:${BRAND.ink};padding:28px 32px">
+    <div style="color:${BRAND.white};font-family:${FONT_HEAD};font-weight:600;font-size:28px;letter-spacing:4px">PEAK</div>
+    <div style="width:48px;height:1px;background:${BRAND.red};margin:6px 0 4px"></div>
+    <div style="color:#9B9285;font-weight:500;font-size:10px;letter-spacing:2.5px">BY MJ PERFORMANCE</div>
   </td></tr>
   <tr><td style="padding:40px 32px 32px">
-    <div style="color:#E8001A;font-weight:900;font-size:11px;letter-spacing:2.5px;margin-bottom:10px;text-transform:uppercase">${L.label}</div>
-    <h1 style="margin:0 0 18px;font-size:30px;line-height:1.15;font-weight:900;letter-spacing:1px;color:#0E0E0E">${L.h1a}<br><span style="color:#E8001A">${L.h1b}</span></h1>
-    <p style="margin:0 0 28px;font-size:15px;line-height:1.6;color:#3a3a3a">${L.intro}</p>
-    <div style="background:#0E0E0E;color:#fff;padding:28px 32px;text-align:center;margin:0 0 22px">
-      <div style="font-family:'Courier New',monospace;font-weight:900;font-size:42px;letter-spacing:12px;color:#fff">${codePretty}</div>
+    <div style="color:${BRAND.red};font-weight:700;font-size:11px;letter-spacing:2.5px;margin-bottom:10px;text-transform:uppercase">${L.label}</div>
+    <h1 style="margin:0 0 18px;font-family:${FONT_HEAD};font-size:30px;line-height:1.15;font-weight:600;letter-spacing:1px;color:${BRAND.ink2}">${L.h1a}<br><span style="color:${BRAND.red}">${L.h1b}</span></h1>
+    <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:15px;line-height:1.6;color:${BRAND.ink2}">${L.intro}</p>
+    <div style="background:${BRAND.ink};color:${BRAND.white};padding:28px 32px;text-align:center;margin:0 0 22px">
+      <div style="font-family:'Courier New',monospace;font-weight:700;font-size:42px;letter-spacing:12px;color:${BRAND.red}">${codePretty}</div>
     </div>
-    <p style="margin:0 0 10px;font-size:12px;color:#666">⏱ ${L.expiry}</p>
-    <p style="margin:0;font-size:11px;color:#999;line-height:1.5">${L.warning}</p>
+    <p style="margin:0 0 10px;font-family:${FONT_BODY};font-size:12px;color:${BRAND.dim}">⏱ ${L.expiry}</p>
+    <p style="margin:0;font-family:${FONT_BODY};font-size:11px;color:${BRAND.faint};line-height:1.5">${L.warning}</p>
   </td></tr>
-  <tr><td style="background:#F5F5F1;padding:18px 32px;border-top:1px solid #E6E6E1">
-    <div style="font-size:10px;color:#999;letter-spacing:1.2px;text-align:center">${L.footer}</div>
+  <tr><td style="background:${BRAND.light};padding:18px 32px;border-top:1px solid ${BRAND.border}">
+    <div style="font-family:${FONT_BODY};font-size:10px;color:${BRAND.faint};letter-spacing:1.2px;text-align:center">${L.footer}</div>
   </td></tr>
 </table></td></tr></table></body></html>`;
 
