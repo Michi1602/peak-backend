@@ -5598,8 +5598,13 @@ async function sendEmail(to, type, data) {
     accountDeletedLabel: 'Konto gelöscht',
     accountDeletedH1a: 'Dein Konto',
     accountDeletedH1b: 'ist gelöscht.',
-    accountDeletedBody: (name) => (name ? name + ', d' : 'D') + 'ein PEAK-Konto wurde auf deinen Wunsch hin vollständig gelöscht. Alle deine Daten (Profil, Ziele, Fortschritt) wurden aus unserer Datenbank entfernt. Falls du ein Premium-Abo hattest, wurde es beendet.',
-    accountDeletedLegal: 'Hinweis: Rechnungen und Zahlungsdaten müssen wir aus steuerrechtlichen Gründen für 10 Jahre aufbewahren (§147 AO). Alle anderen personenbezogenen Daten sind gelöscht.',
+    accountDeletedBody: (name) => (name ? name + ', d' : 'D') + 'ein PEAK-Konto wurde auf deinen Wunsch hin gelöscht. Profil, Ziele, Fortschritts- und Trainings-Daten wurden aus unserer Datenbank entfernt. Ein eventuelles Premium-Abo wurde beendet.',
+    // Audit Nachtrag Thema 2: §147 AO deckt Rechnungen ab, nicht
+    // Gesundheitsdaten. Wir behalten den Stripe-Customer-Record
+    // (Buchhaltungs-Pflicht), löschen aber die sensiblen Metadata-
+    // Felder bei Account-Delete (siehe Befund 4-Fix). Email-Text
+    // beschreibt was tatsächlich passiert, kein DSGVO-Risiko.
+    accountDeletedLegal: 'Hinweis: Aus handelsrechtlichen Gründen müssen wir Rechnungsdaten (Datum, Betrag, Stripe-Transaktions-ID) für 10 Jahre aufbewahren (§257 HGB, §147 AO). Diese Datensätze bleiben in unserer Zahlungsabwicklung. Alle sensiblen Profil- und Gesundheitsdaten wurden gelöscht.',
     accountDeletedBye: 'Danke, dass du PEAK ausprobiert hast. Du bist jederzeit wieder willkommen.',
     // ── PAYMENT FAILED (DE) ──
     paymentFailedSubject: 'Zahlung fehlgeschlagen — bitte Karte aktualisieren',
@@ -5724,8 +5729,12 @@ async function sendEmail(to, type, data) {
     accountDeletedLabel: 'Account deleted',
     accountDeletedH1a: 'Your account',
     accountDeletedH1b: 'is deleted.',
-    accountDeletedBody: (name) => (name ? name + ', y' : 'Y') + 'our PEAK account has been fully deleted at your request. All your data (profile, goals, progress) has been removed from our database. If you had a Premium subscription, it has been ended.',
-    accountDeletedLegal: 'Note: invoices and payment records must be retained for 10 years for tax-law reasons (German §147 AO). All other personal data has been deleted.',
+    accountDeletedBody: (name) => (name ? name + ', y' : 'Y') + 'our PEAK account has been deleted at your request. Profile, goals, progress and training data have been removed from our database. Any Premium subscription has been ended.',
+    // Audit Nachtrag Thema 2: §147 AO covers invoices, not health data.
+    // The stripe-customer record stays (accounting obligation) but
+    // sensitive metadata is scrubbed on delete (Befund 4 fix). Email
+    // describes what actually happens — no GDPR mismatch.
+    accountDeletedLegal: 'Note: under German commercial law we must retain invoice records (date, amount, Stripe transaction ID) for 10 years (§257 HGB, §147 AO). These records remain in our payment system. All sensitive profile and health data has been deleted.',
     accountDeletedBye: 'Thanks for trying PEAK. You\'re always welcome back.',
     // ── PAYMENT FAILED (EN) ──
     paymentFailedSubject: 'Payment failed — please update your card',
