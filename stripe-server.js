@@ -1359,7 +1359,6 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
       dur: userData?.dur ? parseInt(userData.dur, 10) : null,
       equip: userData?.equip || null,
       al: Array.isArray(userData?.al) ? userData.al : [],
-      ad: Array.isArray(userData?.ad) ? userData.ad : [],
       di: Array.isArray(userData?.di) ? userData.di : [],
       cu: Array.isArray(userData?.cu) ? userData.cu : [],
       cook: userData?.cook || null,
@@ -2787,7 +2786,6 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
       dur: userData?.dur || null,
       equip: userData?.equip || null,
       al: Array.isArray(userData?.al) ? userData.al : [],
-      ad: Array.isArray(userData?.ad) ? userData.ad : [],
       di: Array.isArray(userData?.di) ? userData.di : [],
       cu: Array.isArray(userData?.cu) ? userData.cu : [],
       cook: userData?.cook || null,
@@ -3270,7 +3268,7 @@ app.post('/user/update-profile', userLimiter, async (req, res) => {
       'name','age','gender','weight','dweight','height','sleep',
       'job','commute','stress',
       'sport','level','sessions','dur','equip',
-      'al','ad','di','cu','cook','budget','goal','goals','lang',
+      'al','di','cu','cook','budget','goal','goals','lang',
       'stretchAreas','stretchDur',
       'trainDays',
     ];
@@ -3280,7 +3278,7 @@ app.post('/user/update-profile', userLimiter, async (req, res) => {
     // surface the error to the caller than to write garbage that breaks the
     // app downstream (e.g. weight="abc" would crash BMR calculation).
     const NUMERIC_FIELDS = new Set(['age','weight','dweight','height','sleep','sessions','dur','stress','budget','stretchDur']);
-    const ARRAY_FIELDS = new Set(['al','ad','di','cu','goals','stretchAreas']);
+    const ARRAY_FIELDS = new Set(['al','di','cu','goals','stretchAreas']);
     const INT_ARRAY_FIELDS = new Set(['trainDays']);
     const STRING_FIELDS = new Set(['name','gender','job','commute','sport','level','equip','cook','goal','lang']);
 
@@ -4648,7 +4646,6 @@ app.post('/webhook', async (req, res) => {
         dur: pickNum(train.dur, prior?.dur, parseIntR10, PEAK_NUMERIC_RANGES.dur),
         equip: pickStr(train.equip, prior?.equip),
         al: pickArr(train.al, prior?.al),
-        ad: pickArr(train.ad, prior?.ad),
         di: pickArr(train.di, prior?.di),
         cu: pickArr(train.cu, prior?.cu),
         cook: pickStr(train.cook, prior?.cook),
