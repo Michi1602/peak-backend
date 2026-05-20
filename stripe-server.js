@@ -594,7 +594,7 @@ function mE(email) {
 // Centralised so both surfaces enforce identical caps — previously the
 // webhook accepted any value Stripe-metadata threw at it.
 const PEAK_NUMERIC_RANGES = {
-  age:        [16, 120],
+  age:        [18, 120],
   weight:     [25, 350],
   dweight:    [25, 350],
   height:     [100, 250],
@@ -1212,13 +1212,13 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
 
     // ── AGE GATE (GDPR §8 BDSG: minimum 16) ────────────────────────────
     const ageNum = parseInt(userData && userData.age, 10);
-    if (!ageNum || ageNum < 16 || ageNum > 120) {
+    if (!ageNum || ageNum < 18 || ageNum > 120) {
       console.warn(`⚠️ Free signup blocked for ${mE(email)}: invalid age (${userData && userData.age})`);
       return res.status(400).json({
         error: 'AGE_RESTRICTION',
         message: lang === 'de'
-          ? 'PEAK ist ab 16 Jahren verfügbar.'
-          : 'PEAK is available from age 16.'
+          ? 'PEAK ist ab 18 Jahren verfügbar.'
+          : 'PEAK is available from age 18.'
       });
     }
 
@@ -2631,13 +2631,13 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
 
     // ── AGE GATE (GDPR §8 BDSG: minimum 16) ────────────────────────────
     const ageNum = parseInt(userData && userData.age, 10);
-    if (!ageNum || ageNum < 16 || ageNum > 120) {
+    if (!ageNum || ageNum < 18 || ageNum > 120) {
       console.warn(`⚠️ Checkout blocked for ${mE(email)}: invalid age (${userData && userData.age})`);
       return res.status(400).json({
         error: 'AGE_RESTRICTION',
         message: lang === 'de'
-          ? 'PEAK ist ab 16 Jahren verfügbar.'
-          : 'PEAK is available from age 16.'
+          ? 'PEAK ist ab 18 Jahren verfügbar.'
+          : 'PEAK is available from age 18.'
       });
     }
 
@@ -6578,17 +6578,89 @@ app.post('/family/invite', userLimiter, async (req, res) => {
   }
 });
 
-// ─── POST /family/accept-invite ───────────────────────────────────────
-// Redeem an invite token. Caller must be Premium + active. Token must be
-// valid (not expired, not revoked, group not full).
+// ─── POST /family/invite-info ─────────────────────────────────────────
+// Read-only probe of an invite token. Returns group metadata WITHOUT
+// joining. Used by the consent dialog on the frontend so the invitee
+// can see what they're being asked to consent to before clicking
+// "Beitreten" (Caroline-meeting 20.05.2026: active opt-in required).
+//
 // Body: { token }
-app.post('/family/accept-invite', userLimiter, async (req, res) => {
+// Returns 200 with { group_name, inviter_name, member_count } if
+// the token is valid AND the caller would be allowed to join (premium,
+// no other active group, group not full). Mirrors the rejection codes
+// of /family/accept-invite (402/403/404/409/410) so the client can
+// surface the right toast without joining anything.
+app.post('/family/invite-info', userLimiter, async (req, res) => {
   try {
     const auth = await resolveAuthAndTier(req, { requirePremium: true });
     if (!auth.ok) return res.status(auth.status).json(auth.body);
     const { token } = req.body || {};
     if (!token || typeof token !== 'string' || token.length > 64) {
       return res.status(400).json({ error: 'invalid_token_format' });
+    }
+    const { data: inv } = await supabase
+      .from('family_invite_tokens')
+      .select('token, group_id, expires_at, revoked_at, created_by')
+      .eq('token', token)
+      .maybeSingle();
+    if (!inv) return res.status(404).json({ error: 'token_not_found' });
+    if (inv.revoked_at) return res.status(410).json({ error: 'token_revoked' });
+    if (new Date(inv.expires_at) < new Date()) {
+      return res.status(410).json({ error: 'token_expired' });
+    }
+    const existing = await getActiveFamilyGroupId(auth.userId);
+    if (existing && existing !== inv.group_id) {
+      return res.status(409).json({ error: 'already_in_other_group' });
+    }
+    const { data: g } = await supabase
+      .from('family_groups')
+      .select('id, name, member_count')
+      .eq('id', inv.group_id)
+      .maybeSingle();
+    if (!g) return res.status(404).json({ error: 'group_gone' });
+    if (g.member_count >= 4) {
+      return res.status(409).json({ error: 'group_full', limit: 4 });
+    }
+    // Look up the inviter's first name for the consent dialog. Falls
+    // through gracefully if absent. We DON'T expose email, age, or any
+    // health data — only the name as it appears in their PEAK profile.
+    let inviterName = null;
+    if (inv.created_by) {
+      const { data: u } = await supabase
+        .from('users').select('name').eq('id', inv.created_by).maybeSingle();
+      if (u && u.name) inviterName = String(u.name).slice(0, 40);
+    }
+    res.json({
+      group_name: g.name || null,
+      inviter_name: inviterName,
+      member_count: g.member_count || 0,
+    });
+  } catch (e) {
+    console.error('[family/invite-info] error:', e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+// ─── POST /family/accept-invite ───────────────────────────────────────
+// Redeem an invite token. Caller must be Premium + active. Token must be
+// valid (not expired, not revoked, group not full). Caroline-requirement
+// 20.05.2026: requires explicit consent flag in the body. The frontend
+// MUST show /family/invite-info results in a consent dialog and only
+// fire this endpoint with { consent: true } after an explicit click.
+// Body: { token, consent: true, consent_at: <ISO timestamp> }
+app.post('/family/accept-invite', userLimiter, async (req, res) => {
+  try {
+    const auth = await resolveAuthAndTier(req, { requirePremium: true });
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const { token, consent, consent_at } = req.body || {};
+    if (!token || typeof token !== 'string' || token.length > 64) {
+      return res.status(400).json({ error: 'invalid_token_format' });
+    }
+    // Caroline-requirement: active consent is mandatory for the join.
+    // The frontend always sets this; an absent flag means the request
+    // didn't come through the consent dialog and we refuse.
+    if (consent !== true) {
+      return res.status(400).json({ error: 'consent_required' });
     }
     // Validate token
     const { data: inv } = await supabase
@@ -6623,14 +6695,19 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
       .maybeSingle();
     if (prior) {
       await supabase.from('family_memberships')
-        .update({ status: 'active', left_at: null })
+        .update({
+          status: 'active',
+          left_at: null,
+          consent_at: consent_at || new Date().toISOString(),
+        })
         .eq('id', prior.id);
     } else {
       const { error } = await supabase.from('family_memberships').insert({
         group_id: inv.group_id,
         user_id: auth.userId,
         status: 'active',
-        invited_by: null  // unknown — token doesn't track inviter beyond creator
+        invited_by: null,  // unknown — token doesn't track inviter beyond creator
+        consent_at: consent_at || new Date().toISOString(),
       });
       if (error) {
         console.error('[family/accept-invite] insert failed:', error.message);
