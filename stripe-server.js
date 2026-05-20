@@ -5262,8 +5262,18 @@ const BRAND = {
   dim: '#6B5D4A',      // Secondary text
   faint: '#9B9285',    // Footer/meta
   border: '#DFD9CB',   // Marble-toned divider
-  red: '#E8B86B',      // Aurum gold (legacy name kept for back-compat)
-  rdk: '#B8893E',      // Darker aurum for hover/emphasis
+  // Two Aurum tones — the deep one (Cinnamon) is used for any text/icon
+  // that sits on the cream marble body of the email. Passes WCAG-AA
+  // (4.58:1) which the bright Aurum (1.54:1) does NOT. The bright one
+  // is reserved for the header underline + button background where it
+  // sits on Atlantis-Depth (high contrast supplied by the dark
+  // background). The `red` key keeps its name for back-compat with the
+  // older template code; everything that pulls `red` now gets the
+  // Cinnamon so body bullets, label captions and so on are readable in
+  // inboxes that render the cream background.
+  red: '#8A6224',      // Cinnamon Aurum — body text/icons on cream
+  rdk: '#8A6224',      // Same — kept for callers that explicitly want it
+  redBright: '#E8B86B',// Bright Aurum — header underline + buttons on dark
   white: '#FFFFFF',    // Pure white for contrast on dark header
   light: '#F0EBE0',    // Marble — body background
 };
@@ -5276,14 +5286,17 @@ const FONT_HEAD = `'Cinzel', 'Georgia', 'Times New Roman', serif`;
 function emailHeader() {
   // Dark Atlantis-Depth header — Aurum underline matches the app logo.
   // The dark band gives the email inbox a clear visual anchor; Aurum is
-  // the only accent.
+  // the only accent. Header sits on Atlantis-Depth so the BRIGHT Aurum
+  // (#E8B86B) is used here — it has plenty of contrast on the dark
+  // background. Body content uses BRAND.red (darker Aurum) for WCAG-AA
+  // on cream.
   return `
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
     <tr>
       <td align="center" style="padding:32px 20px 28px;">
         <div style="display:inline-block;text-align:center;">
           <div style="font-family:${FONT_HEAD};font-weight:600;font-size:32px;letter-spacing:7px;color:${BRAND.white};line-height:1;">PEAK</div>
-          <div style="width:60px;height:1px;background:${BRAND.red};margin:6px auto 4px;"></div>
+          <div style="width:60px;height:1px;background:${BRAND.redBright};margin:6px auto 4px;"></div>
           <div style="font-family:${FONT_BODY};font-size:9px;font-weight:500;letter-spacing:2.5px;color:#9B9285;text-transform:uppercase;">by MJ Performance</div>
         </div>
       </td>
@@ -5292,12 +5305,16 @@ function emailHeader() {
 }
 
 function emailButton(href, label) {
-  // Bulletproof button — works in Outlook via VML fallback concept (simplified)
+  // Bulletproof button — uses BRIGHT Aurum so the white label on it
+  // stays readable. Pure white on bright Aurum scores ~2.65:1 which is
+  // below WCAG-AA for body text but passes for non-text UI elements,
+  // and the bold uppercase letters make it unambiguous. Keeping bright
+  // here preserves the elegant "gold call-to-action" feel.
   return `
   <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto;">
     <tr>
-      <td align="center" bgcolor="${BRAND.red}" style="background:${BRAND.red};">
-        <a href="${href}" target="_blank" style="display:inline-block;font-family:${FONT_HEAD};font-size:13px;font-weight:900;letter-spacing:3px;text-transform:uppercase;color:${BRAND.white};text-decoration:none;padding:16px 36px;background:${BRAND.red};">${label}</a>
+      <td align="center" bgcolor="${BRAND.redBright}" style="background:${BRAND.redBright};">
+        <a href="${href}" target="_blank" style="display:inline-block;font-family:${FONT_HEAD};font-size:13px;font-weight:900;letter-spacing:3px;text-transform:uppercase;color:${BRAND.ink};text-decoration:none;padding:16px 36px;background:${BRAND.redBright};">${label}</a>
       </td>
     </tr>
   </table>`;
@@ -5312,7 +5329,14 @@ function emailFooter(email) {
   return `
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
     <tr>
-      <td style="padding:28px 30px 32px;font-family:${FONT_BODY};font-size:11px;line-height:1.7;color:#888;text-align:center;">
+      <td style="padding:28px 30px 12px;text-align:center;">
+        <div style="font-family:${FONT_HEAD};font-size:14px;font-weight:600;letter-spacing:5px;color:${BRAND.white};line-height:1;">PEAK</div>
+        <div style="width:32px;height:1px;background:${BRAND.redBright};margin:6px auto 4px;"></div>
+        <div style="font-family:${FONT_BODY};font-size:9px;font-weight:500;letter-spacing:2px;color:#9B9285;text-transform:uppercase;">by MJ Performance</div>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:14px 30px 32px;font-family:${FONT_BODY};font-size:11px;line-height:1.7;color:#888;text-align:center;">
         <p style="margin:0 0 10px;">Du erhältst diese E-Mail, weil du dich bei PEAK registriert hast.<br>You're receiving this because you signed up for PEAK.</p>
         <p style="margin:0 0 14px;">
           <a href="${FRONTEND_URL}/impressum" style="color:#AAA;text-decoration:none;">Impressum</a>
@@ -5332,7 +5356,7 @@ function buildOtpEmail(code, email, lang) {
   const de = lang === 'de';
   const L = {
     subject: de ? 'Dein PEAK Login-Code' : 'Your PEAK login code',
-    label: de ? '🔐 Login-Code' : '🔐 Login code',
+    label: de ? 'Login-Code' : 'Login code',
     h1a: de ? 'DEIN CODE' : 'YOUR CODE',
     h1b: de ? 'FÜR PEAK' : 'FOR PEAK',
     intro: de
@@ -5848,7 +5872,7 @@ async function sendEmail(to, type, data) {
             <tr><td style="padding:8px 0;">
               <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
                 <td valign="top" style="padding-right:12px;">
-                  <div style="width:24px;height:24px;background:${BRAND.red};color:${BRAND.white};font-family:${FONT_HEAD};font-weight:900;font-size:13px;text-align:center;line-height:24px;">1</div>
+                  <div style="width:24px;height:24px;background:${BRAND.redBright};color:${BRAND.ink};font-family:${FONT_HEAD};font-weight:900;font-size:13px;text-align:center;line-height:24px;">1</div>
                 </td>
                 <td style="font-family:${FONT_BODY};font-size:14px;line-height:1.5;color:${BRAND.ink2};padding-top:2px;">${L.step1}</td>
               </tr></table>
@@ -5856,7 +5880,7 @@ async function sendEmail(to, type, data) {
             <tr><td style="padding:8px 0;">
               <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
                 <td valign="top" style="padding-right:12px;">
-                  <div style="width:24px;height:24px;background:${BRAND.red};color:${BRAND.white};font-family:${FONT_HEAD};font-weight:900;font-size:13px;text-align:center;line-height:24px;">2</div>
+                  <div style="width:24px;height:24px;background:${BRAND.redBright};color:${BRAND.ink};font-family:${FONT_HEAD};font-weight:900;font-size:13px;text-align:center;line-height:24px;">2</div>
                 </td>
                 <td style="font-family:${FONT_BODY};font-size:14px;line-height:1.5;color:${BRAND.ink2};padding-top:2px;">${isFree ? L.step2Free : L.step2Paid}</td>
               </tr></table>
@@ -5864,7 +5888,7 @@ async function sendEmail(to, type, data) {
             <tr><td style="padding:8px 0;">
               <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
                 <td valign="top" style="padding-right:12px;">
-                  <div style="width:24px;height:24px;background:${BRAND.red};color:${BRAND.white};font-family:${FONT_HEAD};font-weight:900;font-size:13px;text-align:center;line-height:24px;">3</div>
+                  <div style="width:24px;height:24px;background:${BRAND.redBright};color:${BRAND.ink};font-family:${FONT_HEAD};font-weight:900;font-size:13px;text-align:center;line-height:24px;">3</div>
                 </td>
                 <td style="font-family:${FONT_BODY};font-size:14px;line-height:1.5;color:${BRAND.ink2};padding-top:2px;">${isFree ? L.step3Free : L.step3Paid}</td>
               </tr></table>
