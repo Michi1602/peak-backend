@@ -5262,18 +5262,14 @@ const BRAND = {
   dim: '#6B5D4A',      // Secondary text
   faint: '#9B9285',    // Footer/meta
   border: '#DFD9CB',   // Marble-toned divider
-  // Two Aurum tones — the deep one (Cinnamon) is used for any text/icon
-  // that sits on the cream marble body of the email. Passes WCAG-AA
-  // (4.58:1) which the bright Aurum (1.54:1) does NOT. The bright one
-  // is reserved for the header underline + button background where it
-  // sits on Atlantis-Depth (high contrast supplied by the dark
-  // background). The `red` key keeps its name for back-compat with the
-  // older template code; everything that pulls `red` now gets the
-  // Cinnamon so body bullets, label captions and so on are readable in
-  // inboxes that render the cream background.
-  red: '#8A6224',      // Cinnamon Aurum — body text/icons on cream
-  rdk: '#8A6224',      // Same — kept for callers that explicitly want it
-  redBright: '#E8B86B',// Bright Aurum — header underline + buttons on dark
+  // Aurum gold — PEAK's signature colour. Used for accents, bullets,
+  // header underline, buttons. Same hue on cream body and on dark
+  // header for brand consistency. The user explicitly preferred the
+  // bright #E8B86B over a darker WCAG-stricter alternative; readability
+  // on cream is supported via bold weight on small text.
+  red: '#E8B86B',      // Bright Aurum — accents + buttons
+  rdk: '#B8893E',      // Darker Aurum — kept for hover states
+  redBright: '#E8B86B',// Bright Aurum — alias for explicit callers
   white: '#FFFFFF',    // Pure white for contrast on dark header
   light: '#F0EBE0',    // Marble — body background
 };
