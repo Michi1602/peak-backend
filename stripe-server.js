@@ -1436,31 +1436,70 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
       return res.status(500).json({ error: upsertErr.message });
     }
 
-    // Generate TWO magic links:
-    //   1. magicLinkAuto — returned to the client, consumed immediately by
-    //      window.location.href = magicLinkAuto in the onboarding flow.
-    //      One-time use, dies on first click.
-    //   2. magicLinkEmail — embedded in the welcome email button. Must stay
-    //      valid because users frequently open PEAK on a second device
-    //      (phone after onboarding on laptop, or vice versa). If we used
-    //      the same link for both, the auto-login would already have
-    //      consumed it by the time the email arrives — user clicks the
-    //      mail button → Supabase rejects with "link expired" → user is
-    //      bounced to the login screen and has to do OTP. This was the
-    //      Free-signup double-login bug reported May 12.
-    const { data: linkAutoData } = await supabase.auth.admin.generateLink({
-      type: 'magiclink',
-      email: normalizedEmail,
-      options: { redirectTo: `${FRONTEND_URL}/` },
-    });
-    const magicLinkAuto = linkAutoData?.properties?.action_link || null;
+    // ── Auto-login via direct token exchange ─────────────────────────
+    // Previous approach (May 2026): generate magic-link, return URL to
+    // client, client does window.location.href = magicLink. That had two
+    // failure modes:
+    //   (1) On Supabase Free tier, two `generateLink` calls for the same
+    //       email in quick succession hit a rate-limit and the second
+    //       returned null. magicLinkAuto = null → frontend fell back to
+    //       the "Check your inbox" screen even though the welcome email
+    //       was sent fine. User report May 22, 2026.
+    //   (2) Even when both links generated, iOS Safari with the active
+    //       service worker would occasionally drop the cross-origin
+    //       navigation, landing the user on the intro screen.
+    //
+    // New approach: generate ONE magic-link, exchange it server-side via
+    // verifyOtp, return access_token + refresh_token to the client. The
+    // client calls supabase.auth.setSession() — no browser navigation,
+    // no race condition, no cross-origin handoff. The welcome email
+    // still embeds a separate magic-link for cross-device login (e.g.
+    // user signed up on laptop, opens the app on phone).
+    let autoTokens = null;
+    try {
+      const { data: linkAutoData, error: linkAutoErr } = await supabase.auth.admin.generateLink({
+        type: 'magiclink',
+        email: normalizedEmail,
+        options: { redirectTo: `${FRONTEND_URL}/` },
+      });
+      if (linkAutoErr) {
+        console.warn(`⚠️  Auto-link generation failed: ${linkAutoErr.message}`);
+      } else {
+        const hashedToken = linkAutoData?.properties?.hashed_token;
+        if (hashedToken) {
+          const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
+            type: 'magiclink',
+            token_hash: hashedToken,
+          });
+          if (verifyErr) {
+            console.warn(`⚠️  Auto-login OTP verify failed: ${verifyErr.message}`);
+          } else if (verifyData?.session) {
+            autoTokens = {
+              access_token: verifyData.session.access_token,
+              refresh_token: verifyData.session.refresh_token,
+            };
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`⚠️  Auto-login token exchange threw: ${e.message}`);
+      // Non-fatal — fall through to email-link fallback.
+    }
 
-    const { data: linkEmailData } = await supabase.auth.admin.generateLink({
-      type: 'magiclink',
-      email: normalizedEmail,
-      options: { redirectTo: `${FRONTEND_URL}/` },
-    });
-    const magicLinkEmail = linkEmailData?.properties?.action_link || null;
+    // Welcome-email magic-link — separate, stays valid for cross-device
+    // login. Wrapped in its own try so an email-send failure doesn't
+    // break the signup itself.
+    let magicLinkEmail = null;
+    try {
+      const { data: linkEmailData } = await supabase.auth.admin.generateLink({
+        type: 'magiclink',
+        email: normalizedEmail,
+        options: { redirectTo: `${FRONTEND_URL}/` },
+      });
+      magicLinkEmail = linkEmailData?.properties?.action_link || null;
+    } catch (e) {
+      console.warn(`⚠️  Email-link generation failed: ${e.message}`);
+    }
 
     try {
       await sendEmail(normalizedEmail, 'welcome', {
@@ -1477,10 +1516,16 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
       console.error('⚠️  Free welcome email failed:', err.message);
     }
 
-    console.log(`✅ Free signup complete: ${mE(normalizedEmail)} (${authUserId})`);
-    // Return the auto-login link to the client. The email link is the
-    // backup and stays valid independently.
-    res.json({ success: true, userId: authUserId, magicLink: magicLinkAuto });
+    console.log(`✅ Free signup complete: ${mE(normalizedEmail)} (${authUserId})${autoTokens ? ' [auto-login OK]' : ' [no auto-tokens, email fallback]'}`);
+    // Return the session tokens directly so the client can call
+    // supabase.auth.setSession() without any browser navigation. If
+    // token exchange failed, autoTokens is null and the client falls
+    // back to the "Check your inbox" screen.
+    res.json({
+      success: true,
+      userId: authUserId,
+      session: autoTokens,
+    });
   } catch (err) {
     console.error('❌ signup-free error:', err.message);
     res.status(500).json({ error: err.message });
