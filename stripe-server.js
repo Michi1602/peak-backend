@@ -5361,12 +5361,21 @@ function emailButton(href, label) {
   </table>`;
 }
 
-function emailFooter(email) {
+function emailFooter(email, lang) {
   // Token-signed unsubscribe link (audit #1.1). Without token the
   // endpoint rejects with a generic "link invalid" page. Tokens are
   // valid for 30 days; after that user has to unsubscribe in-app.
   const unsubToken = buildUnsubscribeToken(email);
   const unsub = `${BACKEND_URL}/unsubscribe?token=${encodeURIComponent(unsubToken)}`;
+  // Brand-tagline as a quiet signature between wordmark and legal links.
+  // Italic serif to match the in-app voice (Manifesto block, dashboard
+  // footer, login screen). Bilingual via the optional lang param —
+  // callers that don't pass it fall back to English so old callers
+  // still render correctly.
+  const taglineLang = (lang === 'de') ? 'de' : 'en';
+  const taglineText = (taglineLang === 'de')
+    ? '„Für Athleten, die langfristig denken."'
+    : '"For athletes who play the long game."';
   return `
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
     <tr>
@@ -5374,6 +5383,7 @@ function emailFooter(email) {
         <div style="font-family:${FONT_HEAD};font-size:14px;font-weight:600;letter-spacing:5px;color:${BRAND.white};line-height:1;">PEAK</div>
         <div style="width:32px;height:1px;background:${BRAND.redBright};margin:6px auto 4px;"></div>
         <div style="font-family:${FONT_BODY};font-size:9px;font-weight:500;letter-spacing:2px;color:#9B9285;text-transform:uppercase;">by MJ Performance</div>
+        <div style="font-family:Georgia,'Times New Roman',serif;font-style:italic;font-size:12px;color:#9B9285;margin-top:10px;letter-spacing:.3px;">${taglineText}</div>
       </td>
     </tr>
     <tr>
@@ -5483,7 +5493,7 @@ function buildMagicLinkEmail(magicLink, email, lang) {
     <tr><td style="padding:0 40px 40px;">
       <p style="margin:0;font-family:${FONT_BODY};font-size:12px;line-height:1.6;color:${BRAND.faint};">${L.expire}</p>
     </td></tr>
-    <tr><td>${emailFooter(email)}</td></tr>
+    <tr><td>${emailFooter(email, lang)}</td></tr>
   `);
   return { subject: L.subject, html };
 }
@@ -5970,7 +5980,7 @@ async function sendEmail(to, type, data) {
             `}
         </td></tr>
 
-        <tr><td>${emailFooter(to)}</td></tr>
+        <tr><td>${emailFooter(to, lang)}</td></tr>
       `;
       })())
     },
@@ -5999,7 +6009,7 @@ async function sendEmail(to, type, data) {
           ${emailButton(FRONTEND_URL, L.day6CTA)}
         </td></tr>
 
-        <tr><td>${emailFooter(to)}</td></tr>
+        <tr><td>${emailFooter(to, lang)}</td></tr>
       `)
     },
 
@@ -6031,7 +6041,7 @@ async function sendEmail(to, type, data) {
           ${emailButton(FRONTEND_URL, L.cancelConfirmedCTA)}
         </td></tr>
 
-        <tr><td>${emailFooter(to)}</td></tr>
+        <tr><td>${emailFooter(to, lang)}</td></tr>
       `)
     },
 
@@ -6060,7 +6070,7 @@ async function sendEmail(to, type, data) {
           ${emailButton(FRONTEND_URL, L.cancelReminderCTA)}
         </td></tr>
 
-        <tr><td>${emailFooter(to)}</td></tr>
+        <tr><td>${emailFooter(to, lang)}</td></tr>
       `)
     },
 
@@ -6089,7 +6099,7 @@ async function sendEmail(to, type, data) {
           ${emailButton(FRONTEND_URL, L.cancelFinalCTA)}
         </td></tr>
 
-        <tr><td>${emailFooter(to)}</td></tr>
+        <tr><td>${emailFooter(to, lang)}</td></tr>
       `)
     },
 
@@ -6114,7 +6124,7 @@ async function sendEmail(to, type, data) {
           </p>
         </td></tr>
 
-        <tr><td>${emailFooter(to)}</td></tr>
+        <tr><td>${emailFooter(to, lang)}</td></tr>
       `)
     },
 
@@ -6143,7 +6153,7 @@ async function sendEmail(to, type, data) {
           ${emailButton(FRONTEND_URL, L.paymentFailedCTA)}
         </td></tr>
 
-        <tr><td>${emailFooter(to)}</td></tr>
+        <tr><td>${emailFooter(to, lang)}</td></tr>
       `)
     },
 
@@ -6172,7 +6182,7 @@ async function sendEmail(to, type, data) {
           ${emailButton(FRONTEND_URL, L.trialEndingCTA)}
         </td></tr>
 
-        <tr><td>${emailFooter(to)}</td></tr>
+        <tr><td>${emailFooter(to, lang)}</td></tr>
       `)
     }
   };
