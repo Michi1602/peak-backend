@@ -2488,8 +2488,12 @@ app.post('/ai/quick-log', aiLimiter, async (req, res) => {
       if (u?.status === 'blocked_voucher_abuse') {
         return res.status(403).json({ error: 'account_blocked' });
       }
-      if (u?.tier !== 'premium') {
-        return res.status(403).json({ error: 'premium_required' });
+      // v15s (May 22, 2026): Log was Premium-only; user decided to make
+      // it Basic+ so the upgrade pull happens at the Free→Basic step
+      // (the most common conversion), not at Basic→Premium. Free users
+      // still hit this 403 with a clear upgrade hint.
+      if (u?.tier !== 'premium' && u?.tier !== 'basic') {
+        return res.status(403).json({ error: 'basic_required' });
       }
     } catch (_) { /* fail-closed on DB errors for tier check */
       return res.status(500).json({ error: 'tier_check_failed' });
