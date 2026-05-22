@@ -2464,7 +2464,7 @@ app.post('/ai/quick-log', aiLimiter, async (req, res) => {
       return res.status(400).json({ error: 'text required' });
     }
 
-    // Auth (required — this endpoint is Premium-only)
+    // Auth (required — this endpoint is Basic+ since v15s)
     // Audit Pass 1 #4.1: shared extractBearerToken helper.
     const quickLogToken = extractBearerToken(req);
     if (!quickLogToken) {
@@ -3572,12 +3572,32 @@ app.delete('/user/account', userLimiter, async (req, res) => {
         // health data.
         const customer = await stripe.customers.retrieve(profile.stripe_customer_id);
         if (customer && customer.metadata) {
+          // Audit Pass 2 #4 (KRIT, DSGVO Art. 17 + Art. 9):
+          // Previous list only covered single-field names like 'age',
+          // 'gender' etc. — but /create-checkout actually packs all the
+          // health data into TWO JSON-string fields (profileBio,
+          // profileTrain) plus a handful of user* prefixed fields. The
+          // single-field scrub left those JSON blobs sitting untouched
+          // in Stripe customer metadata for up to 10 years after account
+          // deletion. List now covers BOTH naming styles so we are dicht
+          // regardless of which create-checkout version wrote them.
+          //
+          // Verification: after account-delete, inspect the Stripe
+          // customer in Dashboard → profileBio and profileTrain must be
+          // gone, only deleted_at + deletion_reason remain.
           const HEALTH_KEYS = [
+            // Legacy single-field style (older create-checkout versions
+            // and any future direct-field writes — kept for completeness)
             'age', 'gender', 'weight', 'dweight', 'height', 'sleep',
             'job', 'commute', 'stress', 'sport', 'level', 'sessions',
             'dur', 'equip', 'cook', 'budget', 'goal', 'goals',
             'allergies', 'al', 'diet', 'di', 'cuisines', 'cu',
             'stretchAreas', 'stretchDur', 'trainDays', 'name',
+            // Current packed-JSON style — these are the fields actually
+            // written by /create-checkout and were silently surviving
+            // account-deletion before this fix.
+            'profileBio', 'profileTrain',
+            'userName', 'userGoal', 'userGoals', 'userSport', 'userLang',
           ];
           const scrubbed = {};
           for (const k of HEALTH_KEYS) {
@@ -3750,7 +3770,12 @@ app.get('/user/export-data', userLimiter, async (req, res) => {
       user_id: userId,
       email: email,
       profile: profile || null,
-      _notice: 'This export contains all personal data MJ Performance / PEAK holds about you. Payment data is held by Stripe and not included here — see stripe.com/privacy. AI prompts sent to Anthropic during your usage are not retained (Zero Data Retention).'
+      // Audit Pass 2 #5: previous notice claimed Zero Data Retention which
+      // is NOT what we have with Anthropic — we use their standard API
+      // terms (no model-training on API inputs, but standard retention
+      // applies). Datenschutzerklärung was corrected; this notice has to
+      // match or we have a written inconsistency for a complainant.
+      _notice: 'This export contains all personal data MJ Performance / PEAK holds about you. Payment data is held by Stripe and not included here — see stripe.com/privacy. AI prompts sent to Anthropic are processed under their standard API terms and are not used to train the models. See peak-mj-performance.app/datenschutz for full details.'
     };
 
     console.log(`📦 Data export generated for ${mE(email)}`);
