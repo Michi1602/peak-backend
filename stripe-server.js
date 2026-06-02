@@ -1604,6 +1604,109 @@ app.post('/customer-portal', authLimiter, async (req, res) => {
   }
 });
 
+
+// ── §312k BGB — KÜNDIGUNGSBUTTON BACKEND ──────────────────────────────
+// Öffentlicher, login-freier Kündigungs-Endpoint hinter dem On-Site-Flow
+// "Verträge hier kündigen" → "Jetzt kündigen". Ein Login-Gate hier wäre
+// eine unzulässige "Aufspaltung" (OLG Düsseldorf 23.05.2024), daher wird
+// der Verbraucher nur über die Konto-E-Mail identifiziert. Missbrauch ist
+// abgefedert: Wirkung erst zum Periodenende (kein Sofortverlust), sofortige
+// Bestätigungs-Mail an den Inhaber (Reaktivierung möglich), strikt
+// rate-limitiert.
+const cancelLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'rate_limited', message: 'Zu viele Anfragen. Bitte versuche es später erneut. / Too many requests, please try again later.' },
+});
+
+app.post('/cancel-subscription', cancelLimiter, async (req, res) => {
+  try {
+    const { email, name, art, grund, lang } = req.body || {};
+    const lng = (lang === 'de') ? 'de' : 'en';
+    const t = (de, en) => (lng === 'de' ? de : en);
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      return res.status(400).json({ error: 'invalid_email', message: t('Bitte gib eine gültige E-Mail-Adresse an.', 'Please provide a valid email address.') });
+    }
+    const cleanEmail = email.toLowerCase().trim();
+    const kind = (art === 'ausserordentlich') ? 'ausserordentlich' : 'ordentlich';
+
+    // Vertrag über die Konto-E-Mail identifizieren.
+    const { data: profile, error: pErr } = await supabase
+      .from('users')
+      .select('stripe_subscription_id, tier, lang')
+      .eq('email', cleanEmail)
+      .maybeSingle();
+    if (pErr) throw pErr;
+
+    if (!profile || !profile.stripe_subscription_id) {
+      return res.status(404).json({
+        error: 'no_active_subscription',
+        message: t('Für diese E-Mail-Adresse haben wir kein aktives Abo gefunden. Bitte prüfe die Adresse oder kontaktiere uns.', 'We could not find an active subscription for this email. Please check the address or contact us.'),
+      });
+    }
+
+    // Kündigung zum Ende des laufenden Abrechnungszeitraums vormerken.
+    let updated;
+    try {
+      updated = await stripe.subscriptions.update(profile.stripe_subscription_id, {
+        cancel_at_period_end: true,
+        metadata: {
+          cancellation_via: '312k_button',
+          cancellation_art: kind,
+          cancellation_reason: (grund || '').toString().slice(0, 480),
+          cancellation_name: (name || '').toString().slice(0, 200),
+          cancellation_at: new Date().toISOString(),
+        },
+      });
+    } catch (stripeErr) {
+      if (stripeErr && stripeErr.message && stripeErr.message.includes('No such subscription')) {
+        return res.status(404).json({ error: 'no_active_subscription', message: t('Für diese E-Mail-Adresse haben wir kein aktives Abo gefunden.', 'We could not find an active subscription for this email.') });
+      }
+      throw stripeErr;
+    }
+
+    const endTs = updated.current_period_end ? updated.current_period_end * 1000 : null;
+    const endDateStr = endTs
+      ? new Date(endTs).toLocaleDateString(lng === 'de' ? 'de-DE' : 'en-US', { day: '2-digit', month: 'long', year: 'numeric' })
+      : null;
+
+    // DB-Status spiegeln (der Webhook tut dies ebenfalls, aber wir setzen es
+    // sofort, damit die App den Zustand direkt korrekt zeigt).
+    try {
+      await supabase.from('users').update({
+        status: 'cancelling',
+        cancel_at: endTs ? new Date(endTs).toISOString() : null,
+        cancel_reminder_sent: false,
+      }).eq('email', cleanEmail);
+    } catch (dbErr) {
+      console.error('❌ cancel-subscription DB update failed:', dbErr.message);
+    }
+
+    // §312k: unverzügliche Eingangsbestätigung in Textform (E-Mail). Der
+    // Webhook erkennt dieselbe Kündigung, überspringt aber wegen des
+    // Metadata-Flags seine eigene Mail → der Verbraucher erhält genau eine.
+    try {
+      await sendEmail(cleanEmail, 'cancellation_received', {
+        lang: lng,
+        art: kind,
+        grund: (grund || '').toString(),
+        receivedAt: new Date().toLocaleString(lng === 'de' ? 'de-DE' : 'en-US'),
+        endDate: endDateStr,
+      });
+    } catch (mailErr) {
+      console.error('❌ cancellation_received email failed:', mailErr.message);
+    }
+
+    console.log(`🛑 §312k cancellation for ${mE(cleanEmail)} (${kind}, ends ${endDateStr})`);
+    return res.json({ ok: true, endDate: endDateStr, art: kind });
+  } catch (err) {
+    console.error('❌ cancel-subscription error:', err.message);
+    return res.status(500).json({ error: 'server_error', message: 'Something went wrong. Please try again.' });
+  }
+});
+
 // ── SHARING ENDPOINTS ─────────────────────────────────────────────────
 // Users on Basic+ can share individual recipes, workouts and stretch
 // routines via a short link. Flow:
@@ -2356,6 +2459,127 @@ If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
     res.json(parsed);
   } catch (err) {
     console.error('❌ /ai/scan-menu error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ── SCAN: MEAL PHOTO (Foto-Meal-Tracking) ─────────────────────────────
+// User photographs their actual plate/meal → Claude Vision estimates the
+// foods and their nutrition so the meal can be logged. Sibling of
+// /ai/scan-menu (which reads restaurant menus); this one reads the food in
+// front of you. Premium-only, like the rest of the scanner. The image is
+// processed in memory and NEVER stored (privacy — flagged for Caroline's
+// data-protection section).
+app.post('/ai/scan-meal', aiLimiter, imageJson, async (req, res) => {
+  try {
+    const { image, mediaType, userGoal, userLang } = req.body;
+    if (!image || typeof image !== 'string') {
+      return res.status(400).json({ error: 'image required (base64 data)' });
+    }
+    if (image.length > 6 * 1024 * 1024) {
+      console.warn(`scan-meal image too large: ${image.length} bytes`);
+      return res.status(413).json({ error: 'image too large', code: 'IMAGE_TOO_LARGE', maxBytes: 6 * 1024 * 1024 });
+    }
+    const mt = (mediaType && /^image\/(jpeg|png|webp|gif)$/.test(mediaType)) ? mediaType : 'image/jpeg';
+
+    // Premium-only, server-side enforced (same gate as /ai/scan-menu).
+    const auth = await resolveAuthAndTier(req, { requirePremium: true });
+    if (!auth.ok) return res.status(auth.status).json(auth.body);
+    const userEmail = auth.email || 'unknown';
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'AI not configured' });
+
+    const de = userLang === 'de';
+    const safeGoal = (typeof userGoal === 'string')
+      ? userGoal.replace(/[\p{C}]/gu, '').slice(0, 200).trim()
+      : '';
+    const goalHint = safeGoal ? (de ? `Ziel des Nutzers: ${safeGoal}.` : `User goal: ${safeGoal}.`) : '';
+
+    const prompt = de
+      ? `Du siehst ein Foto einer echten Mahlzeit (Teller/Schüssel/Verpackung), die der Nutzer gerade isst oder essen will. Schätze, was darauf ist, und die Nährwerte. ${goalHint}
+
+PORTIONS- & KALORIEN-SCHÄTZUNG (ehrlich, nicht schönrechnen):
+- Schätze die Portionsgröße anhand sichtbarer Referenzen (Teller ~26cm, Besteck, Hand).
+- Hausmannskost-Teller: 600-900 kcal, üppige Teller 1000-1400 kcal.
+- Beilagen-Richtwerte: Pommes +380-450, Reis (gekocht) +250-350, Nudeln (gekocht) +300-400, Kartoffeln +280-340, Brot/Brötchen +150-250.
+- Sahne-/Käse-/Frittier-Anteile großzügig dazurechnen. Öl/Butter beim Anbraten: +100-200 kcal, oft unsichtbar.
+- Lieber realistisch-hoch als zu niedrig.
+
+MAKRO-SCHÄTZUNG je erkanntem Bestandteil (Protein/Kohlenhydrate/Fett in Gramm):
+- 100g mageres Fleisch/Fisch entspricht ca. 20-30g Protein.
+- Reis/Nudeln/Kartoffeln/Brot sind die Hauptquelle für Kohlenhydrate.
+- Sichtbares Öl, Käse, Sauce, Nüsse sind die Hauptquelle für Fett.
+- Die Makro-Summe sollte grob zu den Gesamt-kcal passen (Protein x4 + Kohlenhydrate x4 + Fett x9 etwa gleich kcal).
+
+WICHTIG: Das ist eine Schätzung, kein Laborwert. Bleib sachlich und wertfrei — KEINE Bewertung wie "ungesund", kein Lob, keine Moral. Nur die Schätzung.
+
+Antworte AUSSCHLIESSLICH als JSON (kein Markdown):
+{"items":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>}],"total":{"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>},"confidence":"hoch"|"mittel"|"niedrig"}
+Falls kein Essen erkennbar ist: {"items":[],"error":"no_food"}.`
+      : `You see a photo of a real meal (plate/bowl/packaging) the user is eating or about to eat. Estimate what's on it and its nutrition. ${goalHint}
+
+PORTION & CALORIE ESTIMATION (honest, don't undersell):
+- Estimate portion size from visible references (plate ~26cm, cutlery, hand).
+- Home-cooked plate: 600-900 kcal, generous plate 1000-1400 kcal.
+- Side references: fries +380-450, cooked rice +250-350, cooked pasta +300-400, potatoes +280-340, bread/roll +150-250.
+- Add cream/cheese/fried components generously. Cooking oil/butter: +100-200 kcal, often invisible.
+- Err on the realistic-high side.
+
+MACRO ESTIMATION per detected component (protein/carbs/fat in grams):
+- 100g lean meat/fish is roughly 20-30g protein.
+- Rice/pasta/potatoes/bread are the main carb source.
+- Visible oil, cheese, sauce, nuts are the main fat source.
+- The macro sum should roughly match total kcal (protein x4 + carbs x4 + fat x9 approximately equals kcal).
+
+IMPORTANT: This is an estimate, not a lab value. Stay factual and non-judgmental — NO ratings like "unhealthy", no praise, no moralising. Just the estimate.
+
+Respond ONLY as JSON (no markdown):
+{"items":[{"name":"...","kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>}],"total":{"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>},"confidence":"high"|"medium"|"low"}
+If no food is visible: {"items":[],"error":"no_food"}.`;
+
+    const modelName = resolveModel('scan', 'claude-haiku-4-5-20251001');
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: modelName,
+        max_tokens: 800,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mt, data: image } },
+            { type: 'text', text: prompt },
+          ],
+        }],
+      }),
+    });
+
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error(`scan-meal Anthropic ${r.status}:`, errText.slice(0, 300));
+      return res.status(502).json({ error: 'AI service error' });
+    }
+
+    const data = await r.json();
+    const text = data?.content?.[0]?.text || '';
+    const clean = text.replace(/^```json\s*|```$/g, '').trim();
+    let parsed;
+    try { parsed = JSON.parse(clean); }
+    catch (e) {
+      console.error(`scan-meal JSON parse failed for ${mE(userEmail)}:`, clean.slice(0, 200));
+      return res.status(502).json({ error: 'Could not read meal' });
+    }
+
+    console.log(`scan-meal OK for ${mE(userEmail)}: ${(parsed.items || []).length} items`);
+    res.json(parsed);
+  } catch (err) {
+    console.error('/ai/scan-meal error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -5194,7 +5418,19 @@ app.post('/webhook', async (req, res) => {
             const endDateStr = endDate
               ? endDate.toLocaleDateString(userLang === 'de' ? 'de-DE' : 'en-US', { day: '2-digit', month: 'long', year: 'numeric' })
               : '';
-            await sendEmail(email, 'cancellation_confirmed', { endDate: endDateStr, lang: userLang, tier: userTier });
+            // §312k: Wurde diese Kündigung gerade über den Kündigungsbutton
+            // ausgelöst, hat der /cancel-subscription-Endpoint bereits die
+            // Eingangsbestätigung (cancellation_received) gesendet — dann hier
+            // KEINE zweite Mail. Recency-Check sorgt dafür, dass spätere
+            // Portal-Kündigungen wieder normal bestätigt werden.
+            const __via312k = sub.metadata && sub.metadata.cancellation_via === '312k_button';
+            const __cancelAtTs = (sub.metadata && sub.metadata.cancellation_at) ? Date.parse(sub.metadata.cancellation_at) : 0;
+            const __recent312k = __via312k && __cancelAtTs && (Date.now() - __cancelAtTs < 3 * 60 * 1000);
+            if (__recent312k) {
+              console.log('Skip cancellation_confirmed (312k receipt already sent) for ' + mE(email));
+            } else {
+              await sendEmail(email, 'cancellation_confirmed', { endDate: endDateStr, lang: userLang, tier: userTier });
+            }
             console.log(`📧 Cancellation confirmed → ${mE(email)} (ends ${endDateStr}, ${userLang}, ${userTier})`);
           } catch (err) {
             console.error('⚠️  cancellation_confirmed email failed:', err.message);
@@ -5694,6 +5930,25 @@ async function sendEmail(to, type, data) {
     cancelConfirmedNote: 'Bis dahin kannst du PEAK in vollem Umfang nutzen. Deine Daten, Pläne und Fortschritte bleiben erhalten.',
     cancelConfirmedReactivateBox: '<strong>Wieder aktivieren?</strong> Kein Problem — öffne einfach PEAK und wähle einen Plan. Dein Profil ist gespeichert.',
     cancelConfirmedCTA: 'PEAK öffnen',
+    cancelReceivedSubject: 'Eingangsbestätigung deiner Kündigung',
+    cancelReceivedLabel: 'Kündigung eingegangen',
+    cancelReceivedH1a: 'Kündigung',
+    cancelReceivedH1b: 'eingegangen.',
+    cancelReceivedBody: (d) => {
+      const kindTxt = (d && d.art === 'ausserordentlich')
+        ? 'Außerordentliche Kündigung (fristlos, aus wichtigem Grund)'
+        : 'Ordentliche Kündigung';
+      const eff = (d && d.endDate)
+        ? `Deine Kündigung wird zum Ende des laufenden Abrechnungszeitraums wirksam, am <strong>${d.endDate}</strong>. Bis dahin bleibt dein Zugang vollständig aktiv.`
+        : 'Deine Kündigung wird zum nächstmöglichen Zeitpunkt wirksam.';
+      return `Wir bestätigen den Eingang deiner Kündigung. Diese E-Mail dient dir als Nachweis in Textform &ndash; bitte bewahre sie auf.<br><br>`
+        + `<strong>Eingegangen am:</strong> ${(d && d.receivedAt) || ''}<br>`
+        + `<strong>Art der Kündigung:</strong> ${kindTxt}<br><br>`
+        + eff;
+    },
+    cancelReceivedNote: 'Deine Daten, Pläne und Fortschritte bleiben bis zum Ende des Zeitraums erhalten.',
+    cancelReceivedReactivateBox: '<strong>Doch weitermachen?</strong> Du kannst die Kündigung jederzeit rückgängig machen &ndash; öffne einfach PEAK und wähle einen Plan.',
+    cancelReceivedCTA: 'PEAK öffnen',
     cancelReminderSubject: (days, tier) => {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return days === 3 ? `Dein ${label} endet in 3 Tagen` : `Dein ${label} endet bald`;
@@ -5828,6 +6083,25 @@ async function sendEmail(to, type, data) {
     cancelConfirmedNote: 'Until then, use PEAK to the fullest. Your data, plans and progress are safe.',
     cancelConfirmedReactivateBox: '<strong>Changed your mind?</strong> No problem — open PEAK and pick a plan. Your profile is saved.',
     cancelConfirmedCTA: 'Open PEAK',
+    cancelReceivedSubject: 'Confirmation of receipt of your cancellation',
+    cancelReceivedLabel: 'Cancellation received',
+    cancelReceivedH1a: 'Cancellation',
+    cancelReceivedH1b: 'received.',
+    cancelReceivedBody: (d) => {
+      const kindTxt = (d && d.art === 'ausserordentlich')
+        ? 'Extraordinary cancellation (immediate, for good cause)'
+        : 'Ordinary cancellation';
+      const eff = (d && d.endDate)
+        ? `Your cancellation takes effect at the end of the current billing period, on <strong>${d.endDate}</strong>. Your access stays fully active until then.`
+        : 'Your cancellation takes effect at the earliest possible date.';
+      return `We confirm receipt of your cancellation. This email serves as your proof in text form &ndash; please keep it.<br><br>`
+        + `<strong>Received on:</strong> ${(d && d.receivedAt) || ''}<br>`
+        + `<strong>Type of cancellation:</strong> ${kindTxt}<br><br>`
+        + eff;
+    },
+    cancelReceivedNote: 'Your data, plans and progress are kept until the end of the period.',
+    cancelReceivedReactivateBox: '<strong>Changed your mind?</strong> You can reverse the cancellation anytime &ndash; just open PEAK and pick a plan.',
+    cancelReceivedCTA: 'Open PEAK',
     cancelReminderSubject: (days, tier) => {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return days === 3 ? `Your ${label} ends in 3 days` : `Your ${label} ends soon`;
@@ -6075,6 +6349,37 @@ async function sendEmail(to, type, data) {
     },
 
     // ── CANCELLATION EMAIL B: Reminder (3 days before end) ──
+    cancellation_received: {
+      subject: L.cancelReceivedSubject,
+      html: emailShell(RESPONSIVE_CSS + `
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${L.cancelReceivedLabel}</p>
+          <h1 class="email-h1" style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:-0.5px;color:${BRAND.ink};">
+            ${L.cancelReceivedH1a}<br>${L.cancelReceivedH1b}
+          </h1>
+          <p style="margin:0 0 24px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            ${L.cancelReceivedBody(data)}
+          </p>
+          <p style="margin:0 0 28px;font-family:${FONT_BODY};font-size:14px;line-height:1.65;color:${BRAND.ink2};">
+            ${L.cancelReceivedNote}
+          </p>
+
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};margin:0 0 8px;">
+            <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
+              ${L.cancelReceivedReactivateBox}
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td class="email-cta" align="center" style="padding:0 40px 56px;">
+          ${emailButton(FRONTEND_URL, L.cancelReceivedCTA)}
+        </td></tr>
+
+        <tr><td>${emailFooter(to, lang)}</td></tr>
+      `)
+    },
+
     cancellation_reminder: {
       subject: L.cancelReminderSubject(data?.daysLeft || 3, data?.tier || 'premium'),
       html: emailShell(RESPONSIVE_CSS + `
