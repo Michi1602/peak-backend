@@ -210,7 +210,16 @@ const smallJson = express.json({ limit: '100kb' });   // default
 const mediumJson = express.json({ limit: '500kb' });  // /user/lite-sync, /user/plan, /family/* may be larger
 const imageJson = express.json({ limit: '8mb' });     // /ai/scan-menu only
 
-app.use(smallJson);
+// The global JSON limit must NOT swallow the large base64 image bodies of the
+// photo-scan endpoints — they declare their own 8mb imageJson. Without this
+// skip, smallJson (100kb) returns 413 for every meal/menu photo BEFORE the
+// route runs (its route-level imageJson never gets the body). All other routes
+// keep the tight 100kb global default. scan-meal still enforces its own 6mb
+// hard cap internally.
+app.use(function(req, res, next){
+  if (req.path === '/ai/scan-meal' || req.path === '/ai/scan-menu') return next();
+  return smallJson(req, res, next);
+});
 
 // ── RATE LIMITERS — protect expensive AI endpoints + auth flows ──────
 // Audit Pass 5 #8.2: trust proxy = 1 is Render-specific. Render's load
