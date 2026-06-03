@@ -5937,7 +5937,12 @@ async function sendEmail(to, type, data) {
   } catch (err) {
     console.error('Unsubscribe-check exception:', err.message);
   }
-  if (unsubscribed) return;
+  // Transactional / security emails are exempt from the marketing unsubscribe:
+  // the §312k cancellation receipt carries the one-click "das war ich nicht /
+  // undo" reactivation link and must reach the account holder even if they have
+  // unsubscribed from other mail. Kept to a tight allowlist on purpose.
+  const ALWAYS_SEND = ['cancellation_received'];
+  if (unsubscribed && ALWAYS_SEND.indexOf(type) === -1) return;
 
   // Language detection priority:
   //   1. explicit data.lang
