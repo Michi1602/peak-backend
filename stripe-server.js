@@ -504,6 +504,45 @@ function verifyUnsubscribeToken(token) {
   return email;
 }
 
+// ── §312k REACTIVATION TOKEN (Audit Befund 40 hardening) ──────────────
+// Signed one-click "undo cancellation" link, emailed to the account owner
+// inside the §312k cancellation receipt. Lets the rightful owner instantly
+// reverse a cancellation they did not request — the key abuse mitigation
+// for the login-free §312k button (only the owner ever receives that mail).
+// Purpose-bound ("reactivate-sub|…") so it can never be confused with an
+// unsubscribe token, even though both reuse UNSUBSCRIBE_SECRET (the purpose
+// tag is part of the signed payload, so cross-use fails the prefix check).
+function buildReactivateToken(email) {
+  const secret = unsubscribeSecret();
+  if (!secret) return null;
+  const ts = Date.now();
+  const payload = `reactivate-sub|${email.toLowerCase().trim()}|${ts}`;
+  const mac = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
+  return `${Buffer.from(payload).toString('base64url')}.${mac}`;
+}
+function verifyReactivateToken(token) {
+  if (!token || typeof token !== 'string') return null;
+  const secret = unsubscribeSecret();
+  if (!secret) return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  let payload;
+  try { payload = Buffer.from(parts[0], 'base64url').toString('utf-8'); } catch (_) { return null; }
+  const expectedMac = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
+  const expectedBuf = Buffer.from(expectedMac);
+  const givenBuf = Buffer.from(parts[1]);
+  if (expectedBuf.length !== givenBuf.length) return null;
+  if (!crypto.timingSafeEqual(expectedBuf, givenBuf)) return null;
+  const segs = payload.split('|');
+  if (segs.length !== 3 || segs[0] !== 'reactivate-sub') return null;
+  const email = segs[1];
+  const ts = parseInt(segs[2], 10);
+  if (!email || !ts || isNaN(ts)) return null;
+  // 30-day expiry — ample for the owner to react to an unwanted cancellation.
+  if (Date.now() - ts > 30 * 24 * 60 * 60 * 1000) return null;
+  return email;
+}
+
 // Tiny HTML-escape for the rare case we need to render user-influenced
 // strings into the unsubscribe response. The previous version inlined
 // `email` unescaped (audit #1.1) — even if the current template doesn't
@@ -1632,6 +1671,21 @@ app.post('/cancel-subscription', cancelLimiter, async (req, res) => {
     const cleanEmail = email.toLowerCase().trim();
     const kind = (art === 'ausserordentlich') ? 'ausserordentlich' : 'ordentlich';
 
+    // Befund 40 hardening: opportunistically verify the caller's session. We
+    // do NOT require it — the §312k button must stay login-free (see header
+    // note re OLG Düsseldorf). But when a valid Bearer token is present AND
+    // matches the account email, the cancellation is identity-verified; we
+    // record that in the audit metadata. No blocking → no §312k impact.
+    let authVerified = false;
+    try {
+      const ah = req.headers.authorization || '';
+      if (ah.startsWith('Bearer ')) {
+        const r = await supabase.auth.getUser(ah.slice(7));
+        const au = r && r.data && r.data.user;
+        if (au && au.email && au.email.toLowerCase().trim() === cleanEmail) authVerified = true;
+      }
+    } catch (_) { /* invalid/expired token → treat as the login-free path */ }
+
     // Vertrag über die Konto-E-Mail identifizieren.
     const { data: profile, error: pErr } = await supabase
       .from('users')
@@ -1657,6 +1711,7 @@ app.post('/cancel-subscription', cancelLimiter, async (req, res) => {
           cancellation_art: kind,
           cancellation_reason: (grund || '').toString().slice(0, 480),
           cancellation_name: (name || '').toString().slice(0, 200),
+          cancellation_authenticated: authVerified ? 'true' : 'false',
           cancellation_at: new Date().toISOString(),
         },
       });
@@ -1688,22 +1743,94 @@ app.post('/cancel-subscription', cancelLimiter, async (req, res) => {
     // Webhook erkennt dieselbe Kündigung, überspringt aber wegen des
     // Metadata-Flags seine eigene Mail → der Verbraucher erhält genau eine.
     try {
+      const reactivateTok = buildReactivateToken(cleanEmail);
+      const reactivateUrl = reactivateTok ? `${BACKEND_URL}/reactivate-subscription?token=${encodeURIComponent(reactivateTok)}` : null;
       await sendEmail(cleanEmail, 'cancellation_received', {
         lang: lng,
         art: kind,
         grund: (grund || '').toString(),
         receivedAt: new Date().toLocaleString(lng === 'de' ? 'de-DE' : 'en-US'),
         endDate: endDateStr,
+        reactivateUrl: reactivateUrl,
       });
     } catch (mailErr) {
       console.error('❌ cancellation_received email failed:', mailErr.message);
     }
 
-    console.log(`🛑 §312k cancellation for ${mE(cleanEmail)} (${kind}, ends ${endDateStr})`);
+    console.log(`🛑 §312k cancellation for ${mE(cleanEmail)} (${kind}, ends ${endDateStr}, auth=${authVerified})`);
     return res.json({ ok: true, endDate: endDateStr, art: kind });
   } catch (err) {
     console.error('❌ cancel-subscription error:', err.message);
     return res.status(500).json({ error: 'server_error', message: 'Something went wrong. Please try again.' });
+  }
+});
+
+// ── §312k REACTIVATION (Befund 40 hardening) ──────────────────────────
+// One-click "undo" for the account owner, reachable only via the signed
+// link in the cancellation receipt (only the owner receives that email).
+// Two-step (GET shows a page, a form POST performs the undo) so an email
+// link-prefetcher cannot silently reverse a cancellation the user really
+// wanted. The token is purpose-bound + HMAC-signed, so it cannot be forged.
+const reactivateLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'rate_limited' },
+});
+
+function reactivatePage(bodyHtml) {
+  return `<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PEAK</title>
+  <style>
+    body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;max-width:480px;margin:80px auto;padding:0 20px;text-align:center;background:#F0EBE0;color:#1A1410}
+    h1{font-family:'Cinzel','Georgia',serif;font-weight:600;letter-spacing:2px;text-transform:uppercase;font-size:18px;color:#0A1420}
+    p{color:#6B5D4A;line-height:1.6}
+    .btn{display:inline-block;background:#E8B86B;color:#0A1420;border:none;cursor:pointer;padding:14px 28px;text-decoration:none;font-family:'Cinzel','Georgia',serif;font-weight:600;font-size:12px;letter-spacing:2.5px;text-transform:uppercase;margin-top:20px}
+  </style></head><body>${bodyHtml}</body></html>`;
+}
+
+app.get('/reactivate-subscription', reactivateLimiter, (req, res) => {
+  const email = verifyReactivateToken(req.query.token);
+  if (!email) {
+    return res.status(400).send(reactivatePage(`<h1>Link ungültig oder abgelaufen</h1><p>Bitte logge dich in der App ein.<br><br>This link is invalid or expired. Please log in to the app.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
+  }
+  const tok = htmlEsc(String(req.query.token || ''));
+  return res.send(reactivatePage(`<h1>Kündigung rückgängig machen</h1><p>Möchtest du deine PEAK-Mitgliedschaft fortsetzen? Die geplante Kündigung wird damit aufgehoben.<br><br>Resume your PEAK membership? This reverses the scheduled cancellation.</p><form method="POST" action="/reactivate-subscription/confirm"><input type="hidden" name="token" value="${tok}"><button type="submit" class="btn">Fortsetzen / Resume</button></form>`));
+});
+
+app.post('/reactivate-subscription/confirm', reactivateLimiter, express.urlencoded({ extended: false }), async (req, res) => {
+  try {
+    const email = verifyReactivateToken((req.body && req.body.token) || '');
+    if (!email) {
+      return res.status(400).send(reactivatePage(`<h1>Link ungültig oder abgelaufen</h1><p>This link is invalid or expired.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
+    }
+    const { data: profile } = await supabase
+      .from('users')
+      .select('stripe_subscription_id')
+      .eq('email', email)
+      .maybeSingle();
+    if (!profile || !profile.stripe_subscription_id) {
+      return res.status(404).send(reactivatePage(`<h1>Kein Abo gefunden</h1><p>Wir konnten kein Abo finden.<br><br>No subscription found.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
+    }
+    try {
+      await stripe.subscriptions.update(profile.stripe_subscription_id, {
+        cancel_at_period_end: false,
+        metadata: { reactivated_via: '312k_undo', reactivated_at: new Date().toISOString() },
+      });
+    } catch (stripeErr) {
+      console.error('❌ reactivate stripe error:', stripeErr.message);
+      return res.status(409).send(reactivatePage(`<h1>Reaktivierung nicht möglich</h1><p>Dein Abo ist möglicherweise bereits beendet. Bitte abonniere in der App erneut.<br><br>Your subscription may already have ended. Please re-subscribe in the app.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
+    }
+    try {
+      await supabase.from('users').update({ status: 'active', cancel_at: null, cancel_reminder_sent: false }).eq('email', email);
+    } catch (dbErr) {
+      console.error('❌ reactivate DB update failed:', dbErr.message);
+    }
+    console.log(`↩️  §312k reactivation for ${mE(email)}`);
+    return res.send(reactivatePage(`<h1>Mitgliedschaft fortgesetzt</h1><p>Deine Kündigung wurde aufgehoben — deine PEAK-Mitgliedschaft läuft weiter.<br><br>Your cancellation has been reversed — your PEAK membership continues.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
+  } catch (err) {
+    console.error('❌ reactivate-subscription error:', err.message);
+    return res.status(500).send(reactivatePage(`<h1>Fehler</h1><p>Etwas ist schiefgelaufen. Bitte versuche es erneut.<br><br>Something went wrong. Please try again.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
   }
 });
 
@@ -6370,6 +6497,11 @@ async function sendEmail(to, type, data) {
               ${L.cancelReceivedReactivateBox}
             </td></tr>
           </table>
+          ${(data && data.reactivateUrl) ? `
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" style="padding:18px 0 0;">
+            ${emailButton(data.reactivateUrl, de ? 'Das war ich nicht — rückgängig machen' : "I didn't request this — undo")}
+          </td></tr></table>
+          ` : ''}
         </td></tr>
 
         <tr><td class="email-cta" align="center" style="padding:0 40px 56px;">
