@@ -3858,6 +3858,54 @@ app.post('/user/update-profile', userLimiter, async (req, res) => {
 //   3. Delete public.users row
 //   4. Delete Supabase Auth user
 //   5. Send confirmation email
+// ── Befund 8: account-deletion email confirmation code ───────────────
+// A stolen — or simply left-open — session can pass the typed "LÖSCHEN"
+// phrase, so the destructive delete below additionally requires a 6-digit
+// code emailed to the account address (the same channel as passwordless
+// login = proof of email control). Codes are kept HASHED in-memory with a
+// 15-min TTL; a server restart just voids pending codes — the user simply
+// re-requests, never a lockout, so DSGVO Art. 17 deletion stays possible.
+// (Single Render instance pre-launch; if scaled out, move this to a table.)
+const __deletionCodes = new Map();   // userId -> { hash, expires }
+function __setDeletionCode(userId, code){
+  __deletionCodes.set(userId, { hash: hashCode(code), expires: Date.now() + 15 * 60 * 1000 });
+}
+function __verifyDeletionCode(userId, code){
+  const e = __deletionCodes.get(userId);
+  if (!e) return false;
+  if (Date.now() > e.expires){ __deletionCodes.delete(userId); return false; }
+  return e.hash === hashCode(String(code).trim());
+}
+// Periodic cleanup so abandoned requests can't grow the Map unbounded.
+const __delCodeCleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of __deletionCodes){ if (now > v.expires) __deletionCodes.delete(k); }
+}, 30 * 60 * 1000);
+if (__delCodeCleanup.unref) __delCodeCleanup.unref();
+
+// Send a fresh deletion code to the authenticated user's own email.
+app.post('/user/account/request-deletion', authLimiter, async (req, res) => {
+  try {
+    const token = extractBearerToken(req);
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    if (userErr || !userData?.user) return res.status(401).json({ error: 'Invalid or expired token' });
+    const userId = userData.user.id;
+    const email = (userData.user.email || '').toLowerCase();
+    if (!email) return res.status(400).json({ error: 'no_email', code: 'NO_EMAIL' });
+    const lang = (req.body && req.body.lang === 'en') ? 'en' : 'de';
+    const code = generateOTP();
+    __setDeletionCode(userId, code);
+    try { await sendEmail(email, 'account_deletion_code', { lang, code }); }
+    catch (e) { console.error('deletion-code email error:', e.message); }
+    console.log(`🔐 Account-deletion code requested: ${mE(email)} (${userId})`);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('request-deletion error:', err.message);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
 app.delete('/user/account', userLimiter, async (req, res) => {
   try {
     // Audit Pass 1 #4.1: shared bearer-token extractor.
@@ -3888,6 +3936,20 @@ app.delete('/user/account', userLimiter, async (req, res) => {
     const userId = userData.user.id;
     const email = (userData.user.email || '').toLowerCase();
     const lang = (req.body && req.body.lang) || 'de';
+
+    // Befund 8: the destructive delete additionally requires the 6-digit code
+    // emailed via POST /user/account/request-deletion (proof of email control).
+    // The typed phrase alone is NOT enough. Code is single-use — consumed on
+    // accept so it can't be replayed.
+    const delCode = String((req.body && req.body.code) || '').trim();
+    if (!__verifyDeletionCode(userId, delCode)) {
+      return res.status(403).json({
+        error: 'deletion_code_required',
+        code: 'DELETION_CODE_REQUIRED',
+        message: 'A valid email confirmation code is required to delete the account.',
+      });
+    }
+    __deletionCodes.delete(userId);
 
     console.log(`🗑️  Account deletion started: ${mE(email)} (${userId})`);
 
@@ -5964,7 +6026,7 @@ async function sendEmail(to, type, data) {
   // the §312k cancellation receipt carries the one-click "das war ich nicht /
   // undo" reactivation link and must reach the account holder even if they have
   // unsubscribed from other mail. Kept to a tight allowlist on purpose.
-  const ALWAYS_SEND = ['cancellation_received'];
+  const ALWAYS_SEND = ['cancellation_received', 'account_deletion_code'];
   if (unsubscribed && ALWAYS_SEND.indexOf(type) === -1) return;
 
   // Language detection priority:
@@ -6622,7 +6684,35 @@ async function sendEmail(to, type, data) {
       `)
     },
 
-    // ── PAYMENT FAILED (Stripe webhook: invoice.payment_failed) ──
+    // ── ACCOUNT DELETION CODE (Befund 8 — re-auth before destructive delete) ──
+    // Self-contained inline DE/EN (no L.* keys) so it can't desync the big
+    // localisation object. Sent ALWAYS (see ALWAYS_SEND) — without the code
+    // nothing is deleted, so it must reach the holder even if unsubscribed.
+    account_deletion_code: {
+      subject: de ? 'Dein Bestätigungscode zum Konto-Löschen' : 'Your account deletion code',
+      html: emailShell(RESPONSIVE_CSS + `
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${de ? 'Konto löschen' : 'Delete account'}</p>
+          <h1 class="email-h1" style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:1px;text-transform:uppercase;color:${BRAND.ink};">
+            ${de ? 'Bestätige' : 'Confirm'}<br>${de ? 'die Löschung.' : 'your deletion.'}
+          </h1>
+          <p style="margin:0 0 24px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            ${de ? 'Gib diesen Code in der App ein, um dein Konto endgültig zu löschen. Warst du das nicht, ignoriere diese E-Mail einfach — ohne Code wird nichts gelöscht.' : 'Enter this code in the app to permanently delete your account. If this wasn’t you, just ignore this email — nothing is deleted without the code.'}
+          </p>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:24px;">
+            <tr><td align="center" style="padding:24px;background:#F5F5F3;border-left:3px solid ${BRAND.red};font-family:${FONT_HEAD};font-size:42px;font-weight:900;letter-spacing:12px;color:${BRAND.ink};">
+              ${htmlEsc(String(data && data.code || ''))}
+            </td></tr>
+          </table>
+          <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:13px;line-height:1.6;color:${BRAND.ink2};">
+            ${de ? 'Der Code ist 15 Minuten gültig.' : 'This code is valid for 15 minutes.'}
+          </p>
+        </td></tr>
+
+        <tr><td>${emailFooter(to, lang)}</td></tr>
+      `)
+    },
     payment_failed: {
       subject: L.paymentFailedSubject,
       html: emailShell(RESPONSIVE_CSS + `
