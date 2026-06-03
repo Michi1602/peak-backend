@@ -4549,15 +4549,35 @@ app.post('/user/lite-sync', userLimiter, mediumJson, async (req, res) => {
       if (food_log.length > 200) {
         return res.status(400).json({ error: 'food_log too large' });
       }
-      // Each entry: {text, emoji, kcal, time}. Shallow-validate types.
+      // Each entry: {text, emoji, kcal, time} PLUS macros + provenance.
+      // NOTE: protein/carbs/fat MUST be preserved — stripping them (the
+      // earlier behaviour) reset the daily Eiweiß/KH/Fett bars to 0 after
+      // every sync round-trip even though kcal survived. The activity tags
+      // and source/date/ts keep Bewegung-Log, hydration and family entries
+      // intact across the round-trip too. All fields are type-validated and
+      // length-capped, so the anti-DoS posture is unchanged.
       const cleaned = [];
       for (const entry of food_log) {
         if (!entry || typeof entry !== 'object') continue;
         const text = typeof entry.text === 'string' ? entry.text.slice(0, 200) : '';
-        const emoji = typeof entry.emoji === 'string' ? entry.emoji.slice(0, 8) : '';
-        const kcal = Number.isFinite(entry.kcal) ? Math.round(entry.kcal) : 0;
-        const time = typeof entry.time === 'string' ? entry.time.slice(0, 16) : '';
-        if (text) cleaned.push({ text, emoji, kcal, time });
+        if (!text) continue;
+        const e = {
+          text,
+          emoji: typeof entry.emoji === 'string' ? entry.emoji.slice(0, 8) : '',
+          kcal: Number.isFinite(entry.kcal) ? Math.round(entry.kcal) : 0,
+          time: typeof entry.time === 'string' ? entry.time.slice(0, 16) : '',
+        };
+        if (Number.isFinite(entry.protein)) e.protein = Math.round(entry.protein);
+        if (Number.isFinite(entry.carbs))   e.carbs   = Math.round(entry.carbs);
+        if (Number.isFinite(entry.fat))     e.fat     = Math.round(entry.fat);
+        if (typeof entry.name === 'string')   e.name   = entry.name.slice(0, 200);
+        if (typeof entry.source === 'string') e.source = entry.source.slice(0, 24);
+        if (typeof entry.date === 'string')   e.date   = entry.date.slice(0, 10);
+        if (Number.isFinite(entry.ts))        e.ts     = entry.ts;
+        if (entry.__activity === true)        e.__activity = true;
+        if (typeof entry.__activityType === 'string') e.__activityType = entry.__activityType.slice(0, 24);
+        if (Number.isFinite(entry.__activityMin))     e.__activityMin = Math.round(entry.__activityMin);
+        cleaned.push(e);
       }
       updates.food_log = cleaned;
     }
