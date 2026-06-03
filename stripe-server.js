@@ -569,6 +569,20 @@ function sanitizeUserText(s, maxLen) {
   return s.replace(/[\p{C}]/gu, '').slice(0, cap).trim();
 }
 
+// Befund 3 (defence-in-depth): strip invisible / dangerous control characters
+// from a string while PRESERVING tab/newline so legitimate multi-line prompt
+// formatting stays intact. Used on the frontend-assembled /ai/generate prompt,
+// which already carries user free-text (recipe mood, profile fields) embedded
+// by the client — this catches zero-width, bidi-override and BOM injection
+// vectors that the client may not have stripped. NOT a length cap (the
+// endpoint enforces its own) and NOT pattern-matching (too fragile).
+function stripInvisible(s) {
+  if (typeof s !== 'string') return '';
+  return s
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, '')
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF]/g, '');
+}
+
 // ── Schema-Validation Clamps (Audit Befund 6) ──────────────────────
 // Used by /user/plan, /share, and other endpoints that accept
 // structured payloads. Whitelisting by type prevents stored-XSS via
@@ -2375,7 +2389,7 @@ app.post('/ai/generate', aiLimiter, mediumJson, async (req, res) => {
       body: JSON.stringify({
         model: modelName,
         max_tokens: tokens,
-        messages: [{ role: 'user', content: prompt }],
+        messages: [{ role: 'user', content: stripInvisible(prompt) }],
       }),
     });
 
