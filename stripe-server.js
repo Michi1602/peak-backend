@@ -4498,7 +4498,7 @@ app.post('/user/lite-sync', userLimiter, mediumJson, async (req, res) => {
       return res.status(403).json({ error: 'basic_required', code: 'BASIC_REQUIRED' });
     }
 
-    const { meal_ratings, workout_ratings, food_log, weekly_shop_checks, meditation_log, mobility_log, analytics_optin, hydration_log } = req.body || {};
+    const { meal_ratings, workout_ratings, food_log, weekly_shop_checks, meditation_log, mobility_log, regen_log, analytics_optin, hydration_log } = req.body || {};
     const updates = { updated_at: new Date().toISOString() };
 
     // Validate + sanitise each field independently. Anything malformed is
@@ -4577,6 +4577,11 @@ app.post('/user/lite-sync', userLimiter, mediumJson, async (req, res) => {
         if (entry.__activity === true)        e.__activity = true;
         if (typeof entry.__activityType === 'string') e.__activityType = entry.__activityType.slice(0, 24);
         if (Number.isFinite(entry.__activityMin))     e.__activityMin = Math.round(entry.__activityMin);
+        // __drinkTs links a macro-bearing drink's food_log mirror back to its
+        // hydration_log entry. MUST be preserved — without it, removing the
+        // drink can't pull the mirror after a sync round-trip, so the day's
+        // macros stay inflated. (Befund A.)
+        if (Number.isFinite(entry.__drinkTs))         e.__drinkTs = entry.__drinkTs;
         cleaned.push(e);
       }
       updates.food_log = cleaned;
@@ -4636,6 +4641,14 @@ app.post('/user/lite-sync', userLimiter, mediumJson, async (req, res) => {
       const r = validateDateLog(mobility_log, 'mobility_log');
       if (r.error) return res.status(400).json({ error: r.error });
       updates.mobility_log = r.value;
+    }
+    // Regeneration check-off log (active recovery). Same { 'YYYY-MM-DD': [keys] }
+    // shape as the habit-streak logs — REGEN_ITEMS keys are short strings, so
+    // validateDateLog's 40-char/30-entry caps comfortably cover it.
+    if (regen_log !== undefined) {
+      const r = validateDateLog(regen_log, 'regen_log');
+      if (r.error) return res.status(400).json({ error: r.error });
+      updates.regen_log = r.value;
     }
     // Audit #4.3: unified consent normaliser. Previously had three slightly
     // different truthy-checks across signup-free, webhook, and lite-sync.
