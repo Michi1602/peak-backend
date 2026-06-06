@@ -2535,7 +2535,7 @@ FIT-BEWERTUNG (strikt anwenden!):
 - Wenn das Ziel Muskelaufbau/Performance ist: bevorzuge hohe Protein-Dichte (Protein/kcal). Paniertes Schnitzel ist NIE "best".
 - Wenn das Ziel Gewichtsabnahme ist: bevorzuge niedrige Kalorien + hohes Protein.
 
-Antworte AUSSCHLIESSLICH als JSON (kein Markdown):
+Antworte AUSSCHLIESSLICH als kompaktes JSON in EINER Zeile — keine Zeilenumbrüche, keine Einrückung, kein Markdown:
 {"dishes":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"fit":"best"|"good"|"ok","reason":"kurzer Grund max 8 Wörter"}]}
 Falls kein Menü erkennbar ist: {"dishes":[],"error":"no_menu"}.`
       : `You see a photo of a restaurant menu. Pick the 3 dishes that BEST match the user's goal. ${goalHint}
@@ -2563,7 +2563,7 @@ FIT RATING (apply strictly!):
 - If goal is muscle building/performance: prefer high protein density (protein/kcal). Breaded schnitzel is NEVER "best".
 - If goal is weight loss: prefer low calories + high protein.
 
-Respond ONLY as JSON (no markdown):
+Respond ONLY as compact single-line JSON — no line breaks, no indentation, no markdown:
 {"dishes":[{"name":"...","kcal":<number>,"protein":<number>,"fit":"best"|"good"|"ok","reason":"short reason max 8 words"}]}
 If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
 
@@ -2577,7 +2577,7 @@ If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
       },
       body: JSON.stringify({
         model: modelName,
-        max_tokens: 600,
+        max_tokens: 1500,
         messages: [{
           role: 'user',
           content: [
@@ -2595,13 +2595,21 @@ If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
     }
 
     const data = await r.json();
-    const text = data?.content?.[0]?.text || '';
-    // Strip any accidental markdown fences
-    const clean = text.replace(/^```json\s*|```$/g, '').trim();
-    let parsed;
+    const raw = data?.content?.[0]?.text || '';
+    // Strip fences, then fall back to extracting the first balanced {...}
+    // object so a stray preamble/suffix can't break the parse (same hardening
+    // as /ai/scan-meal — menus have many items and tempt verbose output).
+    const clean = raw.replace(/```json\s*|```/g, '').trim();
+    let parsed = null;
     try { parsed = JSON.parse(clean); }
-    catch (e) {
-      console.error(`❌ scan-menu JSON parse failed for ${mE(userEmail)}:`, clean.slice(0, 200));
+    catch (e1) {
+      const s = clean.indexOf('{'), eIdx = clean.lastIndexOf('}');
+      if (s !== -1 && eIdx > s) {
+        try { parsed = JSON.parse(clean.slice(s, eIdx + 1)); } catch (e2) { parsed = null; }
+      }
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      console.error(`❌ scan-menu JSON parse failed for ${mE(userEmail)} (truncated/preamble?):`, clean.slice(0, 300));
       return res.status(502).json({ error: 'Could not read menu' });
     }
 
