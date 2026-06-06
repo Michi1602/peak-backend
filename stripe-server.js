@@ -2650,6 +2650,13 @@ app.post('/ai/scan-meal', aiLimiter, imageJson, async (req, res) => {
     const prompt = de
       ? `Du siehst ein Foto einer echten Mahlzeit (Teller/Schüssel/Verpackung), die der Nutzer gerade isst oder essen will. Schätze, was darauf ist, und die Nährwerte. ${goalHint}
 
+ZUTATEN-ERKENNUNG (zuerst, sorgfältig — das ist der wichtigste Teil):
+- Benenne JEDE klar erkennbare Komponente einzeln und konkret. Rate nicht grob ("Fleisch", "Gemüse"), wenn Genaueres erkennbar ist.
+- Unterscheide ähnlich aussehende Lebensmittel bewusst: Gurke vs. Zucchini, Thunfisch/Fisch vs. helles Fleisch, gekochtes Ei vs. Mozzarella/Tofu, Reis vs. Couscous, Frischkäse vs. Joghurt.
+- Achte aktiv auf Proteinquellen (Fisch, Thunfisch, Ei, Hähnchen, Tofu, Hülsenfrüchte) — die werden leicht übersehen. Siehst du Fisch oder Ei, benenne es als solches, NICHT als "Fleisch".
+- Erfinde keine Komponenten. Führe Öl/Butter nur als eigene Position, wenn sichtbar viel Fett/Sauce vorhanden ist; sonst rechne unsichtbares Bratfett still in die kcal ein, ohne es als Zutat zu listen.
+- Bei Unsicherheit zwischen zwei Lebensmitteln das im Kontext wahrscheinlichere wählen (kalte Schüssel mit Salat → eher Gurke/Thunfisch/Ei als Zucchini/Rind/Bratöl).
+
 PORTIONS- & KALORIEN-SCHÄTZUNG (ehrlich, nicht schönrechnen):
 - Schätze die Portionsgröße anhand sichtbarer Referenzen (Teller ~26cm, Besteck, Hand).
 - Hausmannskost-Teller: 600-900 kcal, üppige Teller 1000-1400 kcal.
@@ -2669,6 +2676,13 @@ Antworte AUSSCHLIESSLICH als JSON (kein Markdown):
 {"items":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>}],"total":{"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>},"confidence":"hoch"|"mittel"|"niedrig"}
 Falls kein Essen erkennbar ist: {"items":[],"error":"no_food"}.`
       : `You see a photo of a real meal (plate/bowl/packaging) the user is eating or about to eat. Estimate what's on it and its nutrition. ${goalHint}
+
+INGREDIENT IDENTIFICATION (first, carefully — this is the most important part):
+- Name EVERY clearly visible component individually and specifically. Don't guess broadly ("meat", "vegetables") when something more precise is visible.
+- Deliberately distinguish look-alike foods: cucumber vs. zucchini, tuna/fish vs. pale meat, boiled egg vs. mozzarella/tofu, rice vs. couscous, cream cheese vs. yogurt.
+- Actively look for protein sources (fish, tuna, egg, chicken, tofu, legumes) — these are easily missed. If you see fish or egg, name it as such, NOT as "meat".
+- Don't invent components. List oil/butter as its own line only if there's visibly a lot of fat/sauce; otherwise fold invisible cooking fat silently into the kcal without listing it as an ingredient.
+- When unsure between two foods, pick the more likely one in context (a cold salad bowl → more likely cucumber/tuna/egg than zucchini/beef/frying oil).
 
 PORTION & CALORIE ESTIMATION (honest, don't undersell):
 - Estimate portion size from visible references (plate ~26cm, cutlery, hand).
@@ -2753,12 +2767,39 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
     const userEmail = auth.email || 'unknown';
     const authUserId = auth.userId;
 
-    // Look up Open Food Facts
+    // Look up Open Food Facts. OFF briefly rate-limits (429) or hiccups (5xx),
+    // especially from shared hosting IPs — that caused the transient
+    // "lookup_failed". Retry transient failures a few times with a short
+    // backoff and a request timeout. On final failure return a structured,
+    // retryable error so the frontend can offer manual entry instead of a
+    // dead end. (Not an AI call — model routing untouched.)
     const offUrl = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json`;
-    const offRes = await fetch(offUrl, { headers: { 'User-Agent': 'PEAK-by-MJ-Performance/1.0 (support@mj-performance.net)' } });
-    if (!offRes.ok) {
-      console.warn(`⚠️ Open Food Facts error ${offRes.status} for ${barcode}`);
-      return res.status(502).json({ error: 'lookup_failed' });
+    const OFF_UA = 'PEAK-by-MJ-Performance/1.0 (support@mj-performance.net)';
+    let offRes = null, lastStatus = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 400 * attempt)); // backoff: 400ms, 800ms
+      try {
+        offRes = await fetch(offUrl, {
+          headers: { 'User-Agent': OFF_UA },
+          signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(6000) : undefined,
+        });
+      } catch (e) {
+        console.warn(`⚠️ Open Food Facts fetch failed (attempt ${attempt + 1}) for ${barcode}: ${e.message}`);
+        offRes = null;
+        continue;
+      }
+      if (offRes.ok) break;
+      lastStatus = offRes.status;
+      if (offRes.status === 429 || offRes.status >= 500) {
+        console.warn(`⚠️ Open Food Facts ${offRes.status} (attempt ${attempt + 1}) for ${barcode} — retrying`);
+        offRes = null;
+        continue;
+      }
+      break; // non-transient non-ok (e.g. a 4xx other than 429) — stop retrying
+    }
+    if (!offRes || !offRes.ok) {
+      console.warn(`⚠️ Open Food Facts lookup failed for ${barcode} (last status ${lastStatus || 'network/timeout'})`);
+      return res.status(503).json({ error: 'lookup_unavailable', retryable: true, barcode });
     }
     const offData = await offRes.json();
     if (offData.status !== 1 || !offData.product) {
@@ -6017,7 +6058,6 @@ function emailShell(innerHTML) {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light only">
 <meta name="supported-color-schemes" content="light only">
-<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;700&family=Barlow+Condensed:wght@700;900&display=swap" rel="stylesheet">
 <title>PEAK</title>
 </head>
 <body style="margin:0;padding:0;background:${BRAND.light};font-family:${FONT_BODY};">
