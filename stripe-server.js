@@ -2672,7 +2672,7 @@ MAKRO-SCHÄTZUNG je erkanntem Bestandteil (Protein/Kohlenhydrate/Fett in Gramm):
 
 WICHTIG: Das ist eine Schätzung, kein Laborwert. Bleib sachlich und wertfrei — KEINE Bewertung wie "ungesund", kein Lob, keine Moral. Nur die Schätzung.
 
-Antworte AUSSCHLIESSLICH als JSON (kein Markdown):
+Antworte AUSSCHLIESSLICH als kompaktes JSON in EINER Zeile — keine Zeilenumbrüche, keine Einrückung, kein Markdown:
 {"items":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>}],"total":{"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>},"confidence":"hoch"|"mittel"|"niedrig"}
 Falls kein Essen erkennbar ist: {"items":[],"error":"no_food"}.`
       : `You see a photo of a real meal (plate/bowl/packaging) the user is eating or about to eat. Estimate what's on it and its nutrition. ${goalHint}
@@ -2699,7 +2699,7 @@ MACRO ESTIMATION per detected component (protein/carbs/fat in grams):
 
 IMPORTANT: This is an estimate, not a lab value. Stay factual and non-judgmental — NO ratings like "unhealthy", no praise, no moralising. Just the estimate.
 
-Respond ONLY as JSON (no markdown):
+Respond ONLY as compact single-line JSON — no line breaks, no indentation, no markdown:
 {"items":[{"name":"...","kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>}],"total":{"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>},"confidence":"high"|"medium"|"low"}
 If no food is visible: {"items":[],"error":"no_food"}.`;
 
@@ -2713,7 +2713,7 @@ If no food is visible: {"items":[],"error":"no_food"}.`;
       },
       body: JSON.stringify({
         model: modelName,
-        max_tokens: 800,
+        max_tokens: 1200,
         messages: [{
           role: 'user',
           content: [
@@ -2731,12 +2731,22 @@ If no food is visible: {"items":[],"error":"no_food"}.`;
     }
 
     const data = await r.json();
-    const text = data?.content?.[0]?.text || '';
-    const clean = text.replace(/^```json\s*|```$/g, '').trim();
-    let parsed;
+    const raw = data?.content?.[0]?.text || '';
+    // The model occasionally adds a short preamble or ```fences``` despite the
+    // "ONLY JSON" instruction — the richer ingredient-ID prompt makes that a
+    // touch more likely. Strip fences, then fall back to extracting the first
+    // balanced {...} object so a stray preamble/suffix can't break the parse.
+    const clean = raw.replace(/```json\s*|```/g, '').trim();
+    let parsed = null;
     try { parsed = JSON.parse(clean); }
-    catch (e) {
-      console.error(`scan-meal JSON parse failed for ${mE(userEmail)}:`, clean.slice(0, 200));
+    catch (e1) {
+      const s = clean.indexOf('{'), eIdx = clean.lastIndexOf('}');
+      if (s !== -1 && eIdx > s) {
+        try { parsed = JSON.parse(clean.slice(s, eIdx + 1)); } catch (e2) { parsed = null; }
+      }
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      console.error(`scan-meal JSON parse failed for ${mE(userEmail)} (truncated/preamble?):`, clean.slice(0, 300));
       return res.status(502).json({ error: 'Could not read meal' });
     }
 
