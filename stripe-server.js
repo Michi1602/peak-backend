@@ -2783,6 +2783,46 @@ If no food is visible: {"items":[],"error":"no_food"}.`;
 // Frontend sends a barcode string. We look up Open Food Facts directly
 // (they have great EU/DE coverage, free, no API key) and add a "fit"
 // rating based on the user's goal.
+// When OpenFoodFacts has a product entry but no usable nutrition (common for
+// fresh produce like "Bio Kiwi"), estimate per-100g macros from the product
+// name so the user gets real numbers instead of all-zeros. Uses the quicklog
+// model (Haiku — fast/cheap), robust JSON parse, 8s timeout, and returns null
+// on ANY failure so the caller falls back gracefully to the zero values.
+async function estimateMacrosFromName(name, brand, userLang) {
+  try {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey || !name) return null;
+    const label = (brand ? brand + ' ' : '') + name;
+    const de = userLang === 'de';
+    const prompt = de
+      ? `Schätze die typischen Nährwerte pro 100 g für dieses Lebensmittel: "${label}". Nutze übliche Referenzwerte. Antworte AUSSCHLIESSLICH als kompaktes JSON in EINER Zeile, ohne Erklärung: {"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>}`
+      : `Estimate the typical nutrition per 100 g for this food: "${label}". Use standard reference values. Respond ONLY as compact single-line JSON, no explanation: {"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>}`;
+    const modelName = resolveModel('quicklog', 'claude-haiku-4-5-20251001');
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: modelName, max_tokens: 200, messages: [{ role: 'user', content: prompt }] }),
+      signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(8000) : undefined,
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    const clean = (data?.content?.[0]?.text || '').replace(/```json\s*|```/g, '').trim();
+    let parsed = null;
+    try { parsed = JSON.parse(clean); }
+    catch (e1) {
+      const s = clean.indexOf('{'), eIdx = clean.lastIndexOf('}');
+      if (s !== -1 && eIdx > s) { try { parsed = JSON.parse(clean.slice(s, eIdx + 1)); } catch (e2) { parsed = null; } }
+    }
+    if (!parsed || typeof parsed !== 'object') return null;
+    const num = v => { const n = Number(v); return isFinite(n) && n >= 0 ? n : 0; };
+    const out = { kcal: num(parsed.kcal), protein: num(parsed.protein), carbs: num(parsed.carbs), fat: num(parsed.fat) };
+    return out.kcal > 0 ? out : null; // only useful if it actually produced calories
+  } catch (e) {
+    console.warn('estimateMacrosFromName failed:', e.message);
+    return null;
+  }
+}
+
 app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
   try {
     const { barcode, userGoal, userLang } = req.body;
@@ -2846,12 +2886,26 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
 
     const name = p.product_name || p.product_name_en || p.product_name_de || p.generic_name || 'Unknown';
     const brand = (p.brands || '').split(',')[0].trim() || '';
-    const kcalPer100 = per100['energy-kcal_100g'] || per100['energy-kcal'] || (per100['energy_100g'] ? per100['energy_100g']/4.184 : 0);
-    const proteinPer100 = per100['proteins_100g'] || 0;
-    const carbsPer100 = per100['carbohydrates_100g'] || 0;
+    let kcalPer100 = per100['energy-kcal_100g'] || per100['energy-kcal'] || (per100['energy_100g'] ? per100['energy_100g']/4.184 : 0);
+    let proteinPer100 = per100['proteins_100g'] || 0;
+    let carbsPer100 = per100['carbohydrates_100g'] || 0;
     const sugarsPer100 = per100['sugars_100g'] || 0;
-    const fatPer100 = per100['fat_100g'] || 0;
+    let fatPer100 = per100['fat_100g'] || 0;
     const satFatPer100 = per100['saturated-fat_100g'] || 0;
+
+    // OFF knows the product but has no usable nutrition (e.g. fresh produce
+    // like "Bio Kiwi" → all zeros): estimate per-100g macros from the name via
+    // AI so the user gets numbers instead of zeros. Flagged for the UI.
+    let estimated = false;
+    if (!kcalPer100 && !proteinPer100 && !carbsPer100 && !fatPer100) {
+      const est = await estimateMacrosFromName(name, brand, userLang);
+      if (est) {
+        kcalPer100 = est.kcal; proteinPer100 = est.protein;
+        carbsPer100 = est.carbs; fatPer100 = est.fat;
+        estimated = true;
+        console.log(`ℹ️ scan-barcode: estimated macros for ${barcode} (${name}) — OFF had none`);
+      }
+    }
 
     const round = n => Math.round(n * 10) / 10;
     const product = {
@@ -2865,7 +2919,8 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
       sugars: round(sugarsPer100 * factor),
       fat: round(fatPer100 * factor),
       saturated_fat: round(satFatPer100 * factor),
-      nutri_score: (p.nutriscore_grade || '').toUpperCase() || null,
+      nutri_score: estimated ? null : ((p.nutriscore_grade || '').toUpperCase() || null),
+      estimated,
       image: p.image_small_url || p.image_thumb_url || null,
       // v71: send raw ingredient text for PEAK-Score evaluation client-
       // side. OpenFoodFacts gives us both lang-specific (ingredients_text_de,
