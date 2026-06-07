@@ -676,14 +676,16 @@ const PEAK_NUMERIC_RANGES = {
 // known-good model strings. Unknown overrides log a warning and fall
 // back to the default.
 //
-// Purposes:
-//   plan     → /ai/generate (Opus default, plan-generation quality)
-//   scan     → /ai/scan-menu (Haiku default, vision-heavy)
-//   quicklog → /ai/quick-log (Haiku default, simple JSON output)
-//   family   → /family/generate-meal (Sonnet default, balanced)
+// Purposes (model = per-purpose env override, else this code default):
+//   plan        → /ai/generate            (Sonnet — structured plan JSON)
+//   scan        → /ai/scan-meal + -menu   (Sonnet — vision accuracy, e.g.
+//                                           cucumber vs zucchini look-alikes)
+//   quicklog    → /ai/quick-log           (Haiku — simple JSON, fast/cheap)
+//   family      → /family/generate-meal   (Sonnet — balanced)
+//   translation → /ai/generate, purpose 'session_translate' (Haiku — fast)
 //
-// Back-compat: legacy ANTHROPIC_MODEL is still respected when no
-// purpose-specific override is set. Warns once per process.
+// The legacy global ANTHROPIC_MODEL is NO LONGER used for routing (it used
+// to override all purposes at once). It is inert; warns once if still set.
 // Audit Pass 6 #9.3: hybrid whitelist — explicit set + family regex.
 //
 // Previous version had a hardcoded Set of 5 known model IDs. New
@@ -711,16 +713,21 @@ const __modelEnvKeys = {
   scan: 'ANTHROPIC_SCAN_MODEL',
   quicklog: 'ANTHROPIC_QUICKLOG_MODEL',
   family: 'ANTHROPIC_FAMILY_MODEL',
+  translation: 'ANTHROPIC_TRANSLATION_MODEL',
 };
 let __legacyModelWarned = false;
 const __noticedNewModels = new Set();
 function resolveModel(purpose, defaultModel) {
   const envKey = __modelEnvKeys[purpose];
   const purposeOverride = envKey ? process.env[envKey] : null;
-  const legacyOverride = process.env.ANTHROPIC_MODEL;
-  let candidate = purposeOverride || legacyOverride || defaultModel;
-  if (legacyOverride && !purposeOverride && !__legacyModelWarned) {
-    console.warn(`⚠️  Legacy ANTHROPIC_MODEL=${legacyOverride} affects all purposes. Set ANTHROPIC_PLAN_MODEL / ANTHROPIC_SCAN_MODEL / ANTHROPIC_QUICKLOG_MODEL / ANTHROPIC_FAMILY_MODEL separately for per-purpose control.`);
+  // Per-purpose env override wins; otherwise the per-purpose code default.
+  // The legacy global ANTHROPIC_MODEL is deliberately NO LONGER consulted
+  // for routing — it used to override every purpose at once (forcing e.g.
+  // plan generation onto Haiku), which was almost never intended. It is
+  // now inert; if it's still set we warn once so the operator deletes it.
+  let candidate = purposeOverride || defaultModel;
+  if (process.env.ANTHROPIC_MODEL && !__legacyModelWarned) {
+    console.warn(`⚠️  ANTHROPIC_MODEL=${process.env.ANTHROPIC_MODEL} is set but now IGNORED for routing. Per-purpose models come from ANTHROPIC_PLAN_MODEL / ANTHROPIC_SCAN_MODEL / ANTHROPIC_QUICKLOG_MODEL / ANTHROPIC_FAMILY_MODEL / ANTHROPIC_TRANSLATION_MODEL or the code defaults. Delete ANTHROPIC_MODEL to silence this.`);
     __legacyModelWarned = true;
   }
   // Tier 1: in the explicit set → tested, no log noise.
@@ -2381,7 +2388,13 @@ app.post('/ai/generate', aiLimiter, mediumJson, async (req, res) => {
     // costs ~5x less per call than Opus. Opus 4.7 stays available via
     // ANTHROPIC_PLAN_MODEL env override if a future plan-gen workload
     // needs the extra reasoning headroom.
-    const modelName = resolveModel('plan', 'claude-sonnet-4-6');
+    // Translation (purpose 'session_translate') runs on Haiku — short,
+    // latency-sensitive UI text where Haiku is fast and cheap. Everything
+    // else routed through /ai/generate (plan, recipe, mood_recipe,
+    // training_enrich, exercise_explain) stays on the plan model (Sonnet).
+    const modelName = (purpose === 'session_translate')
+      ? resolveModel('translation', 'claude-haiku-4-5-20251001')
+      : resolveModel('plan', 'claude-sonnet-4-6');
     // Token cap: 2000 was the legacy default for single-meal/day plans.
     // Raised to 12000 so the 14-day meal pool (≈9k output) fits with
     // headroom. 12k is a deliberate ceiling — anything over that signals
@@ -2567,7 +2580,7 @@ Respond ONLY as compact single-line JSON — no line breaks, no indentation, no 
 {"dishes":[{"name":"...","kcal":<number>,"protein":<number>,"fit":"best"|"good"|"ok","reason":"short reason max 8 words"}]}
 If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
 
-    const modelName = resolveModel('scan', 'claude-haiku-4-5-20251001');
+    const modelName = resolveModel('scan', 'claude-sonnet-4-6');
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -2711,7 +2724,7 @@ Respond ONLY as compact single-line JSON — no line breaks, no indentation, no 
 {"items":[{"name":"...","kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>}],"total":{"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>},"confidence":"high"|"medium"|"low"}
 If no food is visible: {"items":[],"error":"no_food"}.`;
 
-    const modelName = resolveModel('scan', 'claude-haiku-4-5-20251001');
+    const modelName = resolveModel('scan', 'claude-sonnet-4-6');
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
