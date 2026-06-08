@@ -4326,19 +4326,50 @@ app.get('/user/export-data', userLimiter, async (req, res) => {
       .eq('id', userId)
       .maybeSingle();
 
+    // Art. 15/20 require ALL personal data, not just the profile row. User
+    // data is spread across several tables keyed by user_id (logs, plans,
+    // daily stats, measurements, AI adaptations, family membership). Each
+    // table is pulled in its own try/catch so a missing table/column can
+    // never break the export — that section just returns null with a logged
+    // note. Keep this list in sync with the schema.
+    async function pullUserRows(table, col) {
+      try {
+        const { data, error } = await supabase.from(table).select('*').eq(col, userId);
+        if (error) { console.warn(`   ⚠ export ${table} failed (skipped): ${error.message}`); return null; }
+        return data || [];
+      } catch (e) {
+        console.warn(`   ⚠ export ${table} threw (skipped): ${e.message}`);
+        return null;
+      }
+    }
+    const [foodLog, meals, dailyStats, measurements, aiAdaptations, familyMemberships] = await Promise.all([
+      pullUserRows('food_log', 'user_id'),
+      pullUserRows('meals', 'user_id'),
+      pullUserRows('daily_stats', 'user_id'),
+      pullUserRows('measurements', 'user_id'),
+      pullUserRows('ai_adaptations', 'user_id'),
+      pullUserRows('family_memberships', 'user_id'),
+    ]);
+
     // Build export JSON (strip internal-only fields that aren't user data)
     const exportPayload = {
       export_generated_at: new Date().toISOString(),
-      export_format_version: '1.0',
+      export_format_version: '1.1',
       user_id: userId,
       email: email,
       profile: profile || null,
+      food_log: foodLog,
+      meals: meals,
+      daily_stats: dailyStats,
+      measurements: measurements,
+      ai_adaptations: aiAdaptations,
+      family_memberships: familyMemberships,
       // Audit Pass 2 #5: previous notice claimed Zero Data Retention which
       // is NOT what we have with Anthropic — we use their standard API
       // terms (no model-training on API inputs, but standard retention
       // applies). Datenschutzerklärung was corrected; this notice has to
       // match or we have a written inconsistency for a complainant.
-      _notice: 'This export contains all personal data MJ Performance / PEAK holds about you. Payment data is held by Stripe and not included here — see stripe.com/privacy. AI prompts sent to Anthropic are processed under their standard API terms and are not used to train the models. See peak-mj-performance.app/datenschutz for full details.'
+      _notice: 'This export contains the personal data MJ Performance / PEAK holds about you: your profile, food log, meals/plans, daily stats, body measurements, AI adaptations and family membership. Payment data is held by Stripe and not included here — see stripe.com/privacy. AI prompts sent to Anthropic are processed under their standard API terms and are not used to train the models. See peak-mj-performance.app/datenschutz for full details.'
     };
 
     console.log(`📦 Data export generated for ${mE(email)}`);
