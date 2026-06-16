@@ -2929,6 +2929,20 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
       // German terms ("rapsöl") AND English terms ("canola oil") since
       // either may appear.
       ingredients_text: p.ingredients_text_de || p.ingredients_text_en || p.ingredients_text || '',
+      // Allergen data for the allergy cross-check + warning. OFF uses an
+      // English-keyed taxonomy ("en:milk", "en:gluten") regardless of UI
+      // language. We strip the language prefix and hand the canonical
+      // keywords to the client, which matches them against the user's stored
+      // allergies (ud.al) and a localized label map. allergens_tags =
+      // declared allergens; traces_tags = "may contain" traces. Both are
+      // best-effort: OFF data can be incomplete, so the UI always shows
+      // "ohne Gewähr, Verpackung prüfen".
+      allergens_tags: Array.isArray(p.allergens_tags)
+        ? p.allergens_tags.map(t => String(t).replace(/^[a-z]{2}:/, '').trim()).filter(Boolean)
+        : [],
+      traces_tags: Array.isArray(p.traces_tags)
+        ? p.traces_tags.map(t => String(t).replace(/^[a-z]{2}:/, '').trim()).filter(Boolean)
+        : [],
     };
 
     // Simple fit-rating — not AI, just heuristics (saves a roundtrip)
