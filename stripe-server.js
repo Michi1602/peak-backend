@@ -4516,6 +4516,15 @@ app.post('/user/training-state', userLimiter, async (req, res) => {
       feedback: ts.feedback && typeof ts.feedback === 'object' ? ts.feedback : {},
       currentWeek: Number.isFinite(ts.currentWeek) ? Math.max(1, Math.min(12, ts.currentWeek)) : 1
     };
+    // Time-anchored 12-week cycle (Jun 2026): the start date drives currentWeek
+    // so the week advances with the calendar. Persist it (validated as a plain
+    // YYYY-MM-DD string) plus the week the plan content was last built for.
+    if (typeof ts.startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ts.startDate)) {
+      cleaned.startDate = ts.startDate;
+    }
+    if (Number.isFinite(ts.planBuiltWeek)) {
+      cleaned.planBuiltWeek = Math.max(1, Math.min(12, ts.planBuiltWeek));
+    }
 
     const { error } = await supabase
       .from('users')
