@@ -2684,6 +2684,7 @@ PORTIONS- & KALORIEN-SCHÄTZUNG (ehrlich, nicht schönrechnen):
 - Beilagen-Richtwerte: Pommes +380-450, Reis (gekocht) +250-350, Nudeln (gekocht) +300-400, Kartoffeln +280-340, Brot/Brötchen +150-250.
 - Sahne-/Käse-/Frittier-Anteile großzügig dazurechnen. Öl/Butter beim Anbraten: +100-200 kcal, oft unsichtbar.
 - Lieber realistisch-hoch als zu niedrig.
+- Schätze zusätzlich das Gesamtgewicht der Mahlzeit in Gramm (alle Komponenten zusammen) und gib es als total_weight_g aus.
 
 MAKRO-SCHÄTZUNG je erkanntem Bestandteil (Protein/Kohlenhydrate/Fett in Gramm):
 - 100g mageres Fleisch/Fisch entspricht ca. 20-30g Protein.
@@ -2694,7 +2695,7 @@ MAKRO-SCHÄTZUNG je erkanntem Bestandteil (Protein/Kohlenhydrate/Fett in Gramm):
 WICHTIG: Das ist eine Schätzung, kein Laborwert. Bleib sachlich und wertfrei — KEINE Bewertung wie "ungesund", kein Lob, keine Moral. Nur die Schätzung.
 
 Antworte AUSSCHLIESSLICH als kompaktes JSON in EINER Zeile — keine Zeilenumbrüche, keine Einrückung, kein Markdown:
-{"items":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>}],"total":{"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>},"confidence":"hoch"|"mittel"|"niedrig"}
+{"items":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>}],"total":{"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>},"total_weight_g":<zahl>,"confidence":"hoch"|"mittel"|"niedrig"}
 Falls kein Essen erkennbar ist: {"items":[],"error":"no_food"}.`
       : `You see a photo of a real meal (plate/bowl/packaging) the user is eating or about to eat. Estimate what's on it and its nutrition. ${goalHint}
 
@@ -2711,6 +2712,7 @@ PORTION & CALORIE ESTIMATION (honest, don't undersell):
 - Side references: fries +380-450, cooked rice +250-350, cooked pasta +300-400, potatoes +280-340, bread/roll +150-250.
 - Add cream/cheese/fried components generously. Cooking oil/butter: +100-200 kcal, often invisible.
 - Err on the realistic-high side.
+- Also estimate the total weight of the meal in grams (all components together) and output it as total_weight_g.
 
 MACRO ESTIMATION per detected component (protein/carbs/fat in grams):
 - 100g lean meat/fish is roughly 20-30g protein.
@@ -2721,7 +2723,7 @@ MACRO ESTIMATION per detected component (protein/carbs/fat in grams):
 IMPORTANT: This is an estimate, not a lab value. Stay factual and non-judgmental — NO ratings like "unhealthy", no praise, no moralising. Just the estimate.
 
 Respond ONLY as compact single-line JSON — no line breaks, no indentation, no markdown:
-{"items":[{"name":"...","kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>}],"total":{"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>},"confidence":"high"|"medium"|"low"}
+{"items":[{"name":"...","kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>}],"total":{"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>},"total_weight_g":<number>,"confidence":"high"|"medium"|"low"}
 If no food is visible: {"items":[],"error":"no_food"}.`;
 
     const modelName = resolveModel('scan', 'claude-sonnet-4-6');
