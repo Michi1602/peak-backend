@@ -676,14 +676,16 @@ const PEAK_NUMERIC_RANGES = {
 // known-good model strings. Unknown overrides log a warning and fall
 // back to the default.
 //
-// Purposes:
-//   plan     → /ai/generate (Opus default, plan-generation quality)
-//   scan     → /ai/scan-menu (Haiku default, vision-heavy)
-//   quicklog → /ai/quick-log (Haiku default, simple JSON output)
-//   family   → /family/generate-meal (Sonnet default, balanced)
+// Purposes (model = per-purpose env override, else this code default):
+//   plan        → /ai/generate            (Sonnet — structured plan JSON)
+//   scan        → /ai/scan-meal + -menu   (Sonnet — vision accuracy, e.g.
+//                                           cucumber vs zucchini look-alikes)
+//   quicklog    → /ai/quick-log           (Haiku — simple JSON, fast/cheap)
+//   family      → /family/generate-meal   (Sonnet — balanced)
+//   translation → /ai/generate, purpose 'session_translate' (Haiku — fast)
 //
-// Back-compat: legacy ANTHROPIC_MODEL is still respected when no
-// purpose-specific override is set. Warns once per process.
+// The legacy global ANTHROPIC_MODEL is NO LONGER used for routing (it used
+// to override all purposes at once). It is inert; warns once if still set.
 // Audit Pass 6 #9.3: hybrid whitelist — explicit set + family regex.
 //
 // Previous version had a hardcoded Set of 5 known model IDs. New
@@ -711,16 +713,21 @@ const __modelEnvKeys = {
   scan: 'ANTHROPIC_SCAN_MODEL',
   quicklog: 'ANTHROPIC_QUICKLOG_MODEL',
   family: 'ANTHROPIC_FAMILY_MODEL',
+  translation: 'ANTHROPIC_TRANSLATION_MODEL',
 };
 let __legacyModelWarned = false;
 const __noticedNewModels = new Set();
 function resolveModel(purpose, defaultModel) {
   const envKey = __modelEnvKeys[purpose];
   const purposeOverride = envKey ? process.env[envKey] : null;
-  const legacyOverride = process.env.ANTHROPIC_MODEL;
-  let candidate = purposeOverride || legacyOverride || defaultModel;
-  if (legacyOverride && !purposeOverride && !__legacyModelWarned) {
-    console.warn(`⚠️  Legacy ANTHROPIC_MODEL=${legacyOverride} affects all purposes. Set ANTHROPIC_PLAN_MODEL / ANTHROPIC_SCAN_MODEL / ANTHROPIC_QUICKLOG_MODEL / ANTHROPIC_FAMILY_MODEL separately for per-purpose control.`);
+  // Per-purpose env override wins; otherwise the per-purpose code default.
+  // The legacy global ANTHROPIC_MODEL is deliberately NO LONGER consulted
+  // for routing — it used to override every purpose at once (forcing e.g.
+  // plan generation onto Haiku), which was almost never intended. It is
+  // now inert; if it's still set we warn once so the operator deletes it.
+  let candidate = purposeOverride || defaultModel;
+  if (process.env.ANTHROPIC_MODEL && !__legacyModelWarned) {
+    console.warn(`⚠️  ANTHROPIC_MODEL=${process.env.ANTHROPIC_MODEL} is set but now IGNORED for routing. Per-purpose models come from ANTHROPIC_PLAN_MODEL / ANTHROPIC_SCAN_MODEL / ANTHROPIC_QUICKLOG_MODEL / ANTHROPIC_FAMILY_MODEL / ANTHROPIC_TRANSLATION_MODEL or the code defaults. Delete ANTHROPIC_MODEL to silence this.`);
     __legacyModelWarned = true;
   }
   // Tier 1: in the explicit set → tested, no log noise.
@@ -2381,7 +2388,13 @@ app.post('/ai/generate', aiLimiter, mediumJson, async (req, res) => {
     // costs ~5x less per call than Opus. Opus 4.7 stays available via
     // ANTHROPIC_PLAN_MODEL env override if a future plan-gen workload
     // needs the extra reasoning headroom.
-    const modelName = resolveModel('plan', 'claude-sonnet-4-6');
+    // Translation (purpose 'session_translate') runs on Haiku — short,
+    // latency-sensitive UI text where Haiku is fast and cheap. Everything
+    // else routed through /ai/generate (plan, recipe, mood_recipe,
+    // training_enrich, exercise_explain) stays on the plan model (Sonnet).
+    const modelName = (purpose === 'session_translate')
+      ? resolveModel('translation', 'claude-haiku-4-5-20251001')
+      : resolveModel('plan', 'claude-sonnet-4-6');
     // Token cap: 2000 was the legacy default for single-meal/day plans.
     // Raised to 12000 so the 14-day meal pool (≈9k output) fits with
     // headroom. 12k is a deliberate ceiling — anything over that signals
@@ -2535,7 +2548,7 @@ FIT-BEWERTUNG (strikt anwenden!):
 - Wenn das Ziel Muskelaufbau/Performance ist: bevorzuge hohe Protein-Dichte (Protein/kcal). Paniertes Schnitzel ist NIE "best".
 - Wenn das Ziel Gewichtsabnahme ist: bevorzuge niedrige Kalorien + hohes Protein.
 
-Antworte AUSSCHLIESSLICH als JSON (kein Markdown):
+Antworte AUSSCHLIESSLICH als kompaktes JSON in EINER Zeile — keine Zeilenumbrüche, keine Einrückung, kein Markdown:
 {"dishes":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"fit":"best"|"good"|"ok","reason":"kurzer Grund max 8 Wörter"}]}
 Falls kein Menü erkennbar ist: {"dishes":[],"error":"no_menu"}.`
       : `You see a photo of a restaurant menu. Pick the 3 dishes that BEST match the user's goal. ${goalHint}
@@ -2563,11 +2576,11 @@ FIT RATING (apply strictly!):
 - If goal is muscle building/performance: prefer high protein density (protein/kcal). Breaded schnitzel is NEVER "best".
 - If goal is weight loss: prefer low calories + high protein.
 
-Respond ONLY as JSON (no markdown):
+Respond ONLY as compact single-line JSON — no line breaks, no indentation, no markdown:
 {"dishes":[{"name":"...","kcal":<number>,"protein":<number>,"fit":"best"|"good"|"ok","reason":"short reason max 8 words"}]}
 If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
 
-    const modelName = resolveModel('scan', 'claude-haiku-4-5-20251001');
+    const modelName = resolveModel('scan', 'claude-sonnet-4-6');
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -2577,7 +2590,7 @@ If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
       },
       body: JSON.stringify({
         model: modelName,
-        max_tokens: 600,
+        max_tokens: 1500,
         messages: [{
           role: 'user',
           content: [
@@ -2595,13 +2608,21 @@ If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
     }
 
     const data = await r.json();
-    const text = data?.content?.[0]?.text || '';
-    // Strip any accidental markdown fences
-    const clean = text.replace(/^```json\s*|```$/g, '').trim();
-    let parsed;
+    const raw = data?.content?.[0]?.text || '';
+    // Strip fences, then fall back to extracting the first balanced {...}
+    // object so a stray preamble/suffix can't break the parse (same hardening
+    // as /ai/scan-meal — menus have many items and tempt verbose output).
+    const clean = raw.replace(/```json\s*|```/g, '').trim();
+    let parsed = null;
     try { parsed = JSON.parse(clean); }
-    catch (e) {
-      console.error(`❌ scan-menu JSON parse failed for ${mE(userEmail)}:`, clean.slice(0, 200));
+    catch (e1) {
+      const s = clean.indexOf('{'), eIdx = clean.lastIndexOf('}');
+      if (s !== -1 && eIdx > s) {
+        try { parsed = JSON.parse(clean.slice(s, eIdx + 1)); } catch (e2) { parsed = null; }
+      }
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      console.error(`❌ scan-menu JSON parse failed for ${mE(userEmail)} (truncated/preamble?):`, clean.slice(0, 300));
       return res.status(502).json({ error: 'Could not read menu' });
     }
 
@@ -2650,12 +2671,20 @@ app.post('/ai/scan-meal', aiLimiter, imageJson, async (req, res) => {
     const prompt = de
       ? `Du siehst ein Foto einer echten Mahlzeit (Teller/Schüssel/Verpackung), die der Nutzer gerade isst oder essen will. Schätze, was darauf ist, und die Nährwerte. ${goalHint}
 
+ZUTATEN-ERKENNUNG (zuerst, sorgfältig — das ist der wichtigste Teil):
+- Benenne JEDE klar erkennbare Komponente einzeln und konkret. Rate nicht grob ("Fleisch", "Gemüse"), wenn Genaueres erkennbar ist.
+- Unterscheide ähnlich aussehende Lebensmittel bewusst: Gurke vs. Zucchini, Thunfisch/Fisch vs. helles Fleisch, gekochtes Ei vs. Mozzarella/Tofu, Reis vs. Couscous, Frischkäse vs. Joghurt.
+- Achte aktiv auf Proteinquellen (Fisch, Thunfisch, Ei, Hähnchen, Tofu, Hülsenfrüchte) — die werden leicht übersehen. Siehst du Fisch oder Ei, benenne es als solches, NICHT als "Fleisch".
+- Erfinde keine Komponenten. Führe Öl/Butter nur als eigene Position, wenn sichtbar viel Fett/Sauce vorhanden ist; sonst rechne unsichtbares Bratfett still in die kcal ein, ohne es als Zutat zu listen.
+- Bei Unsicherheit zwischen zwei Lebensmitteln das im Kontext wahrscheinlichere wählen (kalte Schüssel mit Salat → eher Gurke/Thunfisch/Ei als Zucchini/Rind/Bratöl).
+
 PORTIONS- & KALORIEN-SCHÄTZUNG (ehrlich, nicht schönrechnen):
 - Schätze die Portionsgröße anhand sichtbarer Referenzen (Teller ~26cm, Besteck, Hand).
 - Hausmannskost-Teller: 600-900 kcal, üppige Teller 1000-1400 kcal.
 - Beilagen-Richtwerte: Pommes +380-450, Reis (gekocht) +250-350, Nudeln (gekocht) +300-400, Kartoffeln +280-340, Brot/Brötchen +150-250.
 - Sahne-/Käse-/Frittier-Anteile großzügig dazurechnen. Öl/Butter beim Anbraten: +100-200 kcal, oft unsichtbar.
 - Lieber realistisch-hoch als zu niedrig.
+- Schätze zusätzlich das Gesamtgewicht der Mahlzeit in Gramm (alle Komponenten zusammen) und gib es als total_weight_g aus.
 
 MAKRO-SCHÄTZUNG je erkanntem Bestandteil (Protein/Kohlenhydrate/Fett in Gramm):
 - 100g mageres Fleisch/Fisch entspricht ca. 20-30g Protein.
@@ -2665,10 +2694,17 @@ MAKRO-SCHÄTZUNG je erkanntem Bestandteil (Protein/Kohlenhydrate/Fett in Gramm):
 
 WICHTIG: Das ist eine Schätzung, kein Laborwert. Bleib sachlich und wertfrei — KEINE Bewertung wie "ungesund", kein Lob, keine Moral. Nur die Schätzung.
 
-Antworte AUSSCHLIESSLICH als JSON (kein Markdown):
-{"items":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>}],"total":{"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>},"confidence":"hoch"|"mittel"|"niedrig"}
+Antworte AUSSCHLIESSLICH als kompaktes JSON in EINER Zeile — keine Zeilenumbrüche, keine Einrückung, kein Markdown:
+{"items":[{"name":"...","kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>}],"total":{"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>},"total_weight_g":<zahl>,"confidence":"hoch"|"mittel"|"niedrig"}
 Falls kein Essen erkennbar ist: {"items":[],"error":"no_food"}.`
       : `You see a photo of a real meal (plate/bowl/packaging) the user is eating or about to eat. Estimate what's on it and its nutrition. ${goalHint}
+
+INGREDIENT IDENTIFICATION (first, carefully — this is the most important part):
+- Name EVERY clearly visible component individually and specifically. Don't guess broadly ("meat", "vegetables") when something more precise is visible.
+- Deliberately distinguish look-alike foods: cucumber vs. zucchini, tuna/fish vs. pale meat, boiled egg vs. mozzarella/tofu, rice vs. couscous, cream cheese vs. yogurt.
+- Actively look for protein sources (fish, tuna, egg, chicken, tofu, legumes) — these are easily missed. If you see fish or egg, name it as such, NOT as "meat".
+- Don't invent components. List oil/butter as its own line only if there's visibly a lot of fat/sauce; otherwise fold invisible cooking fat silently into the kcal without listing it as an ingredient.
+- When unsure between two foods, pick the more likely one in context (a cold salad bowl → more likely cucumber/tuna/egg than zucchini/beef/frying oil).
 
 PORTION & CALORIE ESTIMATION (honest, don't undersell):
 - Estimate portion size from visible references (plate ~26cm, cutlery, hand).
@@ -2676,6 +2712,7 @@ PORTION & CALORIE ESTIMATION (honest, don't undersell):
 - Side references: fries +380-450, cooked rice +250-350, cooked pasta +300-400, potatoes +280-340, bread/roll +150-250.
 - Add cream/cheese/fried components generously. Cooking oil/butter: +100-200 kcal, often invisible.
 - Err on the realistic-high side.
+- Also estimate the total weight of the meal in grams (all components together) and output it as total_weight_g.
 
 MACRO ESTIMATION per detected component (protein/carbs/fat in grams):
 - 100g lean meat/fish is roughly 20-30g protein.
@@ -2685,11 +2722,11 @@ MACRO ESTIMATION per detected component (protein/carbs/fat in grams):
 
 IMPORTANT: This is an estimate, not a lab value. Stay factual and non-judgmental — NO ratings like "unhealthy", no praise, no moralising. Just the estimate.
 
-Respond ONLY as JSON (no markdown):
-{"items":[{"name":"...","kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>}],"total":{"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>},"confidence":"high"|"medium"|"low"}
+Respond ONLY as compact single-line JSON — no line breaks, no indentation, no markdown:
+{"items":[{"name":"...","kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>}],"total":{"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>},"total_weight_g":<number>,"confidence":"high"|"medium"|"low"}
 If no food is visible: {"items":[],"error":"no_food"}.`;
 
-    const modelName = resolveModel('scan', 'claude-haiku-4-5-20251001');
+    const modelName = resolveModel('scan', 'claude-sonnet-4-6');
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -2699,7 +2736,7 @@ If no food is visible: {"items":[],"error":"no_food"}.`;
       },
       body: JSON.stringify({
         model: modelName,
-        max_tokens: 800,
+        max_tokens: 1200,
         messages: [{
           role: 'user',
           content: [
@@ -2717,12 +2754,22 @@ If no food is visible: {"items":[],"error":"no_food"}.`;
     }
 
     const data = await r.json();
-    const text = data?.content?.[0]?.text || '';
-    const clean = text.replace(/^```json\s*|```$/g, '').trim();
-    let parsed;
+    const raw = data?.content?.[0]?.text || '';
+    // The model occasionally adds a short preamble or ```fences``` despite the
+    // "ONLY JSON" instruction — the richer ingredient-ID prompt makes that a
+    // touch more likely. Strip fences, then fall back to extracting the first
+    // balanced {...} object so a stray preamble/suffix can't break the parse.
+    const clean = raw.replace(/```json\s*|```/g, '').trim();
+    let parsed = null;
     try { parsed = JSON.parse(clean); }
-    catch (e) {
-      console.error(`scan-meal JSON parse failed for ${mE(userEmail)}:`, clean.slice(0, 200));
+    catch (e1) {
+      const s = clean.indexOf('{'), eIdx = clean.lastIndexOf('}');
+      if (s !== -1 && eIdx > s) {
+        try { parsed = JSON.parse(clean.slice(s, eIdx + 1)); } catch (e2) { parsed = null; }
+      }
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      console.error(`scan-meal JSON parse failed for ${mE(userEmail)} (truncated/preamble?):`, clean.slice(0, 300));
       return res.status(502).json({ error: 'Could not read meal' });
     }
 
@@ -2738,6 +2785,46 @@ If no food is visible: {"items":[],"error":"no_food"}.`;
 // Frontend sends a barcode string. We look up Open Food Facts directly
 // (they have great EU/DE coverage, free, no API key) and add a "fit"
 // rating based on the user's goal.
+// When OpenFoodFacts has a product entry but no usable nutrition (common for
+// fresh produce like "Bio Kiwi"), estimate per-100g macros from the product
+// name so the user gets real numbers instead of all-zeros. Uses the quicklog
+// model (Haiku — fast/cheap), robust JSON parse, 8s timeout, and returns null
+// on ANY failure so the caller falls back gracefully to the zero values.
+async function estimateMacrosFromName(name, brand, userLang) {
+  try {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey || !name) return null;
+    const label = (brand ? brand + ' ' : '') + name;
+    const de = userLang === 'de';
+    const prompt = de
+      ? `Schätze die typischen Nährwerte pro 100 g für dieses Lebensmittel: "${label}". Nutze übliche Referenzwerte. Antworte AUSSCHLIESSLICH als kompaktes JSON in EINER Zeile, ohne Erklärung: {"kcal":<zahl>,"protein":<zahl>,"carbs":<zahl>,"fat":<zahl>}`
+      : `Estimate the typical nutrition per 100 g for this food: "${label}". Use standard reference values. Respond ONLY as compact single-line JSON, no explanation: {"kcal":<number>,"protein":<number>,"carbs":<number>,"fat":<number>}`;
+    const modelName = resolveModel('quicklog', 'claude-haiku-4-5-20251001');
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: modelName, max_tokens: 200, messages: [{ role: 'user', content: prompt }] }),
+      signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(8000) : undefined,
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    const clean = (data?.content?.[0]?.text || '').replace(/```json\s*|```/g, '').trim();
+    let parsed = null;
+    try { parsed = JSON.parse(clean); }
+    catch (e1) {
+      const s = clean.indexOf('{'), eIdx = clean.lastIndexOf('}');
+      if (s !== -1 && eIdx > s) { try { parsed = JSON.parse(clean.slice(s, eIdx + 1)); } catch (e2) { parsed = null; } }
+    }
+    if (!parsed || typeof parsed !== 'object') return null;
+    const num = v => { const n = Number(v); return isFinite(n) && n >= 0 ? n : 0; };
+    const out = { kcal: num(parsed.kcal), protein: num(parsed.protein), carbs: num(parsed.carbs), fat: num(parsed.fat) };
+    return out.kcal > 0 ? out : null; // only useful if it actually produced calories
+  } catch (e) {
+    console.warn('estimateMacrosFromName failed:', e.message);
+    return null;
+  }
+}
+
 app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
   try {
     const { barcode, userGoal, userLang } = req.body;
@@ -2753,12 +2840,39 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
     const userEmail = auth.email || 'unknown';
     const authUserId = auth.userId;
 
-    // Look up Open Food Facts
+    // Look up Open Food Facts. OFF briefly rate-limits (429) or hiccups (5xx),
+    // especially from shared hosting IPs — that caused the transient
+    // "lookup_failed". Retry transient failures a few times with a short
+    // backoff and a request timeout. On final failure return a structured,
+    // retryable error so the frontend can offer manual entry instead of a
+    // dead end. (Not an AI call — model routing untouched.)
     const offUrl = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json`;
-    const offRes = await fetch(offUrl, { headers: { 'User-Agent': 'PEAK-by-MJ-Performance/1.0 (support@mj-performance.net)' } });
-    if (!offRes.ok) {
-      console.warn(`⚠️ Open Food Facts error ${offRes.status} for ${barcode}`);
-      return res.status(502).json({ error: 'lookup_failed' });
+    const OFF_UA = 'PEAK-by-MJ-Performance/1.0 (support@mj-performance.net)';
+    let offRes = null, lastStatus = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 400 * attempt)); // backoff: 400ms, 800ms
+      try {
+        offRes = await fetch(offUrl, {
+          headers: { 'User-Agent': OFF_UA },
+          signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(6000) : undefined,
+        });
+      } catch (e) {
+        console.warn(`⚠️ Open Food Facts fetch failed (attempt ${attempt + 1}) for ${barcode}: ${e.message}`);
+        offRes = null;
+        continue;
+      }
+      if (offRes.ok) break;
+      lastStatus = offRes.status;
+      if (offRes.status === 429 || offRes.status >= 500) {
+        console.warn(`⚠️ Open Food Facts ${offRes.status} (attempt ${attempt + 1}) for ${barcode} — retrying`);
+        offRes = null;
+        continue;
+      }
+      break; // non-transient non-ok (e.g. a 4xx other than 429) — stop retrying
+    }
+    if (!offRes || !offRes.ok) {
+      console.warn(`⚠️ Open Food Facts lookup failed for ${barcode} (last status ${lastStatus || 'network/timeout'})`);
+      return res.status(503).json({ error: 'lookup_unavailable', retryable: true, barcode });
     }
     const offData = await offRes.json();
     if (offData.status !== 1 || !offData.product) {
@@ -2774,12 +2888,26 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
 
     const name = p.product_name || p.product_name_en || p.product_name_de || p.generic_name || 'Unknown';
     const brand = (p.brands || '').split(',')[0].trim() || '';
-    const kcalPer100 = per100['energy-kcal_100g'] || per100['energy-kcal'] || (per100['energy_100g'] ? per100['energy_100g']/4.184 : 0);
-    const proteinPer100 = per100['proteins_100g'] || 0;
-    const carbsPer100 = per100['carbohydrates_100g'] || 0;
+    let kcalPer100 = per100['energy-kcal_100g'] || per100['energy-kcal'] || (per100['energy_100g'] ? per100['energy_100g']/4.184 : 0);
+    let proteinPer100 = per100['proteins_100g'] || 0;
+    let carbsPer100 = per100['carbohydrates_100g'] || 0;
     const sugarsPer100 = per100['sugars_100g'] || 0;
-    const fatPer100 = per100['fat_100g'] || 0;
+    let fatPer100 = per100['fat_100g'] || 0;
     const satFatPer100 = per100['saturated-fat_100g'] || 0;
+
+    // OFF knows the product but has no usable nutrition (e.g. fresh produce
+    // like "Bio Kiwi" → all zeros): estimate per-100g macros from the name via
+    // AI so the user gets numbers instead of zeros. Flagged for the UI.
+    let estimated = false;
+    if (!kcalPer100 && !proteinPer100 && !carbsPer100 && !fatPer100) {
+      const est = await estimateMacrosFromName(name, brand, userLang);
+      if (est) {
+        kcalPer100 = est.kcal; proteinPer100 = est.protein;
+        carbsPer100 = est.carbs; fatPer100 = est.fat;
+        estimated = true;
+        console.log(`ℹ️ scan-barcode: estimated macros for ${barcode} (${name}) — OFF had none`);
+      }
+    }
 
     const round = n => Math.round(n * 10) / 10;
     const product = {
@@ -2793,7 +2921,8 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
       sugars: round(sugarsPer100 * factor),
       fat: round(fatPer100 * factor),
       saturated_fat: round(satFatPer100 * factor),
-      nutri_score: (p.nutriscore_grade || '').toUpperCase() || null,
+      nutri_score: estimated ? null : ((p.nutriscore_grade || '').toUpperCase() || null),
+      estimated,
       image: p.image_small_url || p.image_thumb_url || null,
       // v71: send raw ingredient text for PEAK-Score evaluation client-
       // side. OpenFoodFacts gives us both lang-specific (ingredients_text_de,
@@ -2802,6 +2931,20 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
       // German terms ("rapsöl") AND English terms ("canola oil") since
       // either may appear.
       ingredients_text: p.ingredients_text_de || p.ingredients_text_en || p.ingredients_text || '',
+      // Allergen data for the allergy cross-check + warning. OFF uses an
+      // English-keyed taxonomy ("en:milk", "en:gluten") regardless of UI
+      // language. We strip the language prefix and hand the canonical
+      // keywords to the client, which matches them against the user's stored
+      // allergies (ud.al) and a localized label map. allergens_tags =
+      // declared allergens; traces_tags = "may contain" traces. Both are
+      // best-effort: OFF data can be incomplete, so the UI always shows
+      // "ohne Gewähr, Verpackung prüfen".
+      allergens_tags: Array.isArray(p.allergens_tags)
+        ? p.allergens_tags.map(t => String(t).replace(/^[a-z]{2}:/, '').trim()).filter(Boolean)
+        : [],
+      traces_tags: Array.isArray(p.traces_tags)
+        ? p.traces_tags.map(t => String(t).replace(/^[a-z]{2}:/, '').trim()).filter(Boolean)
+        : [],
     };
 
     // Simple fit-rating — not AI, just heuristics (saves a roundtrip)
@@ -4199,19 +4342,50 @@ app.get('/user/export-data', userLimiter, async (req, res) => {
       .eq('id', userId)
       .maybeSingle();
 
+    // Art. 15/20 require ALL personal data, not just the profile row. User
+    // data is spread across several tables keyed by user_id (logs, plans,
+    // daily stats, measurements, AI adaptations, family membership). Each
+    // table is pulled in its own try/catch so a missing table/column can
+    // never break the export — that section just returns null with a logged
+    // note. Keep this list in sync with the schema.
+    async function pullUserRows(table, col) {
+      try {
+        const { data, error } = await supabase.from(table).select('*').eq(col, userId);
+        if (error) { console.warn(`   ⚠ export ${table} failed (skipped): ${error.message}`); return null; }
+        return data || [];
+      } catch (e) {
+        console.warn(`   ⚠ export ${table} threw (skipped): ${e.message}`);
+        return null;
+      }
+    }
+    const [foodLog, meals, dailyStats, measurements, aiAdaptations, familyMemberships] = await Promise.all([
+      pullUserRows('food_log', 'user_id'),
+      pullUserRows('meals', 'user_id'),
+      pullUserRows('daily_stats', 'user_id'),
+      pullUserRows('measurements', 'user_id'),
+      pullUserRows('ai_adaptations', 'user_id'),
+      pullUserRows('family_memberships', 'user_id'),
+    ]);
+
     // Build export JSON (strip internal-only fields that aren't user data)
     const exportPayload = {
       export_generated_at: new Date().toISOString(),
-      export_format_version: '1.0',
+      export_format_version: '1.1',
       user_id: userId,
       email: email,
       profile: profile || null,
+      food_log: foodLog,
+      meals: meals,
+      daily_stats: dailyStats,
+      measurements: measurements,
+      ai_adaptations: aiAdaptations,
+      family_memberships: familyMemberships,
       // Audit Pass 2 #5: previous notice claimed Zero Data Retention which
       // is NOT what we have with Anthropic — we use their standard API
       // terms (no model-training on API inputs, but standard retention
       // applies). Datenschutzerklärung was corrected; this notice has to
       // match or we have a written inconsistency for a complainant.
-      _notice: 'This export contains all personal data MJ Performance / PEAK holds about you. Payment data is held by Stripe and not included here — see stripe.com/privacy. AI prompts sent to Anthropic are processed under their standard API terms and are not used to train the models. See peak-mj-performance.app/datenschutz for full details.'
+      _notice: 'This export contains the personal data MJ Performance / PEAK holds about you: your profile, food log, meals/plans, daily stats, body measurements, AI adaptations and family membership. Payment data is held by Stripe and not included here — see stripe.com/privacy. AI prompts sent to Anthropic are processed under their standard API terms and are not used to train the models. See peak-mj-performance.app/datenschutz for full details.'
     };
 
     console.log(`📦 Data export generated for ${mE(email)}`);
@@ -4342,6 +4516,15 @@ app.post('/user/training-state', userLimiter, async (req, res) => {
       feedback: ts.feedback && typeof ts.feedback === 'object' ? ts.feedback : {},
       currentWeek: Number.isFinite(ts.currentWeek) ? Math.max(1, Math.min(12, ts.currentWeek)) : 1
     };
+    // Time-anchored 12-week cycle (Jun 2026): the start date drives currentWeek
+    // so the week advances with the calendar. Persist it (validated as a plain
+    // YYYY-MM-DD string) plus the week the plan content was last built for.
+    if (typeof ts.startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ts.startDate)) {
+      cleaned.startDate = ts.startDate;
+    }
+    if (Number.isFinite(ts.planBuiltWeek)) {
+      cleaned.planBuiltWeek = Math.max(1, Math.min(12, ts.planBuiltWeek));
+    }
 
     const { error } = await supabase
       .from('users')
@@ -6017,7 +6200,6 @@ function emailShell(innerHTML) {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light only">
 <meta name="supported-color-schemes" content="light only">
-<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;700&family=Barlow+Condensed:wght@700;900&display=swap" rel="stylesheet">
 <title>PEAK</title>
 </head>
 <body style="margin:0;padding:0;background:${BRAND.light};font-family:${FONT_BODY};">
