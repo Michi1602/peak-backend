@@ -97,11 +97,11 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://peak-mj-performance.app';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://peak-backend-u52q.onrender.com';
-// FROM_EMAIL: visible "from" address. Uses mj-performance.net because that's
-// the domain verified at Resend (free tier limits to one domain). The user
-// sees "PEAK <support@mj-performance.net>" but if they hit "Reply", their
-// mail client routes to REPLY_TO instead — that mailbox actually receives.
-const FROM_EMAIL = 'PEAK <support@mj-performance.net>';
+// FROM_EMAIL: visible "from" address. Sends from the Resend-verified
+// peak-mj-performance.app domain. noreply@ is send-only — no mailbox needed.
+// If the user hits "Reply", their mail client routes to REPLY_TO instead
+// (support@), which is a real, monitored inbox that actually receives.
+const FROM_EMAIL = 'PEAK <noreply@peak-mj-performance.app>';
 // REPLY_TO: real, monitored support inbox. Set as a header on every send
 // so user replies don't disappear into a non-existent mailbox.
 const REPLY_TO = 'support@peak-mj-performance.app';
@@ -2847,7 +2847,7 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
     // retryable error so the frontend can offer manual entry instead of a
     // dead end. (Not an AI call — model routing untouched.)
     const offUrl = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json`;
-    const OFF_UA = 'PEAK-by-MJ-Performance/1.0 (support@mj-performance.net)';
+    const OFF_UA = 'PEAK-by-MJ-Performance/1.0 (support@peak-mj-performance.app)';
     let offRes = null, lastStatus = 0;
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) await new Promise(r => setTimeout(r, 400 * attempt)); // backoff: 400ms, 800ms
