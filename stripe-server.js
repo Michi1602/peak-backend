@@ -4103,7 +4103,12 @@ app.delete('/user/account', userLimiter, async (req, res) => {
       .eq('id', userId)
       .maybeSingle();
 
-    const userLang = (profile && profile.lang) || lang || 'de';
+    // Use the live request language (same source as the deletion-code email)
+    // so the code mail and this confirmation always match. profile.lang is
+    // deliberately NOT used here: it can be stale (e.g. the user switched the
+    // app language without the row being updated), which produced a German
+    // code mail followed by an English confirmation (fix Jun 2026).
+    const userLang = (lang === 'en') ? 'en' : 'de';
     const userName = (profile && profile.name) || '';
 
     // 2. Cancel Stripe subscription immediately (if any)
