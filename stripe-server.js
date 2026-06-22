@@ -923,7 +923,7 @@ app.post('/auth/send-login-link', authLimiter, async (req, res) => {
     }
 
     // Send the magic link via email
-    const magicLink = data?.properties?.action_link;
+    const magicLink = magicLinkFromHashedToken(data);
     if (!magicLink) {
       return res.status(500).json({ error: 'No link generated' });
     }
@@ -1369,7 +1369,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
             email: normalizedEmail,
             options: { redirectTo: `${FRONTEND_URL}/` },
           });
-          const magicLink = linkData?.properties?.action_link;
+          const magicLink = magicLinkFromHashedToken(linkData);
           if (magicLink) {
             const mail = buildMagicLinkEmail(magicLink, normalizedEmail, lang === 'de' ? 'de' : 'en');
             await resend.emails.send({
@@ -1480,7 +1480,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
           email: normalizedEmail,
           options: { redirectTo: `${FRONTEND_URL}/` },
         });
-        const magicLink = linkData?.properties?.action_link;
+        const magicLink = magicLinkFromHashedToken(linkData);
         if (magicLink) {
           const mail = buildMagicLinkEmail(magicLink, normalizedEmail, lang === 'de' ? 'de' : 'en');
           await resend.emails.send({
@@ -1565,7 +1565,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
         email: normalizedEmail,
         options: { redirectTo: `${FRONTEND_URL}/` },
       });
-      magicLinkEmail = linkEmailData?.properties?.action_link || null;
+      magicLinkEmail = magicLinkFromHashedToken(linkEmailData);
     } catch (e) {
       console.warn(`⚠️  Email-link generation failed: ${e.message}`);
     }
@@ -5459,7 +5459,7 @@ app.post('/webhook', async (req, res) => {
         if (linkErr) {
           console.error('❌ Magic link generation failed:', linkErr.message);
         } else {
-          magicLink = linkData?.properties?.action_link || null;
+          magicLink = magicLinkFromHashedToken(linkData);
         }
       } catch (err) {
         console.error('❌ Magic link exception:', err.message);
@@ -6152,6 +6152,16 @@ function buildOtpEmail(code, email, lang) {
   const text = `${L.h1a} ${L.h1b}\n\n${L.intro}\n\n  ${codePretty}\n\n${L.expiry}\n\n${L.warning}\n\n— ${L.footer}`;
 
   return { subject: L.subject, html, text };
+}
+
+// v72-fix51: backend-generated login links must point at OUR app with a
+// token_hash (redeemable via supabase.auth.verifyOtp on the PKCE frontend),
+// NOT the raw Supabase action_link. The action_link is an implicit-flow URL
+// the PKCE client cannot redeem AND it exposes the supabase.co host. Building
+// the link from properties.hashed_token fixes both.
+function magicLinkFromHashedToken(linkData){
+  const ht = linkData && linkData.properties && linkData.properties.hashed_token;
+  return ht ? `${FRONTEND_URL}/?token_hash=${encodeURIComponent(ht)}&type=magiclink` : null;
 }
 
 function buildMagicLinkEmail(magicLink, email, lang) {
