@@ -1098,6 +1098,100 @@ app.post('/auth/send-otp', authLimiter, async (req, res) => {
   }
 });
 
+// ── Auto-login after Stripe Checkout ───────────────────────────────────
+// The success_url returns the user with ?session_id=… . We retrieve the
+// Checkout Session, confirm it completed (a trial checkout is €0 today, so
+// status='complete' with payment_status='no_payment_required'), find/create
+// the auth user (idempotent with the webhook, which may not have run yet),
+// and mint a session so the frontend can log the user straight in — no
+// email-link/code detour.
+app.post('/auth/checkout-login', authLimiter, async (req, res) => {
+  try {
+    const sessionId = (req.body && req.body.session_id) ? String(req.body.session_id).trim() : '';
+    if (!sessionId || !/^cs_/.test(sessionId)) {
+      return res.status(400).json({ error: 'missing_session_id' });
+    }
+    let cs;
+    try {
+      cs = await stripe.checkout.sessions.retrieve(sessionId);
+    } catch (e) {
+      return res.status(404).json({ error: 'session_not_found' });
+    }
+    // €0 trial checkouts complete without a payment — accept any completed
+    // session (NOT just payment_status==='paid').
+    if (!cs || cs.status !== 'complete') {
+      return res.status(409).json({ error: 'session_not_complete' });
+    }
+    let email = cs.customer_email || (cs.customer_details && cs.customer_details.email) || null;
+    if (!email && cs.customer) {
+      try {
+        const cust = await stripe.customers.retrieve(cs.customer);
+        if (cust && !cust.deleted) email = cust.email;
+      } catch (_) {}
+    }
+    if (!email) return res.status(404).json({ error: 'no_email' });
+    const normalizedEmail = String(email).trim().toLowerCase();
+
+    // Find or create the auth user (the webhook may not have run yet).
+    let authUserId = null;
+    const match = await findAuthUserByEmail(normalizedEmail);
+    if (match) {
+      authUserId = match.id;
+    } else {
+      const { data: created, error: createErr } = await supabase.auth.admin.createUser({
+        email: normalizedEmail,
+        email_confirm: true,
+      });
+      if (createErr) {
+        if (/already.*registered|already.*exists|exists/i.test(createErr.message)) {
+          const m2 = await findAuthUserByEmail(normalizedEmail);
+          if (!m2) return res.status(500).json({ error: 'auth_user_failed' });
+          authUserId = m2.id;
+        } else {
+          console.error('❌ checkout-login createUser failed:', createErr.message);
+          return res.status(500).json({ error: 'auth_user_failed' });
+        }
+      } else {
+        authUserId = created.user.id;
+      }
+    }
+
+    // Mint a session via magic-link token exchange (same as /auth/verify-otp).
+    const { data: linkData, error: linkErr } = await supabase.auth.admin.generateLink({
+      type: 'magiclink',
+      email: normalizedEmail,
+    });
+    if (linkErr || !linkData) {
+      console.error('❌ checkout-login generateLink failed:', linkErr && linkErr.message);
+      return res.status(500).json({ error: 'session_generation_failed' });
+    }
+    const hashedToken = linkData.properties && linkData.properties.hashed_token;
+    if (!hashedToken) {
+      return res.status(500).json({ error: 'session_token_missing' });
+    }
+    const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
+      type: 'magiclink',
+      token_hash: hashedToken,
+    });
+    if (verifyErr || !verifyData || !verifyData.session) {
+      console.error('❌ checkout-login verifyOtp failed:', verifyErr && verifyErr.message);
+      return res.status(500).json({ error: 'session_exchange_failed' });
+    }
+
+    console.log(`✅ checkout-login success for ${mE(normalizedEmail)} (${authUserId})`);
+    return res.json({
+      ok: true,
+      session: {
+        access_token: verifyData.session.access_token,
+        refresh_token: verifyData.session.refresh_token,
+      },
+    });
+  } catch (err) {
+    console.error('❌ /auth/checkout-login error:', err.message);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
 app.post('/auth/verify-otp', authLimiter, async (req, res) => {
   try {
     const { email, code } = req.body || {};
