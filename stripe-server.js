@@ -6481,7 +6481,7 @@ async function sendEmail(to, type, data) {
     day6Label: 'Letzte 24 Stunden',
     day6H1: (n) => (n ? n + ',<br>' : '') + 'morgen<br>geht es los.',
     day6Body: 'Deine kostenlose Testphase endet morgen. Dein PEAK-Abo startet automatisch — du musst nichts tun, um weiterzumachen.',
-    day6Box: '<strong>Kündigen:</strong> PEAK öffnen → Einstellungen → Abonnement → Testphase beenden. In 10 Sekunden erledigt.',
+    day6Box: '<strong>Kündigen:</strong> PEAK öffnen → Einstellungen → Abonnement → Testphase beenden. Du behältst die volle Kontrolle — Kündigung jederzeit direkt in der App.',
     day6CTA: 'Plan behalten',
     // ── CANCELLATION EMAILS (DE) ──
     // Tier-aware: a Basic user shouldn't read "Premium ends" (was confusing
@@ -6577,7 +6577,7 @@ async function sendEmail(to, type, data) {
       const dur = trialDays && trialDays > 0 ? `${trialDays}-tägige` : '';
       return (name ? name + ', d' : 'D') + 'eine ' + dur + ' Testphase endet ' + (dateStr ? 'am <strong>' + dateStr + '</strong>' : 'in 3 Tagen') + '. Danach startet dein PEAK-Abo automatisch — du musst nichts tun, um weiterzumachen.';
     },
-    trialEndingBox: '<strong>Möchtest du nicht weitermachen?</strong> Öffne PEAK → Einstellungen → Abonnement → Testphase beenden. 10 Sekunden, kein Telefonat.',
+    trialEndingBox: '<strong>Möchtest du nicht weitermachen?</strong> Öffne PEAK → Einstellungen → Abonnement → Testphase beenden. Du behältst die volle Kontrolle — Kündigung jederzeit direkt in der App.',
     trialEndingCTA: 'PEAK öffnen',
   } : {
     welcomeSubject: (tier) => tier === 'free' ? 'Your PEAK plan is live — this email is your cross-device login' : 'Welcome to PEAK — your plan is ready',
@@ -6636,7 +6636,7 @@ async function sendEmail(to, type, data) {
     day6Label: 'Final 24 hours',
     day6H1: (n) => (n ? n + ',<br>' : '') + 'tomorrow<br>it begins.',
     day6Body: 'Your free trial ends tomorrow. Your PEAK subscription begins automatically — no action needed to continue.',
-    day6Box: '<strong>To cancel:</strong> Open PEAK → Settings → Subscription → Cancel trial. Done in 10 seconds.',
+    day6Box: '<strong>To cancel:</strong> Open PEAK → Settings → Subscription → Cancel trial. You stay in full control — cancel anytime, right in the app.',
     day6CTA: 'Keep my plan',
     // ── CANCELLATION EMAILS (EN) ──
     cancelTierLabel: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
@@ -6724,7 +6724,7 @@ async function sendEmail(to, type, data) {
       const dur = trialDays && trialDays > 0 ? `${trialDays}-day` : '';
       return (name ? name + ', y' : 'Y') + 'our ' + dur + ' trial ends ' + (dateStr ? 'on <strong>' + dateStr + '</strong>' : 'in 3 days') + '. After that, your PEAK subscription starts automatically — you don\'t need to do anything to continue.';
     },
-    trialEndingBox: '<strong>Don\'t want to continue?</strong> Open PEAK → Settings → Subscription → End trial. Ten seconds, no phone call.',
+    trialEndingBox: '<strong>Don\'t want to continue?</strong> Open PEAK → Settings → Subscription → End trial. You stay in full control — cancel anytime, right in the app.',
     trialEndingCTA: 'Open PEAK',
   };
 
