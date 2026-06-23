@@ -3182,6 +3182,97 @@ Respond ONLY as JSON (no markdown, no explanation):
   }
 });
 
+// ── CONTROLLED TIER SWITCH (basic ↔ premium, interval change) ─────────
+// Replaces the Stripe Customer Portal for tier changes. The portal charged
+// immediately AND reset the trial on a mid-trial switch (wrong). Here we
+// drive subscriptions.update ourselves so the spec holds exactly:
+//   • during the trial → proration_behavior:'none' + trial_end untouched
+//     → NO charge, the 7-day trial keeps running, billing still on Day 8.
+//   • after the trial → normal proration (difference onto the next invoice).
+// The customer.subscription.updated webhook syncs tier/plan/trial_end and
+// sends the new-tier welcome email — we do not duplicate that here.
+app.post('/change-tier', authLimiter, mediumJson, async (req, res) => {
+  try {
+    const token = extractBearerToken(req);
+    if (!token) return res.status(401).json({ error: 'Authentication required', code: 'AUTH_REQUIRED' });
+    const { data: authData, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !authData?.user?.email) {
+      return res.status(401).json({ error: 'Invalid or expired token', code: 'AUTH_INVALID' });
+    }
+    const email = authData.user.email.toLowerCase().trim();
+    const tier = req.body?.tier === 'basic' ? 'basic' : 'premium';
+    const plan = req.body?.plan === 'annual' ? 'annual' : 'monthly';
+    const lng = req.body?.lang === 'en' ? 'en' : 'de';
+
+    // Resolve target price (same mapping as /create-checkout).
+    let newPriceId;
+    if (tier === 'basic' && plan === 'annual') newPriceId = process.env.STRIPE_PRICE_BASIC_ANNUAL;
+    else if (tier === 'basic' && plan === 'monthly') newPriceId = process.env.STRIPE_PRICE_BASIC_MONTHLY;
+    else if (tier === 'premium' && plan === 'annual') newPriceId = process.env.STRIPE_PRICE_PREMIUM_ANNUAL || process.env.STRIPE_PRICE_ANNUAL;
+    else newPriceId = process.env.STRIPE_PRICE_PREMIUM_MONTHLY || process.env.STRIPE_PRICE_MONTHLY;
+    if (!newPriceId) {
+      console.error('❌ change-tier: missing price env for', tier, plan);
+      return res.status(500).json({ error: 'Server misconfiguration: price not set' });
+    }
+
+    const { data: profile, error: pErr } = await supabase
+      .from('users').select('stripe_subscription_id, tier, plan').eq('email', email).maybeSingle();
+    if (pErr) throw pErr;
+    if (!profile || !profile.stripe_subscription_id) {
+      return res.status(404).json({ error: 'no_active_subscription', code: 'NO_SUBSCRIPTION',
+        message: lng === 'de' ? 'Kein aktives Abo gefunden.' : 'No active subscription found.' });
+    }
+
+    let sub;
+    try {
+      sub = await stripe.subscriptions.retrieve(profile.stripe_subscription_id);
+    } catch (stripeErr) {
+      if (stripeErr?.message?.includes('No such subscription')) {
+        return res.status(404).json({ error: 'no_active_subscription', code: 'NO_SUBSCRIPTION',
+          message: lng === 'de' ? 'Kein aktives Abo gefunden.' : 'No active subscription found.' });
+      }
+      throw stripeErr;
+    }
+
+    if (!['trialing', 'active', 'past_due'].includes(sub.status)) {
+      return res.status(409).json({ error: 'not_changeable', code: 'NOT_CHANGEABLE',
+        message: lng === 'de' ? 'Dein Abo lässt sich gerade nicht wechseln.' : 'Your subscription cannot be changed right now.' });
+    }
+
+    const item = sub.items?.data?.[0];
+    if (!item) return res.status(500).json({ error: 'subscription_item_missing' });
+
+    // No-op: already on the requested price.
+    if (item.price?.id === newPriceId) {
+      return res.json({ ok: true, unchanged: true, tier, plan });
+    }
+
+    const isTrialing = sub.status === 'trialing';
+
+    // The fix: swap the price on the SAME subscription.
+    //  • trialing  → no proration, trial_end untouched (omitted) → no charge.
+    //  • post-trial → prorate the difference onto the next invoice.
+    await stripe.subscriptions.update(profile.stripe_subscription_id, {
+      items: [{ id: item.id, price: newPriceId }],
+      proration_behavior: isTrialing ? 'none' : 'create_prorations',
+      metadata: { ...(sub.metadata || {}), tier, plan },
+    });
+
+    // Reflect immediately for snappy UI; the webhook reconciles trial_end/status.
+    try {
+      await supabase.from('users').update({ tier, plan }).eq('email', email);
+    } catch (dbErr) {
+      console.error('❌ change-tier DB update failed:', dbErr.message);
+    }
+
+    console.log(`🔀 Tier switch: ${mE(email)} → ${tier}/${plan} (trialing=${isTrialing}, charge=${isTrialing ? 'none' : 'prorated'})`);
+    return res.json({ ok: true, tier, plan, trialing: isTrialing });
+  } catch (err) {
+    console.error('❌ change-tier error:', err.message);
+    return res.status(500).json({ error: 'server_error', message: 'Something went wrong. Please try again.' });
+  }
+});
+
 app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
   try {
     const { email, plan, tier, userData, consent, voucher, lang } = req.body;
@@ -5782,6 +5873,36 @@ app.post('/webhook', async (req, res) => {
           const { error } = await supabase.from('users').update(updates).eq('email', email);
           if (error) console.error('❌ Plan-change DB update failed:', error.message);
           else console.log(`🔄 Plan changed: ${mE(email)} → ${newTier}/${newPlan} (trial_end=${trialEndIso || 'unchanged'})`);
+          // ── New-tier welcome email ──────────────────────────────────
+          // Spec: a tier switch sends a fresh welcome for the NEW tier; the
+          // running trial is unaffected. Same template as the checkout
+          // welcome, with the live trial info. Fires only here, on a real
+          // price change — so it covers every tier/plan switch exactly once.
+          try {
+            const { data: wuser } = await supabase
+              .from('users').select('name, lang').eq('email', email).maybeSingle();
+            let wTrialDays = null;
+            if (sub.trial_start && sub.trial_end) {
+              wTrialDays = Math.round((sub.trial_end - sub.trial_start) * 1000 / 86400000);
+            }
+            let wMagicLink = null;
+            try {
+              const { data: wlink } = await supabase.auth.admin.generateLink({
+                type: 'magiclink', email, options: { redirectTo: `${FRONTEND_URL}/` },
+              });
+              wMagicLink = magicLinkFromHashedToken(wlink);
+            } catch (e) { console.warn('⚠️  tier-switch welcome magic link failed:', e.message); }
+            await sendEmail(email, 'welcome', {
+              name: wuser?.name || '',
+              tier: newTier,
+              trialDays: wTrialDays,
+              magicLink: wMagicLink,
+              lang: (wuser?.lang === 'en') ? 'en' : 'de',
+            });
+            console.log(`📧 Tier-switch welcome → ${mE(email)} (${newTier})`);
+          } catch (e) {
+            console.error('❌ Tier-switch welcome email failed:', e.message);
+          }
           // ── Family Plan: suspend membership if dropping below Premium ──
           // Family Plan is Premium-only. If the user just moved from
           // Premium to Basic (or anything else), pull them out of the
