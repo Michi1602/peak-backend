@@ -6287,8 +6287,8 @@ function emailFooter(email, lang) {
   // still render correctly.
   const taglineLang = (lang === 'de') ? 'de' : 'en';
   const taglineText = (taglineLang === 'de')
-    ? '„Für Athleten, die langfristig denken."'
-    : '"For athletes who play the long game."';
+    ? '„Ernährung, Bewegung und Regeneration — ein Ziel: deine Gesundheit."'
+    : '"Nutrition, movement and recovery — one goal: your health."';
   return `
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
     <tr>
@@ -7655,8 +7655,8 @@ app.post('/family/invite', userLimiter, async (req, res) => {
     const { data: g } = await supabase
       .from('family_groups').select('member_count').eq('id', groupId).maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 4) {
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+    if (g.member_count >= 6) {
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     const token = generateInviteToken();
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -7722,8 +7722,8 @@ app.post('/family/invite-info', userLimiter, async (req, res) => {
       .eq('id', inv.group_id)
       .maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 4) {
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+    if (g.member_count >= 6) {
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     // Look up the inviter's first name for the consent dialog. Falls
     // through gracefully if absent. We DON'T expose email, age, or any
@@ -7787,8 +7787,8 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
     const { data: g } = await supabase
       .from('family_groups').select('member_count').eq('id', inv.group_id).maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 4) {
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+    if (g.member_count >= 6) {
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     // Check for prior membership (left/suspended) → re-activate that row
     const { data: prior } = await supabase
@@ -7832,7 +7832,7 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
         .eq('group_id', inv.group_id)
         .eq('user_id', auth.userId)
         .eq('status', 'active');
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     await supabase.from('users').update({ family_group_id: inv.group_id }).eq('id', auth.userId);
     res.json({ ok: true, group_id: inv.group_id });
