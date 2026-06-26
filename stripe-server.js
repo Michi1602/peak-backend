@@ -6287,8 +6287,8 @@ function emailFooter(email, lang) {
   // still render correctly.
   const taglineLang = (lang === 'de') ? 'de' : 'en';
   const taglineText = (taglineLang === 'de')
-    ? '„Ernährung, Bewegung und Regeneration — ein Ziel: deine Gesundheit."'
-    : '"Nutrition, movement and recovery — one goal: your health."';
+    ? '„Ernährung, Bewegung und Regeneration — vereint statt vereinzelt."'
+    : '"Nutrition, movement and recovery — united, not isolated."';
   return `
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
     <tr>
