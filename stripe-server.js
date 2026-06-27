@@ -93,6 +93,19 @@ app.use(helmet({
 }));
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+// fix58: separater Auth-Client fuer verifyOtp/Session-Operationen. KRITISCH —
+// der Service-Client `supabase` oben darf NIE eine User-Session bekommen.
+// verifyOtp setzt sonst eine Session auf IHM; danach laufen alle .from()-Writes
+// als `authenticated` statt `service_role` -> RLS blockt (z.B. Free-Signup-Upsert,
+// Fehler "violates row-level security policy"). Eigene Instanz mit
+// persistSession:false haelt den Service-Client garantiert sauber. Nutzt den
+// anon-Key (Render-Env SUPABASE_ANON_KEY); Fallback Service-Key, falls (z.B.
+// Staging) nicht gesetzt — auch dann ist es eine separate Instanz und fixt den Bug.
+const supabaseAuth = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_KEY,
+  { auth: { persistSession: false, autoRefreshToken: false } }
+);
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://peak-mj-performance.app';
@@ -1169,7 +1182,7 @@ app.post('/auth/checkout-login', authLimiter, async (req, res) => {
     if (!hashedToken) {
       return res.status(500).json({ error: 'session_token_missing' });
     }
-    const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
+    const { data: verifyData, error: verifyErr } = await supabaseAuth.auth.verifyOtp({
       type: 'magiclink',
       token_hash: hashedToken,
     });
@@ -1330,7 +1343,7 @@ app.post('/auth/verify-otp', authLimiter, async (req, res) => {
       return res.status(500).json({ error: 'Session token missing' });
     }
 
-    const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
+    const { data: verifyData, error: verifyErr } = await supabaseAuth.auth.verifyOtp({
       type: 'magiclink',
       token_hash: hashedToken,
     });
@@ -1630,7 +1643,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
       } else {
         const hashedToken = linkAutoData?.properties?.hashed_token;
         if (hashedToken) {
-          const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
+          const { data: verifyData, error: verifyErr } = await supabaseAuth.auth.verifyOtp({
             type: 'magiclink',
             token_hash: hashedToken,
           });
@@ -6287,8 +6300,8 @@ function emailFooter(email, lang) {
   // still render correctly.
   const taglineLang = (lang === 'de') ? 'de' : 'en';
   const taglineText = (taglineLang === 'de')
-    ? '„Ernährung, Bewegung und Regeneration — vereint statt vereinzelt."'
-    : '"Nutrition, movement and recovery — united, not isolated."';
+    ? '„Für Athleten, die langfristig denken."'
+    : '"For athletes who play the long game."';
   return `
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
     <tr>
@@ -7655,8 +7668,8 @@ app.post('/family/invite', userLimiter, async (req, res) => {
     const { data: g } = await supabase
       .from('family_groups').select('member_count').eq('id', groupId).maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 6) {
-      return res.status(409).json({ error: 'group_full', limit: 6 });
+    if (g.member_count >= 4) {
+      return res.status(409).json({ error: 'group_full', limit: 4 });
     }
     const token = generateInviteToken();
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -7722,8 +7735,8 @@ app.post('/family/invite-info', userLimiter, async (req, res) => {
       .eq('id', inv.group_id)
       .maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 6) {
-      return res.status(409).json({ error: 'group_full', limit: 6 });
+    if (g.member_count >= 4) {
+      return res.status(409).json({ error: 'group_full', limit: 4 });
     }
     // Look up the inviter's first name for the consent dialog. Falls
     // through gracefully if absent. We DON'T expose email, age, or any
@@ -7787,8 +7800,8 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
     const { data: g } = await supabase
       .from('family_groups').select('member_count').eq('id', inv.group_id).maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 6) {
-      return res.status(409).json({ error: 'group_full', limit: 6 });
+    if (g.member_count >= 4) {
+      return res.status(409).json({ error: 'group_full', limit: 4 });
     }
     // Check for prior membership (left/suspended) → re-activate that row
     const { data: prior } = await supabase
@@ -7832,7 +7845,7 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
         .eq('group_id', inv.group_id)
         .eq('user_id', auth.userId)
         .eq('status', 'active');
-      return res.status(409).json({ error: 'group_full', limit: 6 });
+      return res.status(409).json({ error: 'group_full', limit: 4 });
     }
     await supabase.from('users').update({ family_group_id: inv.group_id }).eq('id', auth.userId);
     res.json({ ok: true, group_id: inv.group_id });
