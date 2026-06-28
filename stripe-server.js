@@ -93,19 +93,6 @@ app.use(helmet({
 }));
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-// fix58: separater Auth-Client fuer verifyOtp/Session-Operationen. KRITISCH —
-// der Service-Client `supabase` oben darf NIE eine User-Session bekommen.
-// verifyOtp setzt sonst eine Session auf IHM; danach laufen alle .from()-Writes
-// als `authenticated` statt `service_role` -> RLS blockt (z.B. Free-Signup-Upsert,
-// Fehler "violates row-level security policy"). Eigene Instanz mit
-// persistSession:false haelt den Service-Client garantiert sauber. Nutzt den
-// anon-Key (Render-Env SUPABASE_ANON_KEY); Fallback Service-Key, falls (z.B.
-// Staging) nicht gesetzt — auch dann ist es eine separate Instanz und fixt den Bug.
-const supabaseAuth = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_KEY,
-  { auth: { persistSession: false, autoRefreshToken: false } }
-);
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://peak-mj-performance.app';
@@ -1182,7 +1169,7 @@ app.post('/auth/checkout-login', authLimiter, async (req, res) => {
     if (!hashedToken) {
       return res.status(500).json({ error: 'session_token_missing' });
     }
-    const { data: verifyData, error: verifyErr } = await supabaseAuth.auth.verifyOtp({
+    const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
       type: 'magiclink',
       token_hash: hashedToken,
     });
@@ -1343,7 +1330,7 @@ app.post('/auth/verify-otp', authLimiter, async (req, res) => {
       return res.status(500).json({ error: 'Session token missing' });
     }
 
-    const { data: verifyData, error: verifyErr } = await supabaseAuth.auth.verifyOtp({
+    const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
       type: 'magiclink',
       token_hash: hashedToken,
     });
@@ -1643,7 +1630,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
       } else {
         const hashedToken = linkAutoData?.properties?.hashed_token;
         if (hashedToken) {
-          const { data: verifyData, error: verifyErr } = await supabaseAuth.auth.verifyOtp({
+          const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
             type: 'magiclink',
             token_hash: hashedToken,
           });
@@ -8034,9 +8021,14 @@ app.post('/family/generate-meal', aiLimiter, mediumJson, async (req, res) => {
     if (!Array.isArray(participating_user_ids) || participating_user_ids.length === 0) {
       participating_user_ids = members.map(m => m.id);
     } else {
-      // Sanity check — every requested participant must be in the group
-      // and Premium-active. Drop any that aren't.
-      const validSet = new Set(members.filter(m => m.tier === 'premium' && m.status === 'active').map(m => m.id));
+      // fix59: Sanity check — every requested participant must be an ACTIVE
+      // member of the group. The per-participant Premium re-check was REMOVED:
+      // it read m.tier / m.status, which loadGroupMembersForCooking never
+      // selects -> always false -> "no_valid_participants" for EVERYONE (incl.
+      // valid Premium/Trial members). It is also redundant — the caller is
+      // Premium-verified above (requirePremium) and loadGroupMembersForCooking
+      // already returns only status='active' members; joining requires Premium.
+      const validSet = new Set(members.map(m => m.id));
       participating_user_ids = participating_user_ids.filter(id => validSet.has(id));
       if (participating_user_ids.length === 0) {
         return res.status(400).json({ error: 'no_valid_participants' });
