@@ -8098,13 +8098,13 @@ app.post('/family/generate-meal', aiLimiter, mediumJson, async (req, res) => {
       meal_slot,
       participating_user_ids,
       recipe,
-      per_user_breakdown
+      per_user_breakdown: perUserBreakdown
     }, { onConflict: 'group_id,meal_date,meal_slot' });
     if (upErr) {
       console.error('[family/generate-meal] upsert failed:', upErr.message);
       return res.status(500).json({ error: 'save_failed' });
     }
-    res.json({ ok: true, recipe, per_user_breakdown, participating_user_ids });
+    res.json({ ok: true, recipe, per_user_breakdown: perUserBreakdown, participating_user_ids });
   } catch (e) {
     console.error('[family/generate-meal] error:', e.message);
     res.status(500).json({ error: 'internal' });
