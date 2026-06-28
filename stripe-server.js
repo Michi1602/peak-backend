@@ -809,7 +809,7 @@ app.post('/auth/check-email', enumLimiter, async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
 
-    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
 
     // Check if a user profile exists for this email in our DB
     const { data: profile, error: profileErr } = await supabase
@@ -841,7 +841,7 @@ app.post('/auth/send-login-link', authLimiter, async (req, res) => {
     const { email, lang } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
 
-    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
 
     // Audit Pass 4 #7.8 + Pass 6 #9.8: per-email rate limit, with a
     // pre-check that the account actually exists. authLimiter (20/10min/IP)
@@ -984,7 +984,7 @@ app.post('/auth/send-otp', authLimiter, async (req, res) => {
     if (!email || typeof email !== 'string' || !email.includes('@')) {
       return res.status(400).json({ error: 'Valid email required' });
     }
-    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
     const emailLang = (lang === 'de' || lang === 'en') ? lang : 'en';
 
     // ── ACCOUNT EXISTENCE CHECK ────────────────────────────────────────
@@ -992,18 +992,33 @@ app.post('/auth/send-otp', authLimiter, async (req, res) => {
     // this email. Saves the user from waiting for an email that says
     // "no account" — and saves us Resend credits.
     let existingUser = null;
+    let existenceCheckErrored = false;
     try {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('users')
         .select('status')
         .eq('email', normalizedEmail)
         .maybeSingle();
-      existingUser = data;
+      if (error) {
+        // maybeSingle() also returns an error on >1 matching row. Either way,
+        // an errored probe must NOT block a real user — fail OPEN.
+        existenceCheckErrored = true;
+        console.warn('Account-existence check query error (fail-open):', error.message);
+      } else {
+        existingUser = data;
+      }
     } catch (e) {
-      console.warn('Account-existence check failed (fail-open):', e.message);
+      existenceCheckErrored = true;
+      console.warn('Account-existence check threw (fail-open):', e.message);
     }
 
-    if (!existingUser) {
+    // fix61: only refuse when the check ran CLEANLY and found nothing. On ANY
+    // error (transient DB hiccup under load, connection saturation, multi-row)
+    // we fail OPEN and send the OTP — an existing user must never be locked out
+    // by a flaky probe. Previously the catch was *labelled* "fail-open" but
+    // fell through to "no account" (fail-CLOSED), causing intermittent
+    // "no account" lockouts under load (matches send-login-link's behaviour).
+    if (!existingUser && !existenceCheckErrored) {
       // Audit Pass 4 #7.7: account-enumeration trade-off documented.
       // Returning 404/no_account leaks which emails are registered. For
       // a health/fitness app, mere membership is sensitive (Art. 9 GDPR
@@ -1130,7 +1145,7 @@ app.post('/auth/checkout-login', authLimiter, async (req, res) => {
       } catch (_) {}
     }
     if (!email) return res.status(404).json({ error: 'no_email' });
-    const normalizedEmail = String(email).trim().toLowerCase();
+    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
 
     // Find or create the auth user (the webhook may not have run yet).
     let authUserId = null;
@@ -1198,7 +1213,7 @@ app.post('/auth/verify-otp', authLimiter, async (req, res) => {
     if (!email || !code) {
       return res.status(400).json({ error: 'Email and code required' });
     }
-    const normalizedEmail = String(email).trim().toLowerCase();
+    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
     const normalizedCode = String(code).trim().replace(/\s/g, '');
     if (!/^\d{6}$/.test(normalizedCode)) {
       return res.status(400).json({ error: 'Invalid code format', code: 'INVALID_CODE' });
@@ -1385,7 +1400,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
       });
     }
 
-    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
 
     // ── AUTH CHECK (audit Pass 4 #7.1, P0) ──────────────────────────────
     // Two scenarios reach this endpoint:
@@ -3392,7 +3407,7 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
       });
     }
 
-    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
 
     // ── AUTH CHECK (audit Pass 4 #7.1, P0) ──────────────────────────────
     // Same protection as /auth/signup-free. Two valid paths:
@@ -3735,7 +3750,7 @@ app.post('/voucher/validate', enumLimiter, async (req, res) => {
     }
     // ─── ABUSE CHECK: email already redeemed this code? ─────────────────
     if (email && typeof email === 'string') {
-      const normalizedEmail = email.trim().toLowerCase();
+      const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
       try {
         const { data: prior, error } = await supabase
           .from('voucher_redemptions')
