@@ -332,12 +332,28 @@ async function findAuthUserByEmail(email) {
   let page = 1;
   // Hard cap at 50 pages (50k users) to prevent runaway loops on a broken API.
   while (page <= 50) {
-    let data;
-    try {
-      const result = await supabase.auth.admin.listUsers({ page, perPage: PAGE_SIZE });
-      data = result?.data;
-    } catch (e) {
-      console.error(`listUsers page ${page} failed:`, e.message);
+    let data = null;
+    // fix63: retry transient listUsers failures with short backoff instead of
+    // giving up on the first error. A brief admin-API hiccup (under load, or a
+    // freshly restarted instance) previously returned null on the first throw
+    // = "user not found", which downstream becomes a spurious 500 / failed
+    // login — a real contributor to login flakiness under load. Retrying rides
+    // out the blip. Contract is UNCHANGED: we still return null only after a
+    // query that genuinely finds nothing (or, as before, after exhausting
+    // retries), so every caller behaves exactly as it does today.
+    let got = false;
+    for (let attempt = 0; attempt < 3 && !got; attempt++) {
+      try {
+        const result = await supabase.auth.admin.listUsers({ page, perPage: PAGE_SIZE });
+        data = result?.data;
+        got = true;
+      } catch (e) {
+        console.error(`listUsers page ${page} attempt ${attempt + 1} failed:`, e.message);
+        if (attempt < 2) await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
+      }
+    }
+    if (!got) {
+      console.error(`listUsers page ${page} failed after retries — returning null (unchanged fail-safe)`);
       return null;
     }
     const users = data?.users || [];
