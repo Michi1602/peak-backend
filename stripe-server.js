@@ -6347,6 +6347,8 @@ function emailFooter(email, lang) {
           <span style="color:#555;"> · </span>
           <a href="${FRONTEND_URL}/datenschutz" style="color:#AAA;text-decoration:none;">Datenschutz</a>
           <span style="color:#555;"> · </span>
+          <a href="${FRONTEND_URL}/widerruf" style="color:#AAA;text-decoration:none;">Widerruf</a>
+          <span style="color:#555;"> · </span>
           <a href="${unsub}" style="color:#AAA;text-decoration:none;">Unsubscribe</a>
         </p>
         <p style="margin:0;color:#666;font-size:10px;letter-spacing:0.5px;">${COMPANY.name}</p>
@@ -8427,6 +8429,83 @@ async function regenerateFutureMealsAfterMemberChange(groupId) {
     console.error('[family] regenerate-after-member-change failed:', e.message);
   }
 }
+
+// ── POST /widerruf — Online-Widerruf (gesetzliche 14-Tage-Frist) ──────
+// Public (no auth): a consumer must be able to revoke even when not logged in.
+// Stores nothing in the DB (no migration needed) — the durable internal record
+// is the operator e-mail. Sends the consumer an Eingangsbestaetigung on a
+// durable medium (e-mail) with the content of the declaration plus date + time
+// of receipt, as required by the Widerrufsbutton rules / Art. 246a EGBGB.
+// Rate-limited (authLimiter, 20/10min) against e-mail-bombing.
+app.post('/widerruf', authLimiter, async (req, res) => {
+  try {
+    const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+    const name = String((req.body && req.body.name) || '').trim().slice(0, 200);
+    const orderRef = String((req.body && req.body.orderRef) || '').trim().slice(0, 200);
+    const email = String((req.body && req.body.email) || '').replace(/\s/g, '').toLowerCase();
+    if (!name || !email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return res.status(400).json({ error: 'invalid_input' });
+    }
+    const now = new Date();
+    const stamp = now.toLocaleString('de-DE', { timeZone: 'Europe/Berlin', dateStyle: 'long', timeStyle: 'short' }) + ' Uhr';
+    const declaration = 'Hiermit widerrufe ich den ueber die PEAK-App abgeschlossenen Vertrag ueber die Erbringung der Dienstleistung (Nutzung der PEAK-App).';
+
+    const userHtml =
+      '<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#1A1410">' +
+      '<h2 style="font-size:18px;letter-spacing:2px;color:#1A1410">PEAK &mdash; Eingangsbest&auml;tigung Ihres Widerrufs</h2>' +
+      '<p>Guten Tag ' + esc(name) + ',</p>' +
+      '<p>wir best&auml;tigen den Eingang Ihres Widerrufs. Diese E-Mail dient als Eingangsbest&auml;tigung auf einem dauerhaften Datentr&auml;ger.</p>' +
+      '<table style="border-collapse:collapse;margin:16px 0;font-size:14px">' +
+      '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">Eingegangen am</td><td style="padding:4px 0"><strong>' + esc(stamp) + '</strong></td></tr>' +
+      '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">Name</td><td style="padding:4px 0">' + esc(name) + '</td></tr>' +
+      '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">Bestell-/Vertragskennung</td><td style="padding:4px 0">' + (orderRef ? esc(orderRef) : '&mdash;') + '</td></tr>' +
+      '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">E-Mail</td><td style="padding:4px 0">' + esc(email) + '</td></tr>' +
+      '</table>' +
+      '<p style="font-size:14px"><strong>Inhalt Ihrer Erkl&auml;rung:</strong><br>' + esc(declaration) + '</p>' +
+      '<p>Etwaige bereits geleistete Zahlungen erstatten wir Ihnen unverz&uuml;glich, sp&auml;testens binnen 14 Tagen ab Eingang dieses Widerrufs, &uuml;ber dasselbe Zahlungsmittel.</p>' +
+      '<p style="color:#6B5D4A;font-size:12px;margin-top:24px">MJ Performance &middot; Michael Jahn &middot; Am Hasel 6, 85139 Wettstetten &middot; support@peak-mj-performance.app</p>' +
+      '</div>';
+    const userText =
+      'PEAK - Eingangsbestaetigung Ihres Widerrufs\n\n' +
+      'Eingegangen am: ' + stamp + '\nName: ' + name + '\nBestell-/Vertragskennung: ' + (orderRef || '-') + '\nE-Mail: ' + email + '\n\n' +
+      'Inhalt Ihrer Erklaerung: ' + declaration + '\n\n' +
+      'Etwaige Zahlungen erstatten wir unverzueglich, spaetestens binnen 14 Tagen ab Eingang, ueber dasselbe Zahlungsmittel.\n\n' +
+      'MJ Performance - Michael Jahn - Am Hasel 6, 85139 Wettstetten - support@peak-mj-performance.app';
+
+    try {
+      await resend.emails.send({
+        from: FROM_EMAIL, reply_to: REPLY_TO, to: email,
+        subject: 'Eingangsbestaetigung Ihres Widerrufs - PEAK',
+        html: userHtml, text: userText,
+      });
+    } catch (mailErr) {
+      console.error('[widerruf] confirmation mail failed:', mailErr.message);
+      return res.status(500).json({ error: 'mail_failed' });
+    }
+
+    // Operator notification so the revocation/refund is actually processed.
+    // A failure here must NOT fail the consumer flow (their confirmation is
+    // already out), so it is best-effort.
+    try {
+      await resend.emails.send({
+        from: FROM_EMAIL, reply_to: REPLY_TO, to: 'support@peak-mj-performance.app',
+        subject: 'Neuer Widerruf eingegangen - ' + email,
+        html: '<div style="font-family:Arial,sans-serif"><p><strong>Neuer Online-Widerruf</strong></p>' +
+          '<p>Eingegangen: ' + esc(stamp) + '<br>Name: ' + esc(name) + '<br>Kennung: ' + (orderRef ? esc(orderRef) : '&mdash;') + '<br>E-Mail: ' + esc(email) + '</p>' +
+          '<p>Bitte R&uuml;ckzahlung anstossen (14-Tage-Frist).</p></div>',
+        text: 'Neuer Widerruf\nEingegangen: ' + stamp + '\nName: ' + name + '\nKennung: ' + (orderRef || '-') + '\nE-Mail: ' + email,
+      });
+    } catch (opErr) {
+      console.error('[widerruf] operator notice failed:', opErr.message);
+    }
+
+    console.log('Widerruf received from ' + mE(email) + ' at ' + stamp);
+    return res.json({ ok: true, receivedAt: now.toISOString(), stamp });
+  } catch (e) {
+    console.error('[widerruf] error:', e.message);
+    return res.status(500).json({ error: 'internal' });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 // Audit Pass 5 #8.7: assign to the forward-declared __peakServer (declared
