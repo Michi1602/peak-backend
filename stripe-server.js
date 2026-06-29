@@ -1137,6 +1137,15 @@ app.post('/auth/checkout-login', authLimiter, async (req, res) => {
     if (!cs || cs.status !== 'complete') {
       return res.status(409).json({ error: 'session_not_complete' });
     }
+    // fix62: freshness window. A checkout session id can mint a full login
+    // session here, so it must not be a permanent key. Reject ids whose
+    // checkout completed more than 30 minutes ago — the legitimate
+    // post-checkout auto-login happens within seconds of redirect. (Full
+    // single-use tracking via a consumed-ids table is a sensible follow-up.)
+    const __csAgeSec = Math.floor(Date.now() / 1000) - (cs.created || 0);
+    if (cs.created && __csAgeSec > 1800) {
+      return res.status(410).json({ error: 'session_expired' });
+    }
     let email = cs.customer_email || (cs.customer_details && cs.customer_details.email) || null;
     if (!email && cs.customer) {
       try {
