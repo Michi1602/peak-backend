@@ -6498,7 +6498,7 @@ async function sendEmail(to, type, data) {
   try {
     const { data: user } = await supabase
       .from('users')
-      .select('unsubscribed,goal,goals,sport,lang')
+      .select('unsubscribed,goal,goals,sport,lang,customer_no')
       .eq('email', to)
       .maybeSingle();
     unsubscribed = user?.unsubscribed === true;
@@ -6506,6 +6506,10 @@ async function sendEmail(to, type, data) {
     if (Array.isArray(user?.goals)) userGoals = user.goals;
     if (user?.sport) userSport = user.sport;
     if (user?.lang === 'de' || user?.lang === 'en') userLang = user.lang;
+    // fix65: surface the customer number so templates (welcome mail) can show
+    // it — the user needs it e.g. for the Widerruf form. Best-effort: if the
+    // column is absent or the lookup fails, the mail simply omits it.
+    if (data && user && user.customer_no != null) data.customerNo = user.customer_no;
   } catch (err) {
     console.error('Unsubscribe-check exception:', err.message);
   }
@@ -6902,6 +6906,10 @@ async function sendEmail(to, type, data) {
           <p style="margin:0 0 32px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
             ${L.welcomeIntro(tier, goal, sport, trialDays)}
           </p>
+        </td></tr>
+
+        <tr><td class="email-pad" style="padding:0 40px 8px;">
+          ${data && data.customerNo != null ? ('<p style="margin:0;font-family:' + FONT_BODY + ';font-size:13px;color:' + BRAND.ink2 + ';">' + (de ? 'Deine Kundennummer' : 'Your customer number') + ': <strong style="letter-spacing:1px;color:' + BRAND.ink + ';">' + data.customerNo + '</strong></p>') : ''}
         </td></tr>
 
         <tr><td class="email-pad" style="padding:0 40px 8px;">
@@ -8441,11 +8449,41 @@ app.post('/widerruf', authLimiter, async (req, res) => {
   try {
     const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
     const name = String((req.body && req.body.name) || '').trim().slice(0, 200);
-    const orderRef = String((req.body && req.body.orderRef) || '').trim().slice(0, 200);
+    const customerNo = String((req.body && req.body.customerNo) || '').trim().slice(0, 200);
     const email = String((req.body && req.body.email) || '').replace(/\s/g, '').toLowerCase();
-    if (!name || !email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    if (!name || !email || !customerNo || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
       return res.status(400).json({ error: 'invalid_input' });
     }
+
+    // SECURITY: verify the e-mail and the customer number belong to the SAME
+    // account before doing anything. Without this, a leaked e-mail plus a
+    // guessable (sequential) number — or a guessable first name — would let
+    // someone revoke another person's contract and trigger a refund. Requiring
+    // an exact (email, customer_no) match turns the number into a shared secret
+    // only the account holder has (shown in their welcome mail + app settings).
+    // A genuine user who cannot use the form can still revoke by plain e-mail
+    // (the Widerrufsbelehrung explicitly allows letter/e-mail).
+    const cnNum = parseInt(customerNo, 10);
+    if (!Number.isFinite(cnNum)) {
+      return res.status(422).json({ error: 'no_match' });
+    }
+    let matched = false;
+    try {
+      const { data: u } = await supabase
+        .from('users').select('customer_no').eq('email', email).maybeSingle();
+      matched = !!(u && u.customer_no != null && Number(u.customer_no) === cnNum);
+    } catch (lookupErr) {
+      // Do NOT fail open on a transient lookup error — that would re-open the
+      // exact hole we are closing. Ask the user to retry (or use e-mail).
+      console.error('[widerruf] match lookup failed:', lookupErr.message);
+      return res.status(503).json({ error: 'temporarily_unavailable' });
+    }
+    if (!matched) {
+      // Generic message on purpose — do not reveal whether the e-mail exists or
+      // which field was wrong (avoids enumeration of accounts/numbers).
+      return res.status(422).json({ error: 'no_match' });
+    }
+
     const now = new Date();
     const stamp = now.toLocaleString('de-DE', { timeZone: 'Europe/Berlin', dateStyle: 'long', timeStyle: 'short' }) + ' Uhr';
     const declaration = 'Hiermit widerrufe ich den ueber die PEAK-App abgeschlossenen Vertrag ueber die Erbringung der Dienstleistung (Nutzung der PEAK-App).';
@@ -8458,7 +8496,7 @@ app.post('/widerruf', authLimiter, async (req, res) => {
       '<table style="border-collapse:collapse;margin:16px 0;font-size:14px">' +
       '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">Eingegangen am</td><td style="padding:4px 0"><strong>' + esc(stamp) + '</strong></td></tr>' +
       '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">Name</td><td style="padding:4px 0">' + esc(name) + '</td></tr>' +
-      '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">Bestell-/Vertragskennung</td><td style="padding:4px 0">' + (orderRef ? esc(orderRef) : '&mdash;') + '</td></tr>' +
+      '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">Kundennummer</td><td style="padding:4px 0">' + (customerNo ? esc(customerNo) : '&mdash;') + '</td></tr>' +
       '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">E-Mail</td><td style="padding:4px 0">' + esc(email) + '</td></tr>' +
       '</table>' +
       '<p style="font-size:14px"><strong>Inhalt Ihrer Erkl&auml;rung:</strong><br>' + esc(declaration) + '</p>' +
@@ -8467,7 +8505,7 @@ app.post('/widerruf', authLimiter, async (req, res) => {
       '</div>';
     const userText =
       'PEAK - Eingangsbestaetigung Ihres Widerrufs\n\n' +
-      'Eingegangen am: ' + stamp + '\nName: ' + name + '\nBestell-/Vertragskennung: ' + (orderRef || '-') + '\nE-Mail: ' + email + '\n\n' +
+      'Eingegangen am: ' + stamp + '\nName: ' + name + '\nKundennummer: ' + (customerNo || '-') + '\nE-Mail: ' + email + '\n\n' +
       'Inhalt Ihrer Erklaerung: ' + declaration + '\n\n' +
       'Etwaige Zahlungen erstatten wir unverzueglich, spaetestens binnen 14 Tagen ab Eingang, ueber dasselbe Zahlungsmittel.\n\n' +
       'MJ Performance - Michael Jahn - Am Hasel 6, 85139 Wettstetten - support@peak-mj-performance.app';
@@ -8491,9 +8529,9 @@ app.post('/widerruf', authLimiter, async (req, res) => {
         from: FROM_EMAIL, reply_to: REPLY_TO, to: 'support@peak-mj-performance.app',
         subject: 'Neuer Widerruf eingegangen - ' + email,
         html: '<div style="font-family:Arial,sans-serif"><p><strong>Neuer Online-Widerruf</strong></p>' +
-          '<p>Eingegangen: ' + esc(stamp) + '<br>Name: ' + esc(name) + '<br>Kennung: ' + (orderRef ? esc(orderRef) : '&mdash;') + '<br>E-Mail: ' + esc(email) + '</p>' +
+          '<p>Eingegangen: ' + esc(stamp) + '<br>Name: ' + esc(name) + '<br>Kundennummer: ' + (customerNo ? esc(customerNo) : '&mdash;') + '<br>E-Mail: ' + esc(email) + '</p>' +
           '<p>Bitte R&uuml;ckzahlung anstossen (14-Tage-Frist).</p></div>',
-        text: 'Neuer Widerruf\nEingegangen: ' + stamp + '\nName: ' + name + '\nKennung: ' + (orderRef || '-') + '\nE-Mail: ' + email,
+        text: 'Neuer Widerruf\nEingegangen: ' + stamp + '\nName: ' + name + '\nKundennummer: ' + (customerNo || '-') + '\nE-Mail: ' + email,
       });
     } catch (opErr) {
       console.error('[widerruf] operator notice failed:', opErr.message);
