@@ -3624,6 +3624,28 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
     //   - trial_extend: we read metadata.trial_days and override trial_period_days
     //   - trial_full: 100% off for N months (Stripe coupon + longer trial)
     let trialDays = 7;
+
+    // ANTI-ABUSE (trial once per customer): without this a user could take the
+    // 7-day trial, cancel/withdraw before being charged, then sign up again for
+    // another free trial indefinitely (and with the 14-day right of withdrawal
+    // even reclaim a charged period). Stripe is the source of truth: if this
+    // e-mail has ANY prior subscription (active or cancelled), the trial was
+    // already used -> no trial now (immediate paid subscription). Fail-open so a
+    // transient Stripe error never blocks a genuine first-time signup's trial.
+    let isReturningSubscriber = false;
+    try {
+      const __cust = await stripe.customers.list({ email: (email || '').trim().toLowerCase(), limit: 1 });
+      if (__cust && __cust.data && __cust.data.length > 0) {
+        const __subs = await stripe.subscriptions.list({ customer: __cust.data[0].id, status: 'all', limit: 1 });
+        if (__subs && __subs.data && __subs.data.length > 0) {
+          isReturningSubscriber = true;
+          trialDays = 0;
+          console.log(`No trial - ${mE(email)} already had a subscription (anti-abuse)`);
+        }
+      }
+    } catch (trialChkErr) {
+      console.warn('Trial-eligibility check failed (fail-open, trial granted):', trialChkErr.message);
+    }
     let appliedPromoCode = null;
     let voucherError = null;
 
@@ -3714,10 +3736,12 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
       billing_address_collection: 'auto',
       customer_email: email,
       line_items: [{ price: priceId, quantity: 1 }],
-      subscription_data: {
-        trial_period_days: trialDays,
-        metadata: sharedMetadata,
-      },
+      subscription_data: Object.assign(
+        { metadata: sharedMetadata },
+        // Returning subscribers get NO trial (even if a voucher tried to add
+        // one); Stripe also rejects trial_period_days: 0, so omit it entirely.
+        (!isReturningSubscriber && trialDays > 0) ? { trial_period_days: trialDays } : {}
+      ),
       success_url: `${FRONTEND_URL}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${FRONTEND_URL}?cancelled=true`,
       metadata: sharedMetadata,
@@ -7097,6 +7121,39 @@ async function sendEmail(to, type, data) {
       `)
     },
 
+    widerruf_received: {
+      subject: de ? 'Eingangsbestätigung Ihres Widerrufs – PEAK' : 'Withdrawal received – PEAK',
+      html: emailShell(RESPONSIVE_CSS + `
+        <tr><td>${emailHeader()}</td></tr>
+        <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
+          <p style="margin:0 0 14px;font-family:${FONT_BODY};font-size:11px;font-weight:700;letter-spacing:3px;color:${BRAND.red};text-transform:uppercase;">${de ? 'Widerruf erhalten' : 'Withdrawal received'}</p>
+          <h1 class="email-h1" style="margin:0 0 16px;font-family:${FONT_HEAD};font-weight:900;font-size:38px;line-height:1.05;letter-spacing:-0.5px;color:${BRAND.ink};">
+            ${de ? 'Dein Widerruf<br>ist eingegangen' : 'Your withdrawal<br>was received'}
+          </h1>
+          <p style="margin:0 0 24px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">
+            ${de ? ('Guten Tag ' + (data && data.cname ? data.cname : '') + ', wir bestätigen den Eingang deines Widerrufs.') : ('Hi ' + (data && data.cname ? data.cname : '') + ', we confirm receipt of your withdrawal.')}
+          </p>
+
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};border-left:3px solid ${BRAND.red};margin:0 0 24px;">
+            <tr><td style="padding:18px 22px;font-family:${FONT_BODY};font-size:13px;line-height:1.8;color:${BRAND.ink2};">
+              ${de ? 'Eingegangen am' : 'Received'}: <strong>${data && data.stamp ? data.stamp : ''}</strong><br>
+              ${de ? 'Kundennummer' : 'Customer no.'}: <strong>${data && data.customerNo != null ? data.customerNo : ''}</strong>
+            </td></tr>
+          </table>
+
+          ${(data && data.willDowngrade)
+            ? `<p style="margin:0 0 8px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">${de ? ('Dein Premium-Zugang ' + (data && data.endDate ? ('endet am ' + data.endDate + ' und wird danach') : 'bleibt bis zum Ende der laufenden Testphase bzw. Abrechnungsperiode aktiv und wird danach') + ' automatisch auf den kostenlosen PEAK-Tarif umgestellt. Es erfolgt keine weitere Abbuchung; eine etwaige bereits geleistete Zahlung erstatten wir dir unverzüglich.') : ('Your premium access ' + (data && data.endDate ? ('ends on ' + data.endDate + ', then') : 'stays active until the end of your current trial or billing period, then') + ' automatically switches to the free PEAK plan. You will not be charged again; any payment already made will be refunded promptly.')}</p>`
+            : `<p style="margin:0 0 8px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">${de ? 'Dein Vertrag ist damit widerrufen. Es erfolgt keine Abbuchung.' : 'Your contract is hereby withdrawn. You will not be charged.'}</p>`}
+        </td></tr>
+
+        <tr><td class="email-cta" align="center" style="padding:24px 40px 56px;">
+          ${emailButton(FRONTEND_URL, de ? 'Zur App' : 'Open the app')}
+        </td></tr>
+
+        <tr><td>${emailFooter(to, lang)}</td></tr>
+      `)
+    },
+
     cancellation_reminder: {
       subject: L.cancelReminderSubject(data?.daysLeft || 3, data?.tier || 'premium'),
       html: emailShell(RESPONSIVE_CSS + `
@@ -8439,12 +8496,13 @@ async function regenerateFutureMealsAfterMemberChange(groupId) {
 }
 
 // ── POST /widerruf — Online-Widerruf (gesetzliche 14-Tage-Frist) ──────
-// Public (no auth): a consumer must be able to revoke even when not logged in.
-// Stores nothing in the DB (no migration needed) — the durable internal record
-// is the operator e-mail. Sends the consumer an Eingangsbestaetigung on a
-// durable medium (e-mail) with the content of the declaration plus date + time
-// of receipt, as required by the Widerrufsbutton rules / Art. 246a EGBGB.
-// Rate-limited (authLimiter, 20/10min) against e-mail-bombing.
+// Public (no auth), but verifies (email + customer_no) match the same account
+// before doing anything (anti-abuse). On a verified withdrawal: sets the Stripe
+// subscription to cancel_at_period_end (VARIANT 3 — premium stays until the
+// trial/period ends, no charge, then the subscription.deleted webhook downgrades
+// to free), sends the consumer a branded Eingangsbestaetigung (date + time of
+// receipt) announcing that outcome, and notifies the operator (flagging any
+// Stripe failure for manual handling). Rate-limited (authLimiter, 20/10min).
 app.post('/widerruf', authLimiter, async (req, res) => {
   try {
     const esc = (s) => String(s == null ? '' : s).replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
@@ -8468,9 +8526,11 @@ app.post('/widerruf', authLimiter, async (req, res) => {
       return res.status(422).json({ error: 'no_match' });
     }
     let matched = false;
+    let urow = null;
     try {
       const { data: u } = await supabase
-        .from('users').select('customer_no').eq('email', email).maybeSingle();
+        .from('users').select('customer_no, stripe_subscription_id, tier, status').eq('email', email).maybeSingle();
+      urow = u || null;
       matched = !!(u && u.customer_no != null && Number(u.customer_no) === cnNum);
     } catch (lookupErr) {
       // Do NOT fail open on a transient lookup error — that would re-open the
@@ -8486,58 +8546,60 @@ app.post('/widerruf', authLimiter, async (req, res) => {
 
     const now = new Date();
     const stamp = now.toLocaleString('de-DE', { timeZone: 'Europe/Berlin', dateStyle: 'long', timeStyle: 'short' }) + ' Uhr';
-    const declaration = 'Hiermit widerrufe ich den ueber die PEAK-App abgeschlossenen Vertrag ueber die Erbringung der Dienstleistung (Nutzung der PEAK-App).';
+    // VARIANT 3: keep premium until the end of the running (trial) period, then
+    // auto-downgrade to free — Stripe's cancel_at_period_end. No charge happens
+    // (the sub is cancelled before the trial-end invoice); the existing
+    // subscription.deleted webhook does the tier=free downgrade. Best-effort: if
+    // Stripe fails we still confirm the withdrawal (legal duty) and flag the
+    // operator to cancel manually before the trial ends.
+    let willDowngrade = false, stripeOk = false, stripeTried = false, endDate = null;
+    const subId = urow && urow.stripe_subscription_id;
+    const paidTier = urow && (urow.tier === 'premium' || urow.tier === 'basic');
+    if (subId && paidTier) {
+      stripeTried = true; willDowngrade = true;
+      try {
+        const updatedSub = await stripe.subscriptions.update(subId, {
+          cancel_at_period_end: true,
+          metadata: { cancellation_via: 'widerruf', widerruf_at: now.toISOString() },
+        });
+        stripeOk = true;
+        const endTs = updatedSub && (updatedSub.cancel_at || updatedSub.current_period_end || updatedSub.trial_end);
+        if (endTs) endDate = new Date(endTs * 1000).toLocaleDateString('de-DE', { timeZone: 'Europe/Berlin', day: '2-digit', month: 'long', year: 'numeric' });
+      } catch (stripeErr) {
+        console.error('[widerruf] stripe cancel_at_period_end failed:', stripeErr.message);
+        stripeOk = false;
+      }
+    }
 
-    const userHtml =
-      '<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#1A1410">' +
-      '<h2 style="font-size:18px;letter-spacing:2px;color:#1A1410">PEAK &mdash; Eingangsbest&auml;tigung Ihres Widerrufs</h2>' +
-      '<p>Guten Tag ' + esc(name) + ',</p>' +
-      '<p>wir best&auml;tigen den Eingang Ihres Widerrufs. Diese E-Mail dient als Eingangsbest&auml;tigung auf einem dauerhaften Datentr&auml;ger.</p>' +
-      '<table style="border-collapse:collapse;margin:16px 0;font-size:14px">' +
-      '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">Eingegangen am</td><td style="padding:4px 0"><strong>' + esc(stamp) + '</strong></td></tr>' +
-      '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">Name</td><td style="padding:4px 0">' + esc(name) + '</td></tr>' +
-      '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">Kundennummer</td><td style="padding:4px 0">' + (customerNo ? esc(customerNo) : '&mdash;') + '</td></tr>' +
-      '<tr><td style="padding:4px 12px 4px 0;color:#6B5D4A">E-Mail</td><td style="padding:4px 0">' + esc(email) + '</td></tr>' +
-      '</table>' +
-      '<p style="font-size:14px"><strong>Inhalt Ihrer Erkl&auml;rung:</strong><br>' + esc(declaration) + '</p>' +
-      '<p>Etwaige bereits geleistete Zahlungen erstatten wir Ihnen unverz&uuml;glich, sp&auml;testens binnen 14 Tagen ab Eingang dieses Widerrufs, &uuml;ber dasselbe Zahlungsmittel.</p>' +
-      '<p style="color:#6B5D4A;font-size:12px;margin-top:24px">MJ Performance &middot; Michael Jahn &middot; Am Hasel 6, 85139 Wettstetten &middot; support@peak-mj-performance.app</p>' +
-      '</div>';
-    const userText =
-      'PEAK - Eingangsbestaetigung Ihres Widerrufs\n\n' +
-      'Eingegangen am: ' + stamp + '\nName: ' + name + '\nKundennummer: ' + (customerNo || '-') + '\nE-Mail: ' + email + '\n\n' +
-      'Inhalt Ihrer Erklaerung: ' + declaration + '\n\n' +
-      'Etwaige Zahlungen erstatten wir unverzueglich, spaetestens binnen 14 Tagen ab Eingang, ueber dasselbe Zahlungsmittel.\n\n' +
-      'MJ Performance - Michael Jahn - Am Hasel 6, 85139 Wettstetten - support@peak-mj-performance.app';
-
+    // Consumer confirmation — branded template, announces the Variant-3 outcome.
     try {
-      await resend.emails.send({
-        from: FROM_EMAIL, reply_to: REPLY_TO, to: email,
-        subject: 'Eingangsbestaetigung Ihres Widerrufs - PEAK',
-        html: userHtml, text: userText,
-      });
+      await sendEmail(email, 'widerruf_received', { cname: name, customerNo: cnNum, stamp, willDowngrade, endDate });
     } catch (mailErr) {
       console.error('[widerruf] confirmation mail failed:', mailErr.message);
       return res.status(500).json({ error: 'mail_failed' });
     }
 
-    // Operator notification so the revocation/refund is actually processed.
-    // A failure here must NOT fail the consumer flow (their confirmation is
-    // already out), so it is best-effort.
+    // Operator notification (best-effort) — flags whether Stripe auto-cancel
+    // worked, so a failed one can be handled manually before the trial ends.
     try {
+      const opFlag = !stripeTried
+        ? 'Kein aktives Abo (bereits Free / kein Sub) - nichts zu kuendigen.'
+        : (stripeOk
+          ? 'Stripe: cancel_at_period_end gesetzt - Downgrade zum Trial-/Periodenende laeuft automatisch.'
+          : 'ACHTUNG: Stripe-Kuendigung FEHLGESCHLAGEN - VOR Trial-Ende manuell cancel_at_period_end setzen, sonst wird abgebucht!');
       await resend.emails.send({
         from: FROM_EMAIL, reply_to: REPLY_TO, to: 'support@peak-mj-performance.app',
-        subject: 'Neuer Widerruf eingegangen - ' + email,
+        subject: (stripeTried && !stripeOk ? '[AKTION NOETIG] ' : '') + 'Widerruf eingegangen - ' + email,
         html: '<div style="font-family:Arial,sans-serif"><p><strong>Neuer Online-Widerruf</strong></p>' +
-          '<p>Eingegangen: ' + esc(stamp) + '<br>Name: ' + esc(name) + '<br>Kundennummer: ' + (customerNo ? esc(customerNo) : '&mdash;') + '<br>E-Mail: ' + esc(email) + '</p>' +
-          '<p>Bitte R&uuml;ckzahlung anstossen (14-Tage-Frist).</p></div>',
-        text: 'Neuer Widerruf\nEingegangen: ' + stamp + '\nName: ' + name + '\nKundennummer: ' + (customerNo || '-') + '\nE-Mail: ' + email,
+          '<p>Eingegangen: ' + esc(stamp) + '<br>Name: ' + esc(name) + '<br>Kundennummer: ' + esc(String(cnNum)) + '<br>E-Mail: ' + esc(email) + '</p>' +
+          '<p><strong>' + esc(opFlag) + '</strong></p></div>',
+        text: 'Neuer Widerruf\nEingegangen: ' + stamp + '\nName: ' + name + '\nKundennummer: ' + cnNum + '\nE-Mail: ' + email + '\n\n' + opFlag,
       });
     } catch (opErr) {
       console.error('[widerruf] operator notice failed:', opErr.message);
     }
 
-    console.log('Widerruf received from ' + mE(email) + ' at ' + stamp);
+    console.log('Widerruf received from ' + mE(email) + ' at ' + stamp + ' (downgrade=' + willDowngrade + ', stripeOk=' + stripeOk + ')');
     return res.json({ ok: true, receivedAt: now.toISOString(), stamp });
   } catch (e) {
     console.error('[widerruf] error:', e.message);
