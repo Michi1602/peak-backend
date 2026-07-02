@@ -1,3 +1,4 @@
+// fix70 (audit safe-batch): #2 generic 500 errors · #3 profile field-min (keep stripe_customer_id) · #9 no email in 404 · #10 signup numeric clamps. No auth/payment/flow changes.
 const express = require('express');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { createClient } = require('@supabase/supabase-js');
@@ -846,7 +847,7 @@ app.post('/auth/check-email', enumLimiter, async (req, res) => {
     res.json({ exists, hasSubscription });
   } catch (err) {
     console.error('❌ check-email error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -969,7 +970,7 @@ app.post('/auth/send-login-link', authLimiter, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('❌ send-login-link error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -1125,7 +1126,7 @@ app.post('/auth/send-otp', authLimiter, async (req, res) => {
     res.json({ ok: true, expiresIn: 600 });
   } catch (err) {
     console.error('❌ /auth/send-otp error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -1390,7 +1391,7 @@ app.post('/auth/verify-otp', authLimiter, async (req, res) => {
     });
   } catch (err) {
     console.error('❌ /auth/verify-otp error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -1542,7 +1543,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
 
       if (createErr) {
         console.error('❌ Free auth user creation failed:', createErr.message);
-        return res.status(500).json({ error: createErr.message });
+        return res.status(500).json({ error: 'internal_error' });
       }
 
       authUserId = created.user.id;
@@ -1551,28 +1552,31 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
     const consentAt = consent.at || new Date().toISOString();
 
     // Upsert free profile row
+    // fix70 #10: clamp numeric inputs to sane human ranges (bounds, never reject).
+    const _clampNum = (v, lo, hi) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : null; };
+    const _clampInt = (v, lo, hi) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : null; };
     const userRow = {
       id: authUserId,
       email: normalizedEmail,
       name: userData?.name || '',
       age: userData?.age ? parseInt(userData.age, 10) : null,
       gender: userData?.gender || null,
-      weight: userData?.weight ? parseFloat(userData.weight) : null,
-      dweight: userData?.dweight ? parseFloat(userData.dweight) : null,
-      height: userData?.height ? parseFloat(userData.height) : null,
-      sleep: userData?.sleep ? parseFloat(userData.sleep) : null,
+      weight: _clampNum(userData?.weight, 20, 400),
+      dweight: _clampNum(userData?.dweight, 20, 400),
+      height: _clampNum(userData?.height, 80, 260),
+      sleep: _clampNum(userData?.sleep, 0, 24),
       job: userData?.job || null,
       commute: userData?.commute || null,
-      stress: userData?.stress ? parseFloat(userData.stress) : null,
+      stress: _clampNum(userData?.stress, 0, 100),
       level: userData?.level || null,
-      sessions: userData?.sessions ? parseInt(userData.sessions, 10) : null,
-      dur: userData?.dur ? parseInt(userData.dur, 10) : null,
+      sessions: _clampInt(userData?.sessions, 0, 21),
+      dur: _clampInt(userData?.dur, 0, 600),
       equip: userData?.equip || null,
       al: Array.isArray(userData?.al) ? userData.al : [],
       di: Array.isArray(userData?.di) ? userData.di : [],
       cu: Array.isArray(userData?.cu) ? userData.cu : [],
       cook: userData?.cook || null,
-      budget: userData?.budget ? parseFloat(userData.budget) : null,
+      budget: _clampNum(userData?.budget, 0, 100000),
       stretch_areas: Array.isArray(userData?.stretchAreas) ? userData.stretchAreas : [],
       stretch_dur: userData?.stretchDur ? parseInt(userData.stretchDur, 10) : 10,
       train_days: Array.isArray(userData?.trainDays)
@@ -1636,7 +1640,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
     });
     if (upsertErr) {
       console.error('❌ Free user upsert failed:', upsertErr.message);
-      return res.status(500).json({ error: upsertErr.message });
+      return res.status(500).json({ error: 'internal_error' });
     }
 
     // ── Auto-login via direct token exchange ─────────────────────────
@@ -1731,7 +1735,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
     });
   } catch (err) {
     console.error('❌ signup-free error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -1803,7 +1807,7 @@ app.post('/customer-portal', authLimiter, async (req, res) => {
     res.json({ url: portalSession.url });
   } catch (err) {
     console.error('❌ customer-portal error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -2188,7 +2192,7 @@ app.post('/share', authLimiter, mediumJson, async (req, res) => {
     res.json({ success: true, id, url });
   } catch (err) {
     console.error('❌ /share error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -2223,7 +2227,7 @@ app.get('/share/:id/data', publicReadLimiter, async (req, res) => {
       .maybeSingle();
     if (error) {
       console.error('❌ /share/:id/data error:', error.message);
-      return res.status(500).json({ error: error.message });
+      return res.status(500).json({ error: 'internal_error' });
     }
     if (!data) {
       return res.status(404).json({ error: 'not found' });
@@ -2236,7 +2240,7 @@ app.get('/share/:id/data', publicReadLimiter, async (req, res) => {
     res.json({ type: data.type, payload: data.payload });
   } catch (err) {
     console.error('❌ /share/:id/data error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -2606,7 +2610,7 @@ app.post('/ai/generate', aiLimiter, mediumJson, async (req, res) => {
     // one extra used slot for the user. That's identical to the
     // pre-Pass-2 behaviour and an acceptable trade-off until we refactor
     // this endpoint into a state machine.
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -2764,7 +2768,7 @@ If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
     res.json(parsed);
   } catch (err) {
     console.error('❌ /ai/scan-menu error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -2911,7 +2915,7 @@ If no food is visible: {"items":[],"error":"no_food"}.`;
     res.json(parsed);
   } catch (err) {
     console.error('/ai/scan-meal error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -3098,7 +3102,7 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
     res.json({ product });
   } catch (err) {
     console.error('❌ /ai/scan-barcode error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -3312,7 +3316,7 @@ Respond ONLY as JSON (no markdown, no explanation):
     res.json(result);
   } catch (err) {
     console.error('❌ /ai/quick-log error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -3634,13 +3638,20 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
     // transient Stripe error never blocks a genuine first-time signup's trial.
     let isReturningSubscriber = false;
     try {
-      const __cust = await stripe.customers.list({ email: (email || '').trim().toLowerCase(), limit: 1 });
+      const __cust = await stripe.customers.list({ email: normalizedEmail, limit: 1 });
       if (__cust && __cust.data && __cust.data.length > 0) {
-        const __subs = await stripe.subscriptions.list({ customer: __cust.data[0].id, status: 'all', limit: 1 });
-        if (__subs && __subs.data && __subs.data.length > 0) {
+        const __subs = await stripe.subscriptions.list({ customer: __cust.data[0].id, status: 'all', limit: 10 });
+        // Only count a sub that ACTUALLY started (a trial or a real subscription).
+        // 'incomplete'/'incomplete_expired' = the initial payment never completed,
+        // so a trial was never consumed — don't deny a genuine first-timer their
+        // trial just because an earlier attempt was abandoned.
+        const usedTrialOrSub = ((__subs && __subs.data) || []).some(
+          s => s.status !== 'incomplete' && s.status !== 'incomplete_expired'
+        );
+        if (usedTrialOrSub) {
           isReturningSubscriber = true;
           trialDays = 0;
-          console.log(`No trial - ${mE(email)} already had a subscription (anti-abuse)`);
+          console.log(`No trial - ${mE(normalizedEmail)} already had a subscription (anti-abuse)`);
         }
       }
     } catch (trialChkErr) {
@@ -3760,7 +3771,7 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
     res.json({ url: session.url, sessionId: session.id });
   } catch (err) {
     console.error('❌ Checkout error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -3983,7 +3994,7 @@ app.post('/voucher/apply-existing', authLimiter, async (req, res) => {
     res.json({ ok: true, label, code: normalizedCode });
   } catch (err) {
     console.error('❌ /voucher/apply-existing error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4053,13 +4064,16 @@ app.get('/user/profile', userLimiter, async (req, res) => {
       } else {
         console.warn(`[/user/profile] no profile row found for ${mE(user.email)} (id=${user.id})`);
       }
-      return res.status(404).json({ error: 'Profile not found', email: user.email });
+      return res.status(404).json({ error: 'Profile not found' });
     }
 
-    res.json({ profile });
+    // fix70 #3: data minimisation — strip fields the frontend never reads.
+    // Keep stripe_customer_id (frontend uses it for portal/tier refresh).
+    const { stripe_subscription_id: _ssid, card_fingerprint: _cfp, ...safeProfile } = profile;
+    res.json({ profile: safeProfile });
   } catch (err) {
     console.error('❌ /user/profile error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4235,7 +4249,7 @@ app.post('/user/update-profile', userLimiter, async (req, res) => {
     res.json({ profile: data });
   } catch (err) {
     console.error('❌ /user/update-profile error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4568,7 +4582,7 @@ app.delete('/user/account', userLimiter, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('❌ /user/account DELETE error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4650,7 +4664,7 @@ app.get('/user/export-data', userLimiter, async (req, res) => {
     res.send(JSON.stringify(exportPayload, null, 2));
   } catch (err) {
     console.error('❌ /user/export-data error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4681,7 +4695,7 @@ app.get('/user/training-state', userLimiter, async (req, res) => {
     res.json({ training_state: data?.training_state || null });
   } catch (err) {
     console.error('❌ /user/training-state GET error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4744,7 +4758,7 @@ app.post('/user/meal-track', userLimiter, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/meal-track POST error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4793,7 +4807,7 @@ app.post('/user/training-state', userLimiter, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/training-state POST error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4898,7 +4912,7 @@ app.post('/user/meal-pool', userLimiter, mediumJson, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/meal-pool POST error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -5155,7 +5169,7 @@ app.post('/user/lite-sync', userLimiter, mediumJson, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/lite-sync error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -5271,7 +5285,7 @@ app.post('/user/stretch-pool', userLimiter, mediumJson, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/stretch-pool POST error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -5430,7 +5444,7 @@ app.post('/user/plan', userLimiter, mediumJson, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/plan POST error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
