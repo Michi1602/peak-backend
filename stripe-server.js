@@ -1,3 +1,4 @@
+// fix72 (audit batch 3): #5 checkout-login single-use via consumed_checkout_sessions (atomic insert-first, 409 on replay, fail-open if table missing/DB hiccup) + weekly purge. Requires migration_consumed_checkout_sessions.sql. RLS (#1) handled separately in SQL.
 // fix71 (audit batch 2): #4 payment_method_collection:'always' (trial needs card) · #8 webhook 500-retry for checkout.session.completed with idempotency-unmark · Follow-up A generic webhook error body · Follow-up B update-profile field-min. #5/#7 intentionally not touched.
 // fix70 (audit safe-batch): #2 generic 500 errors · #3 profile field-min (keep stripe_customer_id) · #9 no email in 404 · #10 signup numeric clamps. No auth/payment/flow changes.
 const express = require('express');
@@ -1163,6 +1164,28 @@ app.post('/auth/checkout-login', authLimiter, async (req, res) => {
     const __csAgeSec = Math.floor(Date.now() / 1000) - (cs.created || 0);
     if (cs.created && __csAgeSec > 1800) {
       return res.status(410).json({ error: 'session_expired' });
+    }
+
+    // fix72 #5: single-use. A leaked cs_ (referer / history / support screenshot)
+    // must not mint a login session twice inside the 30-min window. Insert-first
+    // is atomic: the first caller wins, any replay hits the unique PK (23505) and
+    // is rejected. Degrades gracefully — if the table is missing (migration not
+    // deployed yet) or the DB hiccups, we fall open to the freshness-window-only
+    // behaviour so a legitimate user is never locked out. The frontend only calls
+    // this with no existing session and falls back to normal login on failure.
+    try {
+      const { error: consumeErr } = await supabase
+        .from('consumed_checkout_sessions')
+        .insert({ session_id: sessionId });
+      if (consumeErr) {
+        if (consumeErr.code === '23505') {
+          console.warn(`↩️  checkout-login: session already used (${sessionId.slice(0, 12)}…)`);
+          return res.status(409).json({ error: 'session_already_used' });
+        }
+        console.warn('⚠️  checkout-login consume insert failed (fail-open):', consumeErr.message);
+      }
+    } catch (e) {
+      console.warn('⚠️  checkout-login consume threw (fail-open):', e.message);
     }
     let email = cs.customer_email || (cs.customer_details && cs.customer_details.email) || null;
     if (!email && cs.customer) {
@@ -7520,6 +7543,19 @@ cron.schedule('15 3 * * 1', async () => {
       else console.log(`🧹 webhook_events cleanup: removed ${weCount || 0} rows older than 90 days`);
     } catch (e) {
       console.error('❌ webhook_events cleanup crashed:', e.message);
+    }
+    // fix72 #5: consumed_checkout_sessions — useless after the 30-min freshness
+    // window; keep 1 day for forensics. Harmless if the table doesn't exist yet.
+    try {
+      const csCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const { error: ccErr, count: ccCount } = await supabase
+        .from('consumed_checkout_sessions')
+        .delete({ count: 'exact' })
+        .lt('consumed_at', csCutoff);
+      if (ccErr) console.error('❌ consumed_checkout_sessions cleanup error:', ccErr.message);
+      else console.log(`🧹 consumed_checkout_sessions cleanup: removed ${ccCount || 0} rows older than 1 day`);
+    } catch (e) {
+      console.error('❌ consumed_checkout_sessions cleanup crashed:', e.message);
     }
   } catch (err) {
     console.error('❌ ttl cleanup crashed:', err.message);
