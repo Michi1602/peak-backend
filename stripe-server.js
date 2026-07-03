@@ -1,3 +1,4 @@
+// fix74 (annual->monthly renewal, §309 Nr.9 BGB): after 12 months a yearly plan converts to a MONTHLY subscription (monthly-cancellable) at the pro-rated monthly price via a Stripe Subscription Schedule (phase 1 = annual x1yr, trial preserved; phase 2 = monthly renewal price, indefinite). Attached at checkout.session.completed for annual plans (best-effort, operator-alerted on failure). Renewal Price IDs read from env basic_renewal_monthly / premium_renewal_monthly. change-tier / in-app cancel / reactivate / widerruf release any attached schedule first (a scheduled sub rejects direct item/price updates); change-tier re-attaches for annual. Helpers: renewalPriceForTier, releaseScheduleIfAny, attachRenewalScheduleForAnnual, notifyOperator.
 // fix73 (CHRYOS email copy): brand name PEAK->CHRYOS in all visible email/page text + new footer tagline. Domain/addresses (peak-mj-performance.app, noreply@, support@) intentionally UNCHANGED (domain round).
 // fix72 (audit batch 3): #5 checkout-login single-use via consumed_checkout_sessions (atomic insert-first, 409 on replay, fail-open if table missing/DB hiccup) + weekly purge. Requires migration_consumed_checkout_sessions.sql. RLS (#1) handled separately in SQL.
 // fix71 (audit batch 2): #4 payment_method_collection:'always' (trial needs card) · #8 webhook 500-retry for checkout.session.completed with idempotency-unmark · Follow-up A generic webhook error body · Follow-up B update-profile field-min. #5/#7 intentionally not touched.
@@ -65,6 +66,19 @@ if (MISSING_ENV.length) {
   process.exit(1);
 }
 
+// ── RENEWAL PRICES (§309 Nr.9 BGB — annual -> monthly after 12 months) ──
+// A yearly plan must convert to a MONTHLY subscription after its first year
+// (monthly-cancellable) at the pro-rated monthly price. The two renewal
+// Prices live in Render env under these EXACT (lower-case) keys and are read
+// in attachRenewalScheduleForAnnual(). A missing key does NOT crash the
+// backend (checkout keeps working) — but every annual purchase of that tier
+// would then silently renew YEARLY, so we warn loudly at boot.
+['basic_renewal_monthly', 'premium_renewal_monthly'].forEach((k) => {
+  if (!process.env[k]) {
+    console.warn(`⚠️  RENEWAL PRICE MISSING: env ${k} not set — annual->monthly conversion for that tier is skipped (annual would renew yearly). Set it in Render → Environment.`);
+  }
+});
+
 const app = express();
 
 // ── SECURITY HEADERS (audit Pass 5 #8.3, Pass 6 #9.2) ─────────────────
@@ -117,6 +131,158 @@ const COMPANY = {
   website: 'https://peak-mj-performance.app',
   owner: 'Michael Jahn',
 };
+
+// ════════════════════════════════════════════════════════════════════
+// ANNUAL → MONTHLY RENEWAL (§309 Nr.9 BGB — lawyer requirement)
+// ────────────────────────────────────────────────────────────────────
+// A yearly subscription must NOT auto-renew into another fixed year. After
+// the first 12 months it has to continue MONTHLY (cancellable monthly) at
+// the pro-rated monthly price of the annual plan. A plain yearly Stripe
+// Price just renews yearly, so we drive this with a Subscription Schedule:
+//   Phase 1: the yearly Price, exactly ONE year (trial preserved).
+//   Phase 2: the monthly renewal Price, indefinitely.
+// end_behavior:'release' → after phase 1 hands off to phase 2, the monthly
+// subscription simply keeps running (schedule detaches).
+//
+// Renewal monthly Prices (Render env keys = Stripe lookup keys):
+//   basic_renewal_monthly   → Basic  €4.99/mo
+//   premium_renewal_monthly → Premium €9.99/mo
+// ════════════════════════════════════════════════════════════════════
+function renewalPriceForTier(tier) {
+  return tier === 'basic'
+    ? process.env.basic_renewal_monthly
+    : process.env.premium_renewal_monthly;
+}
+
+// Best-effort operator alert (mirrors the /widerruf operator notice).
+async function notifyOperator(subject, lines) {
+  try {
+    const body = Array.isArray(lines) ? lines.join('\n') : String(lines || '');
+    const escd = body.replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+    await resend.emails.send({
+      from: FROM_EMAIL, reply_to: REPLY_TO, to: 'support@peak-mj-performance.app',
+      subject,
+      text: body,
+      html: '<div style="font-family:Arial,sans-serif"><pre style="font-family:inherit;white-space:pre-wrap;margin:0">' + escd + '</pre></div>',
+    });
+  } catch (e) {
+    console.error('[ops-notify] failed:', e.message);
+  }
+}
+
+// Release any subscription schedule attached to a subscription, so that a
+// DIRECT stripe.subscriptions.update (price swap, cancel_at_period_end, …)
+// isn't rejected with "managed by a subscription schedule". Releasing leaves
+// the underlying subscription running on its current phase — it does NOT
+// cancel anything. Accepts a sub object or an id. Best-effort; returns true
+// if a schedule was released.
+async function releaseScheduleIfAny(subOrId) {
+  try {
+    let sub = subOrId;
+    if (typeof subOrId === 'string') {
+      sub = await stripe.subscriptions.retrieve(subOrId);
+    }
+    if (sub && sub.schedule) {
+      const schedId = typeof sub.schedule === 'string' ? sub.schedule : sub.schedule.id;
+      await stripe.subscriptionSchedules.release(schedId);
+      console.log(`🗓  Released subscription schedule ${schedId} for ${sub.id}`);
+      return true;
+    }
+  } catch (e) {
+    // A schedule that's already released/completed/canceled throws — harmless.
+    console.warn('[schedule] releaseScheduleIfAny:', e.message);
+  }
+  return false;
+}
+
+// Convert an ANNUAL subscription into: 1 year at the annual price, then the
+// monthly renewal price indefinitely (monthly-cancellable). Idempotent +
+// best-effort: never throws, never blocks the caller (the purchase already
+// succeeded). On failure the annual sub simply stays annual (old behaviour)
+// and the operator is alerted so a schedule can be added manually.
+async function attachRenewalScheduleForAnnual(subId, tier) {
+  if (!subId) return false;
+  const renewalPrice = renewalPriceForTier(tier);
+  const missingKey = tier === 'basic' ? 'basic_renewal_monthly' : 'premium_renewal_monthly';
+  if (!renewalPrice) {
+    console.error(`❌ [renewal] no renewal price env for tier=${tier} — set ${missingKey} in Render`);
+    await notifyOperator('[AKTION NOETIG] Renewal-Preis fehlt (' + tier + ')',
+      ['Jahresabo konnte NICHT auf Monats-Anschluss umgestellt werden.',
+       'Subscription: ' + subId,
+       'Fehlende Env-Variable: ' + missingKey,
+       'Folge: dieses Jahresabo verlaengert sich sonst jaehrlich (§309 Nr.9 BGB).']);
+    return false;
+  }
+  try {
+    const sub = await stripe.subscriptions.retrieve(subId);
+    // Self-guard: skip cancelled/incomplete subs (e.g. voucher-abuse cancel).
+    if (!sub || !['trialing', 'active', 'past_due'].includes(sub.status)) return false;
+
+    // Only convert genuine YEARLY subscriptions.
+    const curItem = sub.items && sub.items.data && sub.items.data[0];
+    const interval = curItem && curItem.price && curItem.price.recurring && curItem.price.recurring.interval;
+    if (interval !== 'year') return false;
+
+    // Already scheduled → nothing to do (idempotent).
+    if (sub.schedule) return true;
+
+    const annualPriceId = curItem.price.id;
+
+    // 1) Create a schedule mirroring the current subscription. from_subscription
+    //    cannot be combined with other params → a separate update call follows.
+    const schedule = await stripe.subscriptionSchedules.create({ from_subscription: subId });
+    const p0 = (schedule.phases && schedule.phases[0]) || {};
+
+    // Phase 1 = the current annual phase, bounded to ONE year, trial preserved.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const phase1 = {
+      items: [{ price: annualPriceId, quantity: 1 }],
+      start_date: p0.start_date || sub.current_period_start,
+    };
+    const trialEnd = p0.trial_end || sub.trial_end;
+    if (trialEnd && trialEnd > nowSec) phase1.trial_end = trialEnd; // keep the 7-day trial
+
+    // Phase 2 = monthly renewal, indefinite; phase metadata flips the running
+    // subscription to plan=monthly once it enters this phase.
+    const phase2 = {
+      items: [{ price: renewalPrice, quantity: 1 }],
+      metadata: { plan: 'monthly', renewal_of: 'annual', tier },
+    };
+
+    const baseUpdate = { end_behavior: 'release', proration_behavior: 'none' };
+
+    // Bound phase 1 to one yearly cycle. Newer Stripe API versions (2025-09-30+)
+    // replaced `iterations` with `duration`; the server pins no apiVersion, so
+    // we try iterations first (older/default) and fall back to duration.
+    try {
+      await stripe.subscriptionSchedules.update(schedule.id, {
+        ...baseUpdate,
+        phases: [{ ...phase1, iterations: 1 }, phase2],
+      });
+    } catch (e1) {
+      const msg = (e1 && e1.message) || '';
+      if (/iterations|duration|unknown parameter|no longer/i.test(msg)) {
+        await stripe.subscriptionSchedules.update(schedule.id, {
+          ...baseUpdate,
+          phases: [{ ...phase1, duration: { interval: 'year', interval_count: 1 } }, phase2],
+        });
+      } else {
+        throw e1;
+      }
+    }
+
+    console.log(`🗓✅ Renewal schedule attached for ${subId} (${tier}: annual -> monthly ${renewalPrice})`);
+    return true;
+  } catch (e) {
+    console.error('❌ [renewal] attachRenewalScheduleForAnnual failed:', e.message);
+    await notifyOperator('[AKTION NOETIG] Renewal-Schedule fehlgeschlagen',
+      ['Jahresabo konnte NICHT auf Monats-Anschluss umgestellt werden.',
+       'Subscription: ' + subId + '  Tier: ' + tier,
+       'Fehler: ' + (e && e.message),
+       'Folge: dieses Jahresabo verlaengert sich sonst jaehrlich (§309 Nr.9 BGB) — bitte manuell in Stripe einen Schedule anlegen.']);
+    return false;
+  }
+}
 
 // ── CORS — restricted to known origins (security hardening Apr 2026) ──
 // Previously: app.use(cors()) — open to all origins, allowed CSRF-style abuse.
@@ -1897,6 +2063,9 @@ app.post('/cancel-subscription', cancelLimiter, async (req, res) => {
     // Kündigung zum Ende des laufenden Abrechnungszeitraums vormerken.
     let updated;
     try {
+      // A yearly renewal schedule would reject a direct update — detach it
+      // first (release keeps the sub running so cancel_at_period_end applies).
+      await releaseScheduleIfAny(profile.stripe_subscription_id);
       updated = await stripe.subscriptions.update(profile.stripe_subscription_id, {
         cancel_at_period_end: true,
         metadata: {
@@ -2006,6 +2175,10 @@ app.post('/reactivate-subscription/confirm', reactivateLimiter, express.urlencod
       return res.status(404).send(reactivatePage(`<h1>Kein Abo gefunden</h1><p>Wir konnten kein Abo finden.<br><br>No subscription found.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
     }
     try {
+      // Detach any renewal schedule so the un-cancel update isn't rejected.
+      // (Note: a reactivated ANNUAL sub then renews yearly again — rare edge
+      //  case; re-attaching on reactivate is a documented follow-up.)
+      await releaseScheduleIfAny(profile.stripe_subscription_id);
       await stripe.subscriptions.update(profile.stripe_subscription_id, {
         cancel_at_period_end: false,
         metadata: { reactivated_via: '312k_undo', reactivated_at: new Date().toISOString() },
@@ -3412,6 +3585,11 @@ app.post('/change-tier', authLimiter, mediumJson, async (req, res) => {
 
     const isTrialing = sub.status === 'trialing';
 
+    // A yearly renewal schedule (if attached) would BLOCK a direct item swap
+    // ("managed by a subscription schedule"). Release it first — releasing
+    // only detaches the schedule, it does not cancel the subscription.
+    await releaseScheduleIfAny(sub);
+
     // The fix: swap the price on the SAME subscription.
     //  • trialing  → no proration, trial_end untouched (omitted) → no charge.
     //  • post-trial → prorate the difference onto the next invoice.
@@ -3420,6 +3598,12 @@ app.post('/change-tier', authLimiter, mediumJson, async (req, res) => {
       proration_behavior: isTrialing ? 'none' : 'create_prorations',
       metadata: { ...(sub.metadata || {}), tier, plan },
     });
+
+    // If the switched-to plan is annual, (re)attach the annual->monthly
+    // renewal schedule so the new yearly term is also §309-Nr.9-compliant.
+    if (plan === 'annual') {
+      await attachRenewalScheduleForAnnual(profile.stripe_subscription_id, tier);
+    }
 
     // Reflect immediately for snappy UI; the webhook reconciles trial_end/status.
     try {
@@ -5898,6 +6082,19 @@ app.post('/webhook', async (req, res) => {
             console.error('❌ Voucher redemption insert exception:', err.message);
           }
         }
+      }
+
+      // ── Annual → monthly renewal (§309 Nr.9 BGB) ─────────────────────
+      // For a YEARLY plan, convert the subscription so it bills the annual
+      // price for one year, then the monthly renewal price indefinitely
+      // (monthly-cancellable). Best-effort: the helper self-skips if the sub
+      // was cancelled (e.g. voucher abuse above) or isn't actually yearly,
+      // and never throws — the paid signup is already fully provisioned.
+      if (session.subscription && meta.plan === 'annual') {
+        await attachRenewalScheduleForAnnual(
+          session.subscription,
+          meta.tier === 'basic' ? 'basic' : 'premium'
+        );
       }
     } else if (event.type === 'customer.subscription.deleted') {
       const sub = event.data.object;
@@ -8639,6 +8836,9 @@ app.post('/widerruf', authLimiter, async (req, res) => {
     if (subId && paidTier) {
       stripeTried = true; willDowngrade = true;
       try {
+        // Detach any renewal schedule first (a scheduled sub rejects a direct
+        // update); releasing keeps the sub so cancel_at_period_end still holds.
+        await releaseScheduleIfAny(subId);
         const updatedSub = await stripe.subscriptions.update(subId, {
           cancel_at_period_end: true,
           metadata: { cancellation_via: 'widerruf', widerruf_at: now.toISOString() },
