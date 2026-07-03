@@ -1,3 +1,4 @@
+// fix71 (audit batch 2): #4 payment_method_collection:'always' (trial needs card) · #8 webhook 500-retry for checkout.session.completed with idempotency-unmark · Follow-up A generic webhook error body · Follow-up B update-profile field-min. #5/#7 intentionally not touched.
 // fix70 (audit safe-batch): #2 generic 500 errors · #3 profile field-min (keep stripe_customer_id) · #9 no email in 404 · #10 signup numeric clamps. No auth/payment/flow changes.
 const express = require('express');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -3734,6 +3735,10 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
 
     const sessionConfig = {
       mode: 'subscription',
+      // fix71 #4: always collect a card, even for trials / trial_full (100% off) —
+      // overrides any Dashboard 'if_required' setting so a full trial cannot be
+      // taken without a payment method. Closes trial-abuse via throwaway emails.
+      payment_method_collection: 'always',
       // When payment_method_types is omitted on a Checkout Session, Stripe
       // automatically shows all payment methods enabled in the Dashboard
       // (card, Apple Pay, Google Pay, PayPal, Klarna, SEPA, etc.) — no code
@@ -4246,7 +4251,10 @@ app.post('/user/update-profile', userLimiter, async (req, res) => {
     // Audit #3.2: was `length - 1` assuming updated_at was inside `updates`,
     // but it's appended to dbUpdates only. Counting `updates` directly now.
     console.log(`✅ Profile updated for ${mE(user.email)} (${Object.keys(updates).length} fields)`);
-    res.json({ profile: data });
+    // fix71 Follow-up B: strip fields the frontend never reads (guarded for null).
+    let safeUpdated = data;
+    if (data) { const { stripe_subscription_id: _ssid2, card_fingerprint: _cfp2, ...rest } = data; safeUpdated = rest; }
+    res.json({ profile: safeUpdated });
   } catch (err) {
     console.error('❌ /user/update-profile error:', err.message);
     res.status(500).json({ error: 'internal_error' });
@@ -5450,6 +5458,17 @@ app.post('/user/plan', userLimiter, mediumJson, async (req, res) => {
 
 
 // ── WEBHOOK ───────────────────────────────────────────────────────────
+// fix71 #8: when a handler fails and we return 500 (so Stripe retries), remove
+// the idempotency row first — otherwise the retry is treated as a duplicate and
+// skipped, defeating the retry. No-op if the row was never written.
+async function unmarkWebhookEvent(eventId) {
+  try {
+    await supabase.from('webhook_events').delete().eq('event_id', eventId);
+  } catch (e) {
+    console.warn('⚠️  unmarkWebhookEvent failed:', e.message);
+  }
+}
+
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -5571,7 +5590,10 @@ app.post('/webhook', async (req, res) => {
         }
       } catch (err) {
         console.error('❌ Auth user creation failed for', mE(email), ':', err.message);
-        return res.status(200).json({ received: true, auth_error: err.message });
+        // fix71 #8+A: real failure on the paid-signup event → 500 so Stripe
+        // retries (user paid, account not yet created). Generic body (no leak).
+        await unmarkWebhookEvent(event.id);
+        return res.status(500).json({ received: false });
       }
 
       // ── STEP 2: Upsert profile row in public.users, keyed by auth id ──
@@ -5702,7 +5724,9 @@ app.post('/webhook', async (req, res) => {
 
       if (error) {
         console.error('❌ Supabase upsert failed for', mE(email), ':', error.message);
-        return res.status(200).json({ received: true, db_error: error.message });
+        // fix71 #8+A: real failure on the paid-signup event → 500 so Stripe retries.
+        await unmarkWebhookEvent(event.id);
+        return res.status(500).json({ received: false });
       }
 
       console.log(`✅ User profile upserted: ${mE(email)} (rows: ${data?.length || 0})`);
@@ -6279,7 +6303,13 @@ app.post('/webhook', async (req, res) => {
     }
   } catch (err) {
     console.error('❌ Webhook handler error:', err.message, err.stack);
-    // Still return 200 so Stripe doesn't retry
+    // fix71 #8: paid-signup failures must be RETRIED (user paid, no account) —
+    // return 500 and drop the idempotency row so Stripe's retry reprocesses.
+    // Other event types keep 200 to avoid retry storms (recoverable otherwise).
+    if (event && event.type === 'checkout.session.completed') {
+      await unmarkWebhookEvent(event.id);
+      return res.status(500).json({ received: false });
+    }
   }
 
   res.json({ received: true });
