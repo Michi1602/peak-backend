@@ -1,3 +1,8 @@
+// fix74 (annual->monthly renewal, §309 Nr.9 BGB): after 12 months a yearly plan converts to a MONTHLY subscription (monthly-cancellable) at the pro-rated monthly price via a Stripe Subscription Schedule (phase 1 = annual x1yr, trial preserved; phase 2 = monthly renewal price, indefinite). Attached at checkout.session.completed for annual plans (best-effort, operator-alerted on failure). Renewal Price IDs read from env basic_renewal_monthly / premium_renewal_monthly. change-tier / in-app cancel / reactivate / widerruf release any attached schedule first (a scheduled sub rejects direct item/price updates); change-tier re-attaches for annual. Helpers: renewalPriceForTier, releaseScheduleIfAny, attachRenewalScheduleForAnnual, notifyOperator.
+// fix73 (CHRYOS email copy): brand name PEAK->CHRYOS in all visible email/page text + new footer tagline. Domain/addresses (peak-mj-performance.app, noreply@, support@) intentionally UNCHANGED (domain round).
+// fix72 (audit batch 3): #5 checkout-login single-use via consumed_checkout_sessions (atomic insert-first, 409 on replay, fail-open if table missing/DB hiccup) + weekly purge. Requires migration_consumed_checkout_sessions.sql. RLS (#1) handled separately in SQL.
+// fix71 (audit batch 2): #4 payment_method_collection:'always' (trial needs card) · #8 webhook 500-retry for checkout.session.completed with idempotency-unmark · Follow-up A generic webhook error body · Follow-up B update-profile field-min. #5/#7 intentionally not touched.
+// fix70 (audit safe-batch): #2 generic 500 errors · #3 profile field-min (keep stripe_customer_id) · #9 no email in 404 · #10 signup numeric clamps. No auth/payment/flow changes.
 const express = require('express');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { createClient } = require('@supabase/supabase-js');
@@ -61,6 +66,19 @@ if (MISSING_ENV.length) {
   process.exit(1);
 }
 
+// ── RENEWAL PRICES (§309 Nr.9 BGB — annual -> monthly after 12 months) ──
+// A yearly plan must convert to a MONTHLY subscription after its first year
+// (monthly-cancellable) at the pro-rated monthly price. The two renewal
+// Prices live in Render env under these EXACT (lower-case) keys and are read
+// in attachRenewalScheduleForAnnual(). A missing key does NOT crash the
+// backend (checkout keeps working) — but every annual purchase of that tier
+// would then silently renew YEARLY, so we warn loudly at boot.
+['basic_renewal_monthly', 'premium_renewal_monthly'].forEach((k) => {
+  if (!process.env[k]) {
+    console.warn(`⚠️  RENEWAL PRICE MISSING: env ${k} not set — annual->monthly conversion for that tier is skipped (annual would renew yearly). Set it in Render → Environment.`);
+  }
+});
+
 const app = express();
 
 // ── SECURITY HEADERS (audit Pass 5 #8.3, Pass 6 #9.2) ─────────────────
@@ -101,7 +119,7 @@ const BACKEND_URL = process.env.BACKEND_URL || 'https://peak-backend-u52q.onrend
 // peak-mj-performance.app domain. noreply@ is send-only — no mailbox needed.
 // If the user hits "Reply", their mail client routes to REPLY_TO instead
 // (support@), which is a real, monitored inbox that actually receives.
-const FROM_EMAIL = 'PEAK <noreply@peak-mj-performance.app>';
+const FROM_EMAIL = 'CHRYOS <noreply@peak-mj-performance.app>';
 // REPLY_TO: real, monitored support inbox. Set as a header on every send
 // so user replies don't disappear into a non-existent mailbox.
 const REPLY_TO = 'support@peak-mj-performance.app';
@@ -113,6 +131,158 @@ const COMPANY = {
   website: 'https://peak-mj-performance.app',
   owner: 'Michael Jahn',
 };
+
+// ════════════════════════════════════════════════════════════════════
+// ANNUAL → MONTHLY RENEWAL (§309 Nr.9 BGB — lawyer requirement)
+// ────────────────────────────────────────────────────────────────────
+// A yearly subscription must NOT auto-renew into another fixed year. After
+// the first 12 months it has to continue MONTHLY (cancellable monthly) at
+// the pro-rated monthly price of the annual plan. A plain yearly Stripe
+// Price just renews yearly, so we drive this with a Subscription Schedule:
+//   Phase 1: the yearly Price, exactly ONE year (trial preserved).
+//   Phase 2: the monthly renewal Price, indefinitely.
+// end_behavior:'release' → after phase 1 hands off to phase 2, the monthly
+// subscription simply keeps running (schedule detaches).
+//
+// Renewal monthly Prices (Render env keys = Stripe lookup keys):
+//   basic_renewal_monthly   → Basic  €4.99/mo
+//   premium_renewal_monthly → Premium €9.99/mo
+// ════════════════════════════════════════════════════════════════════
+function renewalPriceForTier(tier) {
+  return tier === 'basic'
+    ? process.env.basic_renewal_monthly
+    : process.env.premium_renewal_monthly;
+}
+
+// Best-effort operator alert (mirrors the /widerruf operator notice).
+async function notifyOperator(subject, lines) {
+  try {
+    const body = Array.isArray(lines) ? lines.join('\n') : String(lines || '');
+    const escd = body.replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+    await resend.emails.send({
+      from: FROM_EMAIL, reply_to: REPLY_TO, to: 'support@peak-mj-performance.app',
+      subject,
+      text: body,
+      html: '<div style="font-family:Arial,sans-serif"><pre style="font-family:inherit;white-space:pre-wrap;margin:0">' + escd + '</pre></div>',
+    });
+  } catch (e) {
+    console.error('[ops-notify] failed:', e.message);
+  }
+}
+
+// Release any subscription schedule attached to a subscription, so that a
+// DIRECT stripe.subscriptions.update (price swap, cancel_at_period_end, …)
+// isn't rejected with "managed by a subscription schedule". Releasing leaves
+// the underlying subscription running on its current phase — it does NOT
+// cancel anything. Accepts a sub object or an id. Best-effort; returns true
+// if a schedule was released.
+async function releaseScheduleIfAny(subOrId) {
+  try {
+    let sub = subOrId;
+    if (typeof subOrId === 'string') {
+      sub = await stripe.subscriptions.retrieve(subOrId);
+    }
+    if (sub && sub.schedule) {
+      const schedId = typeof sub.schedule === 'string' ? sub.schedule : sub.schedule.id;
+      await stripe.subscriptionSchedules.release(schedId);
+      console.log(`🗓  Released subscription schedule ${schedId} for ${sub.id}`);
+      return true;
+    }
+  } catch (e) {
+    // A schedule that's already released/completed/canceled throws — harmless.
+    console.warn('[schedule] releaseScheduleIfAny:', e.message);
+  }
+  return false;
+}
+
+// Convert an ANNUAL subscription into: 1 year at the annual price, then the
+// monthly renewal price indefinitely (monthly-cancellable). Idempotent +
+// best-effort: never throws, never blocks the caller (the purchase already
+// succeeded). On failure the annual sub simply stays annual (old behaviour)
+// and the operator is alerted so a schedule can be added manually.
+async function attachRenewalScheduleForAnnual(subId, tier) {
+  if (!subId) return false;
+  const renewalPrice = renewalPriceForTier(tier);
+  const missingKey = tier === 'basic' ? 'basic_renewal_monthly' : 'premium_renewal_monthly';
+  if (!renewalPrice) {
+    console.error(`❌ [renewal] no renewal price env for tier=${tier} — set ${missingKey} in Render`);
+    await notifyOperator('[AKTION NOETIG] Renewal-Preis fehlt (' + tier + ')',
+      ['Jahresabo konnte NICHT auf Monats-Anschluss umgestellt werden.',
+       'Subscription: ' + subId,
+       'Fehlende Env-Variable: ' + missingKey,
+       'Folge: dieses Jahresabo verlaengert sich sonst jaehrlich (§309 Nr.9 BGB).']);
+    return false;
+  }
+  try {
+    const sub = await stripe.subscriptions.retrieve(subId);
+    // Self-guard: skip cancelled/incomplete subs (e.g. voucher-abuse cancel).
+    if (!sub || !['trialing', 'active', 'past_due'].includes(sub.status)) return false;
+
+    // Only convert genuine YEARLY subscriptions.
+    const curItem = sub.items && sub.items.data && sub.items.data[0];
+    const interval = curItem && curItem.price && curItem.price.recurring && curItem.price.recurring.interval;
+    if (interval !== 'year') return false;
+
+    // Already scheduled → nothing to do (idempotent).
+    if (sub.schedule) return true;
+
+    const annualPriceId = curItem.price.id;
+
+    // 1) Create a schedule mirroring the current subscription. from_subscription
+    //    cannot be combined with other params → a separate update call follows.
+    const schedule = await stripe.subscriptionSchedules.create({ from_subscription: subId });
+    const p0 = (schedule.phases && schedule.phases[0]) || {};
+
+    // Phase 1 = the current annual phase, bounded to ONE year, trial preserved.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const phase1 = {
+      items: [{ price: annualPriceId, quantity: 1 }],
+      start_date: p0.start_date || sub.current_period_start,
+    };
+    const trialEnd = p0.trial_end || sub.trial_end;
+    if (trialEnd && trialEnd > nowSec) phase1.trial_end = trialEnd; // keep the 7-day trial
+
+    // Phase 2 = monthly renewal, indefinite; phase metadata flips the running
+    // subscription to plan=monthly once it enters this phase.
+    const phase2 = {
+      items: [{ price: renewalPrice, quantity: 1 }],
+      metadata: { plan: 'monthly', renewal_of: 'annual', tier },
+    };
+
+    const baseUpdate = { end_behavior: 'release', proration_behavior: 'none' };
+
+    // Bound phase 1 to one yearly cycle. Newer Stripe API versions (2025-09-30+)
+    // replaced `iterations` with `duration`; the server pins no apiVersion, so
+    // we try iterations first (older/default) and fall back to duration.
+    try {
+      await stripe.subscriptionSchedules.update(schedule.id, {
+        ...baseUpdate,
+        phases: [{ ...phase1, iterations: 1 }, phase2],
+      });
+    } catch (e1) {
+      const msg = (e1 && e1.message) || '';
+      if (/iterations|duration|unknown parameter|no longer/i.test(msg)) {
+        await stripe.subscriptionSchedules.update(schedule.id, {
+          ...baseUpdate,
+          phases: [{ ...phase1, duration: { interval: 'year', interval_count: 1 } }, phase2],
+        });
+      } else {
+        throw e1;
+      }
+    }
+
+    console.log(`🗓✅ Renewal schedule attached for ${subId} (${tier}: annual -> monthly ${renewalPrice})`);
+    return true;
+  } catch (e) {
+    console.error('❌ [renewal] attachRenewalScheduleForAnnual failed:', e.message);
+    await notifyOperator('[AKTION NOETIG] Renewal-Schedule fehlgeschlagen',
+      ['Jahresabo konnte NICHT auf Monats-Anschluss umgestellt werden.',
+       'Subscription: ' + subId + '  Tier: ' + tier,
+       'Fehler: ' + (e && e.message),
+       'Folge: dieses Jahresabo verlaengert sich sonst jaehrlich (§309 Nr.9 BGB) — bitte manuell in Stripe einen Schedule anlegen.']);
+    return false;
+  }
+}
 
 // ── CORS — restricted to known origins (security hardening Apr 2026) ──
 // Previously: app.use(cors()) — open to all origins, allowed CSRF-style abuse.
@@ -188,7 +358,7 @@ app.use(cors({
     // rather than bubbling up as a generic 500.
     return callback(null, false);
   },
-  // Audit Befund 11: explicitly disable credentials. PEAK uses Bearer
+  // Audit Befund 11: explicitly disable credentials. CHRYOS uses Bearer
   // tokens in the Authorization header, not cookies. Setting this to
   // false closes the door on future architecture drift accidentally
   // creating a CORS gap when cookies are introduced.
@@ -200,7 +370,7 @@ app.use('/webhook', express.raw({ type: 'application/json' }));
 // 10mb limit was generous to the point of being dangerous — every
 // endpoint inherited it, including /user/* writes that should never see
 // more than a few KB. Default is now 100kb (still very generous for any
-// JSON payload PEAK actually sends), with explicit larger limits for
+// JSON payload CHRYOS actually sends), with explicit larger limits for
 // the image-upload endpoint only.
 //
 // Why not 1mb default: even 1mb is an order of magnitude more than any
@@ -453,7 +623,7 @@ async function resolveAuthAndTier(req, { requirePremium = false } = {}) {
 // monitors. Render's own /healthz endpoint is what handles actual
 // container health-checks.
 app.get('/', (req, res) => {
-  res.json({ status: 'PEAK Backend running' });
+  res.json({ status: 'CHRYOS Backend running' });
 });
 
 // ── UNSUBSCRIBE ───────────────────────────────────────────────────────
@@ -713,7 +883,7 @@ const PEAK_NUMERIC_RANGES = {
 // or "gpt-4o" still fail the regex.
 //
 // The explicit Set is kept as a "known-known" list for documentation
-// — these are the models we've actually tested with PEAK. Models that
+// — these are the models we've actually tested with CHRYOS. Models that
 // match the regex but aren't in the Set log a notice (not a warning)
 // so operators know they're trying something untested.
 const MODEL_WHITELIST = new Set([
@@ -800,7 +970,7 @@ app.get('/unsubscribe', async (req, res) => {
   </style>
   </head><body>
   <h1>Du wurdest abgemeldet</h1>
-  <p style="color:#6B5D4A">Du erhältst keine weiteren E-Mails von PEAK.<br><br>You have been unsubscribed from PEAK emails.</p>
+  <p style="color:#6B5D4A">Du erhältst keine weiteren E-Mails von CHRYOS.<br><br>You have been unsubscribed from CHRYOS emails.</p>
   <a href="${FRONTEND_URL}" class="btn">Zurück zur App</a>
   </body></html>`);
 });
@@ -846,7 +1016,7 @@ app.post('/auth/check-email', enumLimiter, async (req, res) => {
     res.json({ exists, hasSubscription });
   } catch (err) {
     console.error('❌ check-email error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -969,7 +1139,7 @@ app.post('/auth/send-login-link', authLimiter, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('❌ send-login-link error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -1038,7 +1208,7 @@ app.post('/auth/send-otp', authLimiter, async (req, res) => {
       // Audit Pass 4 #7.7: account-enumeration trade-off documented.
       // Returning 404/no_account leaks which emails are registered. For
       // a health/fitness app, mere membership is sensitive (Art. 9 GDPR
-      // implies the user is health-conscious enough to use PEAK).
+      // implies the user is health-conscious enough to use CHRYOS).
       //
       // We deliberately keep the explicit "no_account" response anyway
       // because:
@@ -1125,7 +1295,7 @@ app.post('/auth/send-otp', authLimiter, async (req, res) => {
     res.json({ ok: true, expiresIn: 600 });
   } catch (err) {
     console.error('❌ /auth/send-otp error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -1161,6 +1331,28 @@ app.post('/auth/checkout-login', authLimiter, async (req, res) => {
     const __csAgeSec = Math.floor(Date.now() / 1000) - (cs.created || 0);
     if (cs.created && __csAgeSec > 1800) {
       return res.status(410).json({ error: 'session_expired' });
+    }
+
+    // fix72 #5: single-use. A leaked cs_ (referer / history / support screenshot)
+    // must not mint a login session twice inside the 30-min window. Insert-first
+    // is atomic: the first caller wins, any replay hits the unique PK (23505) and
+    // is rejected. Degrades gracefully — if the table is missing (migration not
+    // deployed yet) or the DB hiccups, we fall open to the freshness-window-only
+    // behaviour so a legitimate user is never locked out. The frontend only calls
+    // this with no existing session and falls back to normal login on failure.
+    try {
+      const { error: consumeErr } = await supabase
+        .from('consumed_checkout_sessions')
+        .insert({ session_id: sessionId });
+      if (consumeErr) {
+        if (consumeErr.code === '23505') {
+          console.warn(`↩️  checkout-login: session already used (${sessionId.slice(0, 12)}…)`);
+          return res.status(409).json({ error: 'session_already_used' });
+        }
+        console.warn('⚠️  checkout-login consume insert failed (fail-open):', consumeErr.message);
+      }
+    } catch (e) {
+      console.warn('⚠️  checkout-login consume threw (fail-open):', e.message);
     }
     let email = cs.customer_email || (cs.customer_details && cs.customer_details.email) || null;
     if (!email && cs.customer) {
@@ -1390,7 +1582,7 @@ app.post('/auth/verify-otp', authLimiter, async (req, res) => {
     });
   } catch (err) {
     console.error('❌ /auth/verify-otp error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -1420,8 +1612,8 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
       return res.status(400).json({
         error: 'AGE_RESTRICTION',
         message: lang === 'de'
-          ? 'PEAK ist ab 18 Jahren verfügbar.'
-          : 'PEAK is available from age 18.'
+          ? 'CHRYOS ist ab 18 Jahren verfügbar.'
+          : 'CHRYOS is available from age 18.'
       });
     }
 
@@ -1542,7 +1734,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
 
       if (createErr) {
         console.error('❌ Free auth user creation failed:', createErr.message);
-        return res.status(500).json({ error: createErr.message });
+        return res.status(500).json({ error: 'internal_error' });
       }
 
       authUserId = created.user.id;
@@ -1551,28 +1743,31 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
     const consentAt = consent.at || new Date().toISOString();
 
     // Upsert free profile row
+    // fix70 #10: clamp numeric inputs to sane human ranges (bounds, never reject).
+    const _clampNum = (v, lo, hi) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : null; };
+    const _clampInt = (v, lo, hi) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : null; };
     const userRow = {
       id: authUserId,
       email: normalizedEmail,
       name: userData?.name || '',
       age: userData?.age ? parseInt(userData.age, 10) : null,
       gender: userData?.gender || null,
-      weight: userData?.weight ? parseFloat(userData.weight) : null,
-      dweight: userData?.dweight ? parseFloat(userData.dweight) : null,
-      height: userData?.height ? parseFloat(userData.height) : null,
-      sleep: userData?.sleep ? parseFloat(userData.sleep) : null,
+      weight: _clampNum(userData?.weight, 20, 400),
+      dweight: _clampNum(userData?.dweight, 20, 400),
+      height: _clampNum(userData?.height, 80, 260),
+      sleep: _clampNum(userData?.sleep, 0, 24),
       job: userData?.job || null,
       commute: userData?.commute || null,
-      stress: userData?.stress ? parseFloat(userData.stress) : null,
+      stress: _clampNum(userData?.stress, 0, 100),
       level: userData?.level || null,
-      sessions: userData?.sessions ? parseInt(userData.sessions, 10) : null,
-      dur: userData?.dur ? parseInt(userData.dur, 10) : null,
+      sessions: _clampInt(userData?.sessions, 0, 21),
+      dur: _clampInt(userData?.dur, 0, 600),
       equip: userData?.equip || null,
       al: Array.isArray(userData?.al) ? userData.al : [],
       di: Array.isArray(userData?.di) ? userData.di : [],
       cu: Array.isArray(userData?.cu) ? userData.cu : [],
       cook: userData?.cook || null,
-      budget: userData?.budget ? parseFloat(userData.budget) : null,
+      budget: _clampNum(userData?.budget, 0, 100000),
       stretch_areas: Array.isArray(userData?.stretchAreas) ? userData.stretchAreas : [],
       stretch_dur: userData?.stretchDur ? parseInt(userData.stretchDur, 10) : 10,
       train_days: Array.isArray(userData?.trainDays)
@@ -1636,7 +1831,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
     });
     if (upsertErr) {
       console.error('❌ Free user upsert failed:', upsertErr.message);
-      return res.status(500).json({ error: upsertErr.message });
+      return res.status(500).json({ error: 'internal_error' });
     }
 
     // ── Auto-login via direct token exchange ─────────────────────────
@@ -1731,7 +1926,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
     });
   } catch (err) {
     console.error('❌ signup-free error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -1803,7 +1998,7 @@ app.post('/customer-portal', authLimiter, async (req, res) => {
     res.json({ url: portalSession.url });
   } catch (err) {
     console.error('❌ customer-portal error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -1868,6 +2063,9 @@ app.post('/cancel-subscription', cancelLimiter, async (req, res) => {
     // Kündigung zum Ende des laufenden Abrechnungszeitraums vormerken.
     let updated;
     try {
+      // A yearly renewal schedule would reject a direct update — detach it
+      // first (release keeps the sub running so cancel_at_period_end applies).
+      await releaseScheduleIfAny(profile.stripe_subscription_id);
       updated = await stripe.subscriptions.update(profile.stripe_subscription_id, {
         cancel_at_period_end: true,
         metadata: {
@@ -1944,7 +2142,7 @@ const reactivateLimiter = rateLimit({
 });
 
 function reactivatePage(bodyHtml) {
-  return `<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PEAK</title>
+  return `<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CHRYOS</title>
   <style>
     body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;max-width:480px;margin:80px auto;padding:0 20px;text-align:center;background:#F0EBE0;color:#1A1410}
     h1{font-family:'Cinzel','Georgia',serif;font-weight:600;letter-spacing:2px;text-transform:uppercase;font-size:18px;color:#0A1420}
@@ -1959,7 +2157,7 @@ app.get('/reactivate-subscription', reactivateLimiter, (req, res) => {
     return res.status(400).send(reactivatePage(`<h1>Link ungültig oder abgelaufen</h1><p>Bitte logge dich in der App ein.<br><br>This link is invalid or expired. Please log in to the app.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
   }
   const tok = htmlEsc(String(req.query.token || ''));
-  return res.send(reactivatePage(`<h1>Kündigung rückgängig machen</h1><p>Möchtest du deine PEAK-Mitgliedschaft fortsetzen? Die geplante Kündigung wird damit aufgehoben.<br><br>Resume your PEAK membership? This reverses the scheduled cancellation.</p><form method="POST" action="/reactivate-subscription/confirm"><input type="hidden" name="token" value="${tok}"><button type="submit" class="btn">Fortsetzen / Resume</button></form>`));
+  return res.send(reactivatePage(`<h1>Kündigung rückgängig machen</h1><p>Möchtest du deine CHRYOS-Mitgliedschaft fortsetzen? Die geplante Kündigung wird damit aufgehoben.<br><br>Resume your CHRYOS membership? This reverses the scheduled cancellation.</p><form method="POST" action="/reactivate-subscription/confirm"><input type="hidden" name="token" value="${tok}"><button type="submit" class="btn">Fortsetzen / Resume</button></form>`));
 });
 
 app.post('/reactivate-subscription/confirm', reactivateLimiter, express.urlencoded({ extended: false }), async (req, res) => {
@@ -1977,6 +2175,10 @@ app.post('/reactivate-subscription/confirm', reactivateLimiter, express.urlencod
       return res.status(404).send(reactivatePage(`<h1>Kein Abo gefunden</h1><p>Wir konnten kein Abo finden.<br><br>No subscription found.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
     }
     try {
+      // Detach any renewal schedule so the un-cancel update isn't rejected.
+      // (Note: a reactivated ANNUAL sub then renews yearly again — rare edge
+      //  case; re-attaching on reactivate is a documented follow-up.)
+      await releaseScheduleIfAny(profile.stripe_subscription_id);
       await stripe.subscriptions.update(profile.stripe_subscription_id, {
         cancel_at_period_end: false,
         metadata: { reactivated_via: '312k_undo', reactivated_at: new Date().toISOString() },
@@ -1991,7 +2193,7 @@ app.post('/reactivate-subscription/confirm', reactivateLimiter, express.urlencod
       console.error('❌ reactivate DB update failed:', dbErr.message);
     }
     console.log(`↩️  §312k reactivation for ${mE(email)}`);
-    return res.send(reactivatePage(`<h1>Mitgliedschaft fortgesetzt</h1><p>Deine Kündigung wurde aufgehoben — deine PEAK-Mitgliedschaft läuft weiter.<br><br>Your cancellation has been reversed — your PEAK membership continues.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
+    return res.send(reactivatePage(`<h1>Mitgliedschaft fortgesetzt</h1><p>Deine Kündigung wurde aufgehoben — deine CHRYOS-Mitgliedschaft läuft weiter.<br><br>Your cancellation has been reversed — your CHRYOS membership continues.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
   } catch (err) {
     console.error('❌ reactivate-subscription error:', err.message);
     return res.status(500).send(reactivatePage(`<h1>Fehler</h1><p>Etwas ist schiefgelaufen. Bitte versuche es erneut.<br><br>Something went wrong. Please try again.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
@@ -2188,7 +2390,7 @@ app.post('/share', authLimiter, mediumJson, async (req, res) => {
     res.json({ success: true, id, url });
   } catch (err) {
     console.error('❌ /share error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -2223,7 +2425,7 @@ app.get('/share/:id/data', publicReadLimiter, async (req, res) => {
       .maybeSingle();
     if (error) {
       console.error('❌ /share/:id/data error:', error.message);
-      return res.status(500).json({ error: error.message });
+      return res.status(500).json({ error: 'internal_error' });
     }
     if (!data) {
       return res.status(404).json({ error: 'not found' });
@@ -2236,7 +2438,7 @@ app.get('/share/:id/data', publicReadLimiter, async (req, res) => {
     res.json({ type: data.type, payload: data.payload });
   } catch (err) {
     console.error('❌ /share/:id/data error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -2606,7 +2808,7 @@ app.post('/ai/generate', aiLimiter, mediumJson, async (req, res) => {
     // one extra used slot for the user. That's identical to the
     // pre-Pass-2 behaviour and an acceptable trade-off until we refactor
     // this endpoint into a state machine.
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -2764,7 +2966,7 @@ If no menu is visible: {"dishes":[],"error":"no_menu"}.`;
     res.json(parsed);
   } catch (err) {
     console.error('❌ /ai/scan-menu error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -2911,7 +3113,7 @@ If no food is visible: {"items":[],"error":"no_food"}.`;
     res.json(parsed);
   } catch (err) {
     console.error('/ai/scan-meal error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -2981,7 +3183,7 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
     // retryable error so the frontend can offer manual entry instead of a
     // dead end. (Not an AI call — model routing untouched.)
     const offUrl = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json`;
-    const OFF_UA = 'PEAK-by-MJ-Performance/1.0 (support@peak-mj-performance.app)';
+    const OFF_UA = 'CHRYOS-by-MJ-Performance/1.0 (support@peak-mj-performance.app)';
     let offRes = null, lastStatus = 0;
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) await new Promise(r => setTimeout(r, 400 * attempt)); // backoff: 400ms, 800ms
@@ -3058,7 +3260,7 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
       nutri_score: estimated ? null : ((p.nutriscore_grade || '').toUpperCase() || null),
       estimated,
       image: p.image_small_url || p.image_thumb_url || null,
-      // v71: send raw ingredient text for PEAK-Score evaluation client-
+      // v71: send raw ingredient text for CHRYOS-Score evaluation client-
       // side. OpenFoodFacts gives us both lang-specific (ingredients_text_de,
       // ingredients_text_en) and a generic ingredients_text. We prefer
       // lang-specific where available so PEAK_SCORE_PATTERNS can match
@@ -3098,7 +3300,7 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
     res.json({ product });
   } catch (err) {
     console.error('❌ /ai/scan-barcode error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -3312,7 +3514,7 @@ Respond ONLY as JSON (no markdown, no explanation):
     res.json(result);
   } catch (err) {
     console.error('❌ /ai/quick-log error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -3383,6 +3585,11 @@ app.post('/change-tier', authLimiter, mediumJson, async (req, res) => {
 
     const isTrialing = sub.status === 'trialing';
 
+    // A yearly renewal schedule (if attached) would BLOCK a direct item swap
+    // ("managed by a subscription schedule"). Release it first — releasing
+    // only detaches the schedule, it does not cancel the subscription.
+    await releaseScheduleIfAny(sub);
+
     // The fix: swap the price on the SAME subscription.
     //  • trialing  → no proration, trial_end untouched (omitted) → no charge.
     //  • post-trial → prorate the difference onto the next invoice.
@@ -3391,6 +3598,12 @@ app.post('/change-tier', authLimiter, mediumJson, async (req, res) => {
       proration_behavior: isTrialing ? 'none' : 'create_prorations',
       metadata: { ...(sub.metadata || {}), tier, plan },
     });
+
+    // If the switched-to plan is annual, (re)attach the annual->monthly
+    // renewal schedule so the new yearly term is also §309-Nr.9-compliant.
+    if (plan === 'annual') {
+      await attachRenewalScheduleForAnnual(profile.stripe_subscription_id, tier);
+    }
 
     // Reflect immediately for snappy UI; the webhook reconciles trial_end/status.
     try {
@@ -3427,8 +3640,8 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
       return res.status(400).json({
         error: 'AGE_RESTRICTION',
         message: lang === 'de'
-          ? 'PEAK ist ab 18 Jahren verfügbar.'
-          : 'PEAK is available from age 18.'
+          ? 'CHRYOS ist ab 18 Jahren verfügbar.'
+          : 'CHRYOS is available from age 18.'
       });
     }
 
@@ -3634,13 +3847,20 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
     // transient Stripe error never blocks a genuine first-time signup's trial.
     let isReturningSubscriber = false;
     try {
-      const __cust = await stripe.customers.list({ email: (email || '').trim().toLowerCase(), limit: 1 });
+      const __cust = await stripe.customers.list({ email: normalizedEmail, limit: 1 });
       if (__cust && __cust.data && __cust.data.length > 0) {
-        const __subs = await stripe.subscriptions.list({ customer: __cust.data[0].id, status: 'all', limit: 1 });
-        if (__subs && __subs.data && __subs.data.length > 0) {
+        const __subs = await stripe.subscriptions.list({ customer: __cust.data[0].id, status: 'all', limit: 10 });
+        // Only count a sub that ACTUALLY started (a trial or a real subscription).
+        // 'incomplete'/'incomplete_expired' = the initial payment never completed,
+        // so a trial was never consumed — don't deny a genuine first-timer their
+        // trial just because an earlier attempt was abandoned.
+        const usedTrialOrSub = ((__subs && __subs.data) || []).some(
+          s => s.status !== 'incomplete' && s.status !== 'incomplete_expired'
+        );
+        if (usedTrialOrSub) {
           isReturningSubscriber = true;
           trialDays = 0;
-          console.log(`No trial - ${mE(email)} already had a subscription (anti-abuse)`);
+          console.log(`No trial - ${mE(normalizedEmail)} already had a subscription (anti-abuse)`);
         }
       }
     } catch (trialChkErr) {
@@ -3723,6 +3943,10 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
 
     const sessionConfig = {
       mode: 'subscription',
+      // fix71 #4: always collect a card, even for trials / trial_full (100% off) —
+      // overrides any Dashboard 'if_required' setting so a full trial cannot be
+      // taken without a payment method. Closes trial-abuse via throwaway emails.
+      payment_method_collection: 'always',
       // When payment_method_types is omitted on a Checkout Session, Stripe
       // automatically shows all payment methods enabled in the Dashboard
       // (card, Apple Pay, Google Pay, PayPal, Klarna, SEPA, etc.) — no code
@@ -3760,7 +3984,7 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
     res.json({ url: session.url, sessionId: session.id });
   } catch (err) {
     console.error('❌ Checkout error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -3983,7 +4207,7 @@ app.post('/voucher/apply-existing', authLimiter, async (req, res) => {
     res.json({ ok: true, label, code: normalizedCode });
   } catch (err) {
     console.error('❌ /voucher/apply-existing error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4053,13 +4277,16 @@ app.get('/user/profile', userLimiter, async (req, res) => {
       } else {
         console.warn(`[/user/profile] no profile row found for ${mE(user.email)} (id=${user.id})`);
       }
-      return res.status(404).json({ error: 'Profile not found', email: user.email });
+      return res.status(404).json({ error: 'Profile not found' });
     }
 
-    res.json({ profile });
+    // fix70 #3: data minimisation — strip fields the frontend never reads.
+    // Keep stripe_customer_id (frontend uses it for portal/tier refresh).
+    const { stripe_subscription_id: _ssid, card_fingerprint: _cfp, ...safeProfile } = profile;
+    res.json({ profile: safeProfile });
   } catch (err) {
     console.error('❌ /user/profile error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4232,10 +4459,13 @@ app.post('/user/update-profile', userLimiter, async (req, res) => {
     // Audit #3.2: was `length - 1` assuming updated_at was inside `updates`,
     // but it's appended to dbUpdates only. Counting `updates` directly now.
     console.log(`✅ Profile updated for ${mE(user.email)} (${Object.keys(updates).length} fields)`);
-    res.json({ profile: data });
+    // fix71 Follow-up B: strip fields the frontend never reads (guarded for null).
+    let safeUpdated = data;
+    if (data) { const { stripe_subscription_id: _ssid2, card_fingerprint: _cfp2, ...rest } = data; safeUpdated = rest; }
+    res.json({ profile: safeUpdated });
   } catch (err) {
     console.error('❌ /user/update-profile error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4568,7 +4798,7 @@ app.delete('/user/account', userLimiter, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('❌ /user/account DELETE error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4639,7 +4869,7 @@ app.get('/user/export-data', userLimiter, async (req, res) => {
       // terms (no model-training on API inputs, but standard retention
       // applies). Datenschutzerklärung was corrected; this notice has to
       // match or we have a written inconsistency for a complainant.
-      _notice: 'This export contains the personal data MJ Performance / PEAK holds about you: your profile, food log, meals/plans, daily stats, body measurements, AI adaptations and family membership. Payment data is held by Stripe and not included here — see stripe.com/privacy. AI prompts sent to Anthropic are processed under their standard API terms and are not used to train the models. See peak-mj-performance.app/datenschutz for full details.'
+      _notice: 'This export contains the personal data MJ Performance / CHRYOS holds about you: your profile, food log, meals/plans, daily stats, body measurements, AI adaptations and family membership. Payment data is held by Stripe and not included here — see stripe.com/privacy. AI prompts sent to Anthropic are processed under their standard API terms and are not used to train the models. See peak-mj-performance.app/datenschutz for full details.'
     };
 
     console.log(`📦 Data export generated for ${mE(email)}`);
@@ -4650,7 +4880,7 @@ app.get('/user/export-data', userLimiter, async (req, res) => {
     res.send(JSON.stringify(exportPayload, null, 2));
   } catch (err) {
     console.error('❌ /user/export-data error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4681,7 +4911,7 @@ app.get('/user/training-state', userLimiter, async (req, res) => {
     res.json({ training_state: data?.training_state || null });
   } catch (err) {
     console.error('❌ /user/training-state GET error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4744,7 +4974,7 @@ app.post('/user/meal-track', userLimiter, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/meal-track POST error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4793,7 +5023,7 @@ app.post('/user/training-state', userLimiter, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/training-state POST error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -4898,7 +5128,7 @@ app.post('/user/meal-pool', userLimiter, mediumJson, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/meal-pool POST error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -5155,7 +5385,7 @@ app.post('/user/lite-sync', userLimiter, mediumJson, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/lite-sync error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -5271,7 +5501,7 @@ app.post('/user/stretch-pool', userLimiter, mediumJson, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/stretch-pool POST error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -5430,12 +5660,23 @@ app.post('/user/plan', userLimiter, mediumJson, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('❌ /user/plan POST error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
 
 // ── WEBHOOK ───────────────────────────────────────────────────────────
+// fix71 #8: when a handler fails and we return 500 (so Stripe retries), remove
+// the idempotency row first — otherwise the retry is treated as a duplicate and
+// skipped, defeating the retry. No-op if the row was never written.
+async function unmarkWebhookEvent(eventId) {
+  try {
+    await supabase.from('webhook_events').delete().eq('event_id', eventId);
+  } catch (e) {
+    console.warn('⚠️  unmarkWebhookEvent failed:', e.message);
+  }
+}
+
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -5557,7 +5798,10 @@ app.post('/webhook', async (req, res) => {
         }
       } catch (err) {
         console.error('❌ Auth user creation failed for', mE(email), ':', err.message);
-        return res.status(200).json({ received: true, auth_error: err.message });
+        // fix71 #8+A: real failure on the paid-signup event → 500 so Stripe
+        // retries (user paid, account not yet created). Generic body (no leak).
+        await unmarkWebhookEvent(event.id);
+        return res.status(500).json({ received: false });
       }
 
       // ── STEP 2: Upsert profile row in public.users, keyed by auth id ──
@@ -5688,7 +5932,9 @@ app.post('/webhook', async (req, res) => {
 
       if (error) {
         console.error('❌ Supabase upsert failed for', mE(email), ':', error.message);
-        return res.status(200).json({ received: true, db_error: error.message });
+        // fix71 #8+A: real failure on the paid-signup event → 500 so Stripe retries.
+        await unmarkWebhookEvent(event.id);
+        return res.status(500).json({ received: false });
       }
 
       console.log(`✅ User profile upserted: ${mE(email)} (rows: ${data?.length || 0})`);
@@ -5836,6 +6082,19 @@ app.post('/webhook', async (req, res) => {
             console.error('❌ Voucher redemption insert exception:', err.message);
           }
         }
+      }
+
+      // ── Annual → monthly renewal (§309 Nr.9 BGB) ─────────────────────
+      // For a YEARLY plan, convert the subscription so it bills the annual
+      // price for one year, then the monthly renewal price indefinitely
+      // (monthly-cancellable). Best-effort: the helper self-skips if the sub
+      // was cancelled (e.g. voucher abuse above) or isn't actually yearly,
+      // and never throws — the paid signup is already fully provisioned.
+      if (session.subscription && meta.plan === 'annual') {
+        await attachRenewalScheduleForAnnual(
+          session.subscription,
+          meta.tier === 'basic' ? 'basic' : 'premium'
+        );
       }
     } else if (event.type === 'customer.subscription.deleted') {
       const sub = event.data.object;
@@ -6265,7 +6524,13 @@ app.post('/webhook', async (req, res) => {
     }
   } catch (err) {
     console.error('❌ Webhook handler error:', err.message, err.stack);
-    // Still return 200 so Stripe doesn't retry
+    // fix71 #8: paid-signup failures must be RETRIED (user paid, no account) —
+    // return 500 and drop the idempotency row so Stripe's retry reprocesses.
+    // Other event types keep 200 to avoid retry storms (recoverable otherwise).
+    if (event && event.type === 'checkout.session.completed') {
+      await unmarkWebhookEvent(event.id);
+      return res.status(500).json({ received: false });
+    }
   }
 
   res.json({ received: true });
@@ -6284,7 +6549,7 @@ const BRAND = {
   dim: '#6B5D4A',      // Secondary text
   faint: '#9B9285',    // Footer/meta
   border: '#DFD9CB',   // Marble-toned divider
-  // Aurum gold — PEAK's signature colour. Used for accents, bullets,
+  // Aurum gold — CHRYOS's signature colour. Used for accents, bullets,
   // header underline, buttons. Same hue on cream body and on dark
   // header for brand consistency. The user explicitly preferred the
   // bright #E8B86B over a darker WCAG-stricter alternative; readability
@@ -6313,7 +6578,7 @@ function emailHeader() {
     <tr>
       <td align="center" style="padding:32px 20px 28px;">
         <div style="display:inline-block;text-align:center;">
-          <div style="font-family:${FONT_HEAD};font-weight:600;font-size:32px;letter-spacing:7px;color:${BRAND.white};line-height:1;">PEAK</div>
+          <div style="font-family:${FONT_HEAD};font-weight:600;font-size:32px;letter-spacing:7px;color:${BRAND.white};line-height:1;">CHRYOS</div>
           <div style="width:60px;height:1px;background:${BRAND.redBright};margin:6px auto 4px;"></div>
           <div style="font-family:${FONT_BODY};font-size:9px;font-weight:500;letter-spacing:2.5px;color:#9B9285;text-transform:uppercase;">by MJ Performance</div>
         </div>
@@ -6351,13 +6616,13 @@ function emailFooter(email, lang) {
   // still render correctly.
   const taglineLang = (lang === 'de') ? 'de' : 'en';
   const taglineText = (taglineLang === 'de')
-    ? '„Für Athleten, die langfristig denken."'
-    : '"For athletes who play the long game."';
+    ? '„Disziplin gewinnt das Rennen."'
+    : '"Discipline wins the race."';
   return `
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
     <tr>
       <td style="padding:28px 30px 12px;text-align:center;">
-        <div style="font-family:${FONT_HEAD};font-size:14px;font-weight:600;letter-spacing:5px;color:${BRAND.white};line-height:1;">PEAK</div>
+        <div style="font-family:${FONT_HEAD};font-size:14px;font-weight:600;letter-spacing:5px;color:${BRAND.white};line-height:1;">CHRYOS</div>
         <div style="width:32px;height:1px;background:${BRAND.redBright};margin:6px auto 4px;"></div>
         <div style="font-family:${FONT_BODY};font-size:9px;font-weight:500;letter-spacing:2px;color:#9B9285;text-transform:uppercase;">by MJ Performance</div>
         <div style="font-family:Georgia,'Times New Roman',serif;font-style:italic;font-size:12px;color:#9B9285;margin-top:10px;letter-spacing:.3px;">${taglineText}</div>
@@ -6365,7 +6630,7 @@ function emailFooter(email, lang) {
     </tr>
     <tr>
       <td style="padding:14px 30px 32px;font-family:${FONT_BODY};font-size:11px;line-height:1.7;color:#888;text-align:center;">
-        <p style="margin:0 0 10px;">Du erhältst diese E-Mail, weil du dich bei PEAK registriert hast.<br>You're receiving this because you signed up for PEAK.</p>
+        <p style="margin:0 0 10px;">Du erhältst diese E-Mail, weil du dich bei CHRYOS registriert hast.<br>You're receiving this because you signed up for CHRYOS.</p>
         <p style="margin:0 0 14px;">
           <a href="${FRONTEND_URL}/impressum" style="color:#AAA;text-decoration:none;">Impressum</a>
           <span style="color:#555;"> · </span>
@@ -6385,13 +6650,13 @@ function emailFooter(email, lang) {
 function buildOtpEmail(code, email, lang) {
   const de = lang === 'de';
   const L = {
-    subject: de ? 'Dein PEAK Login-Code' : 'Your PEAK login code',
+    subject: de ? 'Dein CHRYOS Login-Code' : 'Your CHRYOS login code',
     label: de ? 'Login-Code' : 'Login code',
     h1a: de ? 'DEIN CODE' : 'YOUR CODE',
-    h1b: de ? 'FÜR PEAK' : 'FOR PEAK',
+    h1b: de ? 'FÜR CHRYOS' : 'FOR CHRYOS',
     intro: de
-      ? 'Gib diesen 6-stelligen Code in der PEAK-App ein, um dich anzumelden:'
-      : 'Enter this 6-digit code in the PEAK app to sign in:',
+      ? 'Gib diesen 6-stelligen Code in der CHRYOS-App ein, um dich anzumelden:'
+      : 'Enter this 6-digit code in the CHRYOS app to sign in:',
     expiry: de
       ? 'Der Code ist 10 Minuten gültig.'
       : 'The code expires in 10 minutes.',
@@ -6399,8 +6664,8 @@ function buildOtpEmail(code, email, lang) {
       ? 'Wenn du diesen Code nicht angefordert hast, ignoriere diese E-Mail.'
       : 'If you did not request this code, ignore this email.',
     footer: de
-      ? 'PEAK by MJ Performance · Impressum: ' + FRONTEND_URL + '/impressum'
-      : 'PEAK by MJ Performance · Legal: ' + FRONTEND_URL + '/impressum',
+      ? 'CHRYOS by MJ Performance · Impressum: ' + FRONTEND_URL + '/impressum'
+      : 'CHRYOS by MJ Performance · Legal: ' + FRONTEND_URL + '/impressum',
   };
 
   // Format code with middle space for readability: "123 456"
@@ -6411,7 +6676,7 @@ function buildOtpEmail(code, email, lang) {
 <table width="100%" cellpadding="0" cellspacing="0" style="background:${BRAND.light};padding:40px 20px"><tr><td align="center">
 <table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;background:${BRAND.white};border:1px solid ${BRAND.border}">
   <tr><td style="background:${BRAND.ink};padding:28px 32px">
-    <div style="color:${BRAND.white};font-family:${FONT_HEAD};font-weight:600;font-size:28px;letter-spacing:4px">PEAK</div>
+    <div style="color:${BRAND.white};font-family:${FONT_HEAD};font-weight:600;font-size:28px;letter-spacing:4px">CHRYOS</div>
     <div style="width:48px;height:1px;background:${BRAND.red};margin:6px 0 4px"></div>
     <div style="color:#9B9285;font-weight:500;font-size:10px;letter-spacing:2.5px">BY MJ PERFORMANCE</div>
   </td></tr>
@@ -6448,13 +6713,13 @@ function magicLinkFromHashedToken(linkData){
 function buildMagicLinkEmail(magicLink, email, lang) {
   const de = lang === 'de';
   const L = {
-    subject: de ? 'Dein PEAK Login-Link' : 'Your PEAK login link',
+    subject: de ? 'Dein CHRYOS Login-Link' : 'Your CHRYOS login link',
     label: de ? '🔐 Login-Link' : '🔐 Login link',
     h1a: de ? 'DEIN LINK' : 'YOUR LINK',
-    h1b: de ? 'ZU PEAK' : 'TO PEAK',
+    h1b: de ? 'ZU CHRYOS' : 'TO CHRYOS',
     intro: de
-      ? 'Klick den Button unten, um dich bei PEAK einzuloggen. Kein Passwort nötig.'
-      : 'Click the button below to sign in to PEAK. No password needed.',
+      ? 'Klick den Button unten, um dich bei CHRYOS einzuloggen. Kein Passwort nötig.'
+      : 'Click the button below to sign in to CHRYOS. No password needed.',
     cta: de ? 'Jetzt einloggen' : 'Sign in now',
     expire: de
       ? 'Dieser Link ist 1 Stunde gültig. Falls du diesen Login nicht angefordert hast, ignoriere diese E-Mail.'
@@ -6496,7 +6761,7 @@ function emailShell(innerHTML) {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light only">
 <meta name="supported-color-schemes" content="light only">
-<title>PEAK</title>
+<title>CHRYOS</title>
 </head>
 <body style="margin:0;padding:0;background:${BRAND.light};font-family:${FONT_BODY};">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};">
@@ -6575,7 +6840,7 @@ async function sendEmail(to, type, data) {
   const L = de ? {
     // Subject branches by tier — Basic and Premium share the "trial" subject;
     // Free uses the cross-device login subject.
-    welcomeSubject: (tier) => tier === 'free' ? 'Dein PEAK-Plan ist live — diese Mail ist dein Cross-Device-Login' : 'Willkommen bei PEAK — dein Plan ist bereit',
+    welcomeSubject: (tier) => tier === 'free' ? 'Dein CHRYOS-Plan ist live — diese Mail ist dein Cross-Device-Login' : 'Willkommen bei CHRYOS — dein Plan ist bereit',
     welcomeLabel: (n) => 'Willkommen' + (n ? ', ' + htmlEsc(n) : ''),
     welcomeH1a: 'Dein Plan',
     welcomeH1b: 'ist live.',
@@ -6587,7 +6852,7 @@ async function sendEmail(to, type, data) {
       const safeGoal = goal ? htmlEsc(goal) : '';
       const safeSport = sport ? htmlEsc(sport) : '';
       if (tier === 'free') {
-        return 'Du bist bereits eingeloggt — diese Mail ist dein Backup. Speicher sie, falls du PEAK auf einem anderen Gerät öffnen willst (Handy, Tablet). Klick einfach unten auf den Button und du landest direkt in deinem Plan, ohne Passwort.';
+        return 'Du bist bereits eingeloggt — diese Mail ist dein Backup. Speicher sie, falls du CHRYOS auf einem anderen Gerät öffnen willst (Handy, Tablet). Klick einfach unten auf den Button und du landest direkt in deinem Plan, ohne Passwort.';
       }
       const days = trialDays && trialDays > 0 ? trialDays : 7;
       // Lead with the auto-login note — same logic as Free, just shorter.
@@ -6644,14 +6909,14 @@ async function sendEmail(to, type, data) {
     day6Subject: 'Letzter Tag — deine Testphase endet morgen',
     day6Label: 'Letzte 24 Stunden',
     day6H1: (n) => (n ? n + ',<br>' : '') + 'morgen<br>geht es los.',
-    day6Body: 'Deine kostenlose Testphase endet morgen. Dein PEAK-Abo startet automatisch — du musst nichts tun, um weiterzumachen.',
-    day6Box: '<strong>Kündigen:</strong> PEAK öffnen → Einstellungen → Abonnement → Testphase beenden. Du behältst die volle Kontrolle — Kündigung jederzeit direkt in der App.',
+    day6Body: 'Deine kostenlose Testphase endet morgen. Dein CHRYOS-Abo startet automatisch — du musst nichts tun, um weiterzumachen.',
+    day6Box: '<strong>Kündigen:</strong> CHRYOS öffnen → Einstellungen → Abonnement → Testphase beenden. Du behältst die volle Kontrolle — Kündigung jederzeit direkt in der App.',
     day6CTA: 'Plan behalten',
     // ── CANCELLATION EMAILS (DE) ──
     // Tier-aware: a Basic user shouldn't read "Premium ends" (was confusing
     // and wrong). Helper renders the correct plan label in either language.
     cancelTierLabel: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
-    cancelConfirmedSubject: 'Deine PEAK-Kündigung ist bestätigt',
+    cancelConfirmedSubject: 'Deine CHRYOS-Kündigung ist bestätigt',
     cancelConfirmedLabel: 'Kündigung bestätigt',
     cancelConfirmedH1a: 'Schade,',
     cancelConfirmedH1b: 'dass du gehst.',
@@ -6659,9 +6924,9 @@ async function sendEmail(to, type, data) {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return `Deine Kündigung wurde registriert. Dein ${label}-Zugang bleibt bis zum <strong>${endDate}</strong> aktiv — dann wird dein Account automatisch auf den Free-Plan umgestellt.`;
     },
-    cancelConfirmedNote: 'Bis dahin kannst du PEAK in vollem Umfang nutzen. Deine Daten, Pläne und Fortschritte bleiben erhalten.',
-    cancelConfirmedReactivateBox: '<strong>Wieder aktivieren?</strong> Kein Problem — öffne einfach PEAK und wähle einen Plan. Dein Profil ist gespeichert.',
-    cancelConfirmedCTA: 'PEAK öffnen',
+    cancelConfirmedNote: 'Bis dahin kannst du CHRYOS in vollem Umfang nutzen. Deine Daten, Pläne und Fortschritte bleiben erhalten.',
+    cancelConfirmedReactivateBox: '<strong>Wieder aktivieren?</strong> Kein Problem — öffne einfach CHRYOS und wähle einen Plan. Dein Profil ist gespeichert.',
+    cancelConfirmedCTA: 'CHRYOS öffnen',
     cancelReceivedSubject: 'Eingangsbestätigung deiner Kündigung',
     cancelReceivedLabel: 'Kündigung eingegangen',
     cancelReceivedH1a: 'Kündigung',
@@ -6679,8 +6944,8 @@ async function sendEmail(to, type, data) {
         + eff;
     },
     cancelReceivedNote: 'Deine Daten, Pläne und Fortschritte bleiben bis zum Ende des Zeitraums erhalten.',
-    cancelReceivedReactivateBox: '<strong>Doch weitermachen?</strong> Du kannst die Kündigung jederzeit rückgängig machen &ndash; öffne einfach PEAK und wähle einen Plan.',
-    cancelReceivedCTA: 'PEAK öffnen',
+    cancelReceivedReactivateBox: '<strong>Doch weitermachen?</strong> Du kannst die Kündigung jederzeit rückgängig machen &ndash; öffne einfach CHRYOS und wähle einen Plan.',
+    cancelReceivedCTA: 'CHRYOS öffnen',
     cancelReminderSubject: (days, tier) => {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return days === 3 ? `Dein ${label} endet in 3 Tagen` : `Dein ${label} endet bald`;
@@ -6696,10 +6961,10 @@ async function sendEmail(to, type, data) {
       return `Am <strong>${endDate}</strong> endet dein ${label}-Zugang. Bis dahin: volle Power — Pläne anpassen, Workouts tracken, Rezepte checken.`;
     },
     cancelReminderBox: '<strong>Noch nicht sicher?</strong> Du kannst jederzeit zurückkehren — dein Profil und deine Fortschritte bleiben 30 Tage erhalten.',
-    cancelReminderCTA: 'Jetzt PEAK nutzen',
+    cancelReminderCTA: 'Jetzt CHRYOS nutzen',
     cancelFinalSubject: (tier) => {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
-      return `Dein PEAK ${label} ist beendet`;
+      return `Dein CHRYOS ${label} ist beendet`;
     },
     cancelFinalLabel: (tier) => `${tier === 'basic' ? 'Basic' : 'Premium'} beendet`,
     cancelFinalH1a: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
@@ -6710,25 +6975,25 @@ async function sendEmail(to, type, data) {
     },
     cancelFinalReactivate: 'Plan vermissen? Hol ihn dir mit einem Klick zurück.',
     cancelFinalCTA: 'Plan zurückholen',
-    accountDeletedSubject: 'Dein PEAK-Konto wurde gelöscht',
+    accountDeletedSubject: 'Dein CHRYOS-Konto wurde gelöscht',
     accountDeletedLabel: 'Konto gelöscht',
     accountDeletedH1a: 'Dein Konto',
     accountDeletedH1b: 'ist gelöscht.',
-    accountDeletedBody: (name) => (name ? name + ', d' : 'D') + 'ein PEAK-Konto wurde auf deinen Wunsch hin gelöscht. Profil, Ziele, Fortschritts- und Trainings-Daten wurden aus unserer Datenbank entfernt. Ein eventuelles Premium-Abo wurde beendet.',
+    accountDeletedBody: (name) => (name ? name + ', d' : 'D') + 'ein CHRYOS-Konto wurde auf deinen Wunsch hin gelöscht. Profil, Ziele, Fortschritts- und Trainings-Daten wurden aus unserer Datenbank entfernt. Ein eventuelles Premium-Abo wurde beendet.',
     // Audit Nachtrag Thema 2: §147 AO deckt Rechnungen ab, nicht
     // Gesundheitsdaten. Wir behalten den Stripe-Customer-Record
     // (Buchhaltungs-Pflicht), löschen aber die sensiblen Metadata-
     // Felder bei Account-Delete (siehe Befund 4-Fix). Email-Text
     // beschreibt was tatsächlich passiert, kein DSGVO-Risiko.
     accountDeletedLegal: 'Hinweis: Aus handelsrechtlichen Gründen müssen wir Rechnungsdaten (Datum, Betrag, Stripe-Transaktions-ID) für 10 Jahre aufbewahren (§257 HGB, §147 AO). Diese Datensätze bleiben in unserer Zahlungsabwicklung. Alle sensiblen Profil- und Gesundheitsdaten wurden gelöscht.',
-    accountDeletedBye: 'Danke, dass du PEAK ausprobiert hast. Du bist jederzeit wieder willkommen.',
+    accountDeletedBye: 'Danke, dass du CHRYOS ausprobiert hast. Du bist jederzeit wieder willkommen.',
     // ── PAYMENT FAILED (DE) ──
     paymentFailedSubject: 'Zahlung fehlgeschlagen — bitte Karte aktualisieren',
     paymentFailedLabel: 'Zahlung fehlgeschlagen',
     paymentFailedH1a: 'Deine Zahlung',
     paymentFailedH1b: 'ging schief.',
     paymentFailedBody: (name) => (name ? name + ', w' : 'W') + 'ir konnten deine letzte Abbuchung nicht durchführen. Häufigster Grund: abgelaufene Karte oder fehlendes Guthaben. Stripe versucht es in den nächsten Tagen automatisch erneut.',
-    paymentFailedBox: '<strong>Was du tun kannst:</strong> Öffne PEAK, gehe zu Einstellungen → Abonnement → Zahlungsmethode und hinterlege eine aktuelle Karte. Sobald die Zahlung durchgeht, läuft dein Abo nahtlos weiter.',
+    paymentFailedBox: '<strong>Was du tun kannst:</strong> Öffne CHRYOS, gehe zu Einstellungen → Abonnement → Zahlungsmethode und hinterlege eine aktuelle Karte. Sobald die Zahlung durchgeht, läuft dein Abo nahtlos weiter.',
     paymentFailedCTA: 'Karte aktualisieren',
     // ── TRIAL ENDING (DE) — fired by Stripe 3 days before trial_end ──
     // Body uses actual trial length from Stripe sub, not a hardcoded "7"
@@ -6739,12 +7004,12 @@ async function sendEmail(to, type, data) {
     trialEndingH1b: 'startet dein Abo.',
     trialEndingBody: (name, dateStr, trialDays) => {
       const dur = trialDays && trialDays > 0 ? `${trialDays}-tägige` : '';
-      return (name ? name + ', d' : 'D') + 'eine ' + dur + ' Testphase endet ' + (dateStr ? 'am <strong>' + dateStr + '</strong>' : 'in 3 Tagen') + '. Danach startet dein PEAK-Abo automatisch — du musst nichts tun, um weiterzumachen.';
+      return (name ? name + ', d' : 'D') + 'eine ' + dur + ' Testphase endet ' + (dateStr ? 'am <strong>' + dateStr + '</strong>' : 'in 3 Tagen') + '. Danach startet dein CHRYOS-Abo automatisch — du musst nichts tun, um weiterzumachen.';
     },
-    trialEndingBox: '<strong>Möchtest du nicht weitermachen?</strong> Öffne PEAK → Einstellungen → Abonnement → Testphase beenden. Du behältst die volle Kontrolle — Kündigung jederzeit direkt in der App.',
-    trialEndingCTA: 'PEAK öffnen',
+    trialEndingBox: '<strong>Möchtest du nicht weitermachen?</strong> Öffne CHRYOS → Einstellungen → Abonnement → Testphase beenden. Du behältst die volle Kontrolle — Kündigung jederzeit direkt in der App.',
+    trialEndingCTA: 'CHRYOS öffnen',
   } : {
-    welcomeSubject: (tier) => tier === 'free' ? 'Your PEAK plan is live — this email is your cross-device login' : 'Welcome to PEAK — your plan is ready',
+    welcomeSubject: (tier) => tier === 'free' ? 'Your CHRYOS plan is live — this email is your cross-device login' : 'Welcome to CHRYOS — your plan is ready',
     welcomeLabel: (n) => 'Welcome' + (n ? ', ' + htmlEsc(n) : ''),
     welcomeH1a: 'Your plan is',
     welcomeH1b: 'live.',
@@ -6754,7 +7019,7 @@ async function sendEmail(to, type, data) {
       const safeGoal = goal ? htmlEsc(goal) : '';
       const safeSport = sport ? htmlEsc(sport) : '';
       if (tier === 'free') {
-        return 'You\'re already logged in — this email is your backup. Save it if you ever want to open PEAK on another device (phone, tablet). Just tap the button below and you\'ll land straight in your plan, no password.';
+        return 'You\'re already logged in — this email is your backup. Save it if you ever want to open CHRYOS on another device (phone, tablet). Just tap the button below and you\'ll land straight in your plan, no password.';
       }
       const days = trialDays && trialDays > 0 ? trialDays : 7;
       // Same auto-login framing as Free, just compact for paid tiers.
@@ -6796,15 +7061,15 @@ async function sendEmail(to, type, data) {
       return txt;
     },
     ctaOpen: 'Open my plan',
-    day6Subject: 'Final day — your PEAK trial ends tomorrow',
+    day6Subject: 'Final day — your CHRYOS trial ends tomorrow',
     day6Label: 'Final 24 hours',
     day6H1: (n) => (n ? n + ',<br>' : '') + 'tomorrow<br>it begins.',
-    day6Body: 'Your free trial ends tomorrow. Your PEAK subscription begins automatically — no action needed to continue.',
-    day6Box: '<strong>To cancel:</strong> Open PEAK → Settings → Subscription → Cancel trial. You stay in full control — cancel anytime, right in the app.',
+    day6Body: 'Your free trial ends tomorrow. Your CHRYOS subscription begins automatically — no action needed to continue.',
+    day6Box: '<strong>To cancel:</strong> Open CHRYOS → Settings → Subscription → Cancel trial. You stay in full control — cancel anytime, right in the app.',
     day6CTA: 'Keep my plan',
     // ── CANCELLATION EMAILS (EN) ──
     cancelTierLabel: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
-    cancelConfirmedSubject: 'Your PEAK cancellation is confirmed',
+    cancelConfirmedSubject: 'Your CHRYOS cancellation is confirmed',
     cancelConfirmedLabel: 'Cancellation confirmed',
     cancelConfirmedH1a: 'Sorry to',
     cancelConfirmedH1b: 'see you go.',
@@ -6812,9 +7077,9 @@ async function sendEmail(to, type, data) {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return `Your cancellation has been processed. Your ${label} access remains active until <strong>${endDate}</strong> — then your account switches to the Free plan automatically.`;
     },
-    cancelConfirmedNote: 'Until then, use PEAK to the fullest. Your data, plans and progress are safe.',
-    cancelConfirmedReactivateBox: '<strong>Changed your mind?</strong> No problem — open PEAK and pick a plan. Your profile is saved.',
-    cancelConfirmedCTA: 'Open PEAK',
+    cancelConfirmedNote: 'Until then, use CHRYOS to the fullest. Your data, plans and progress are safe.',
+    cancelConfirmedReactivateBox: '<strong>Changed your mind?</strong> No problem — open CHRYOS and pick a plan. Your profile is saved.',
+    cancelConfirmedCTA: 'Open CHRYOS',
     cancelReceivedSubject: 'Confirmation of receipt of your cancellation',
     cancelReceivedLabel: 'Cancellation received',
     cancelReceivedH1a: 'Cancellation',
@@ -6832,8 +7097,8 @@ async function sendEmail(to, type, data) {
         + eff;
     },
     cancelReceivedNote: 'Your data, plans and progress are kept until the end of the period.',
-    cancelReceivedReactivateBox: '<strong>Changed your mind?</strong> You can reverse the cancellation anytime &ndash; just open PEAK and pick a plan.',
-    cancelReceivedCTA: 'Open PEAK',
+    cancelReceivedReactivateBox: '<strong>Changed your mind?</strong> You can reverse the cancellation anytime &ndash; just open CHRYOS and pick a plan.',
+    cancelReceivedCTA: 'Open CHRYOS',
     cancelReminderSubject: (days, tier) => {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return days === 3 ? `Your ${label} ends in 3 days` : `Your ${label} ends soon`;
@@ -6849,8 +7114,8 @@ async function sendEmail(to, type, data) {
       return `Your ${label} access ends on <strong>${endDate}</strong>. Until then: full power — tune plans, track workouts, check recipes.`;
     },
     cancelReminderBox: '<strong>Still deciding?</strong> You can come back anytime — your profile and progress are kept for 30 days.',
-    cancelReminderCTA: 'Use PEAK now',
-    cancelFinalSubject: (tier) => `Your PEAK ${tier === 'basic' ? 'Basic' : 'Premium'} has ended`,
+    cancelReminderCTA: 'Use CHRYOS now',
+    cancelFinalSubject: (tier) => `Your CHRYOS ${tier === 'basic' ? 'Basic' : 'Premium'} has ended`,
     cancelFinalLabel: (tier) => `${tier === 'basic' ? 'Basic' : 'Premium'} ended`,
     cancelFinalH1a: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
     cancelFinalH1b: 'has ended.',
@@ -6860,24 +7125,24 @@ async function sendEmail(to, type, data) {
     },
     cancelFinalReactivate: 'Missing your plan? Bring it back with one click.',
     cancelFinalCTA: 'Bring back my plan',
-    accountDeletedSubject: 'Your PEAK account has been deleted',
+    accountDeletedSubject: 'Your CHRYOS account has been deleted',
     accountDeletedLabel: 'Account deleted',
     accountDeletedH1a: 'Your account',
     accountDeletedH1b: 'is deleted.',
-    accountDeletedBody: (name) => (name ? name + ', y' : 'Y') + 'our PEAK account has been deleted at your request. Profile, goals, progress and training data have been removed from our database. Any Premium subscription has been ended.',
+    accountDeletedBody: (name) => (name ? name + ', y' : 'Y') + 'our CHRYOS account has been deleted at your request. Profile, goals, progress and training data have been removed from our database. Any Premium subscription has been ended.',
     // Audit Nachtrag Thema 2: §147 AO covers invoices, not health data.
     // The stripe-customer record stays (accounting obligation) but
     // sensitive metadata is scrubbed on delete (Befund 4 fix). Email
     // describes what actually happens — no GDPR mismatch.
     accountDeletedLegal: 'Note: under German commercial law we must retain invoice records (date, amount, Stripe transaction ID) for 10 years (§257 HGB, §147 AO). These records remain in our payment system. All sensitive profile and health data has been deleted.',
-    accountDeletedBye: 'Thanks for trying PEAK. You\'re always welcome back.',
+    accountDeletedBye: 'Thanks for trying CHRYOS. You\'re always welcome back.',
     // ── PAYMENT FAILED (EN) ──
     paymentFailedSubject: 'Payment failed — please update your card',
     paymentFailedLabel: 'Payment failed',
     paymentFailedH1a: 'Your payment',
     paymentFailedH1b: 'didn\'t go through.',
     paymentFailedBody: (name) => (name ? name + ', w' : 'W') + 'e couldn\'t process your last payment. Most common reason: expired card or insufficient funds. Stripe will retry automatically over the next few days.',
-    paymentFailedBox: '<strong>What you can do:</strong> Open PEAK, go to Settings → Subscription → Payment method and add a current card. Once the charge goes through, your subscription continues without interruption.',
+    paymentFailedBox: '<strong>What you can do:</strong> Open CHRYOS, go to Settings → Subscription → Payment method and add a current card. Once the charge goes through, your subscription continues without interruption.',
     paymentFailedCTA: 'Update card',
     // ── TRIAL ENDING (EN) — fired by Stripe 3 days before trial_end ──
     trialEndingSubject: 'Your trial ends in 3 days',
@@ -6886,10 +7151,10 @@ async function sendEmail(to, type, data) {
     trialEndingH1b: 'your plan starts.',
     trialEndingBody: (name, dateStr, trialDays) => {
       const dur = trialDays && trialDays > 0 ? `${trialDays}-day` : '';
-      return (name ? name + ', y' : 'Y') + 'our ' + dur + ' trial ends ' + (dateStr ? 'on <strong>' + dateStr + '</strong>' : 'in 3 days') + '. After that, your PEAK subscription starts automatically — you don\'t need to do anything to continue.';
+      return (name ? name + ', y' : 'Y') + 'our ' + dur + ' trial ends ' + (dateStr ? 'on <strong>' + dateStr + '</strong>' : 'in 3 days') + '. After that, your CHRYOS subscription starts automatically — you don\'t need to do anything to continue.';
     },
-    trialEndingBox: '<strong>Don\'t want to continue?</strong> Open PEAK → Settings → Subscription → End trial. You stay in full control — cancel anytime, right in the app.',
-    trialEndingCTA: 'Open PEAK',
+    trialEndingBox: '<strong>Don\'t want to continue?</strong> Open CHRYOS → Settings → Subscription → End trial. You stay in full control — cancel anytime, right in the app.',
+    trialEndingCTA: 'Open CHRYOS',
   };
 
   // Responsive email CSS: proper mobile breakpoint + padding reduction
@@ -7122,7 +7387,7 @@ async function sendEmail(to, type, data) {
     },
 
     widerruf_received: {
-      subject: de ? 'Eingangsbestätigung Ihres Widerrufs – PEAK' : 'Withdrawal received – PEAK',
+      subject: de ? 'Eingangsbestätigung Ihres Widerrufs – CHRYOS' : 'Withdrawal received – CHRYOS',
       html: emailShell(RESPONSIVE_CSS + `
         <tr><td>${emailHeader()}</td></tr>
         <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
@@ -7142,7 +7407,7 @@ async function sendEmail(to, type, data) {
           </table>
 
           ${(data && data.willDowngrade)
-            ? `<p style="margin:0 0 8px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">${de ? ('Dein Premium-Zugang ' + (data && data.endDate ? ('endet am ' + data.endDate + ' und wird danach') : 'bleibt bis zum Ende der laufenden Testphase bzw. Abrechnungsperiode aktiv und wird danach') + ' automatisch auf den kostenlosen PEAK-Tarif umgestellt. Es erfolgt keine weitere Abbuchung; eine etwaige bereits geleistete Zahlung erstatten wir dir unverzüglich.') : ('Your premium access ' + (data && data.endDate ? ('ends on ' + data.endDate + ', then') : 'stays active until the end of your current trial or billing period, then') + ' automatically switches to the free PEAK plan. You will not be charged again; any payment already made will be refunded promptly.')}</p>`
+            ? `<p style="margin:0 0 8px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">${de ? ('Dein Premium-Zugang ' + (data && data.endDate ? ('endet am ' + data.endDate + ' und wird danach') : 'bleibt bis zum Ende der laufenden Testphase bzw. Abrechnungsperiode aktiv und wird danach') + ' automatisch auf den kostenlosen CHRYOS-Tarif umgestellt. Es erfolgt keine weitere Abbuchung; eine etwaige bereits geleistete Zahlung erstatten wir dir unverzüglich.') : ('Your premium access ' + (data && data.endDate ? ('ends on ' + data.endDate + ', then') : 'stays active until the end of your current trial or billing period, then') + ' automatically switches to the free CHRYOS plan. You will not be charged again; any payment already made will be refunded promptly.')}</p>`
             : `<p style="margin:0 0 8px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">${de ? 'Dein Vertrag ist damit widerrufen. Es erfolgt keine Abbuchung.' : 'Your contract is hereby withdrawn. You will not be charged.'}</p>`}
         </td></tr>
 
@@ -7476,6 +7741,19 @@ cron.schedule('15 3 * * 1', async () => {
       else console.log(`🧹 webhook_events cleanup: removed ${weCount || 0} rows older than 90 days`);
     } catch (e) {
       console.error('❌ webhook_events cleanup crashed:', e.message);
+    }
+    // fix72 #5: consumed_checkout_sessions — useless after the 30-min freshness
+    // window; keep 1 day for forensics. Harmless if the table doesn't exist yet.
+    try {
+      const csCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const { error: ccErr, count: ccCount } = await supabase
+        .from('consumed_checkout_sessions')
+        .delete({ count: 'exact' })
+        .lt('consumed_at', csCutoff);
+      if (ccErr) console.error('❌ consumed_checkout_sessions cleanup error:', ccErr.message);
+      else console.log(`🧹 consumed_checkout_sessions cleanup: removed ${ccCount || 0} rows older than 1 day`);
+    } catch (e) {
+      console.error('❌ consumed_checkout_sessions cleanup crashed:', e.message);
     }
   } catch (err) {
     console.error('❌ ttl cleanup crashed:', err.message);
@@ -7834,7 +8112,7 @@ app.post('/family/invite-info', userLimiter, async (req, res) => {
     }
     // Look up the inviter's first name for the consent dialog. Falls
     // through gracefully if absent. We DON'T expose email, age, or any
-    // health data — only the name as it appears in their PEAK profile.
+    // health data — only the name as it appears in their CHRYOS profile.
     let inviterName = null;
     if (inv.created_by) {
       const { data: u } = await supabase
@@ -8042,7 +8320,7 @@ app.delete('/family/remove-member', userLimiter, async (req, res) => {
 // Update the group's default-shared-meals pattern (4×7 boolean matrix).
 // Body: { shared_meals_pattern: {...} }
 //
-// Audit Pass 4 #7.13: family trust model documented. PEAK family groups
+// Audit Pass 4 #7.13: family trust model documented. CHRYOS family groups
 // are EGALITARIAN for shared data (any active member can edit the
 // shared-meals pattern, delete a shared meal, generate new shared meals)
 // and HIERARCHICAL for membership management (only the creator can
@@ -8558,6 +8836,9 @@ app.post('/widerruf', authLimiter, async (req, res) => {
     if (subId && paidTier) {
       stripeTried = true; willDowngrade = true;
       try {
+        // Detach any renewal schedule first (a scheduled sub rejects a direct
+        // update); releasing keeps the sub so cancel_at_period_end still holds.
+        await releaseScheduleIfAny(subId);
         const updatedSub = await stripe.subscriptions.update(subId, {
           cancel_at_period_end: true,
           metadata: { cancellation_via: 'widerruf', widerruf_at: now.toISOString() },
@@ -8611,4 +8892,4 @@ const PORT = process.env.PORT || 3000;
 // Audit Pass 5 #8.7: assign to the forward-declared __peakServer (declared
 // near the uncaughtException handler) so the graceful-shutdown path can
 // call .close() to drain in-flight requests before process.exit.
-__peakServer = app.listen(PORT, () => console.log(`🚀 PEAK Backend on port ${PORT}`));
+__peakServer = app.listen(PORT, () => console.log(`🚀 CHRYOS Backend on port ${PORT}`));
