@@ -1,3 +1,4 @@
+// fix75 (login lockout — invisible-char e-mail): all e-mail lookups + writes now go through normEmail(), which strips invisible Unicode format/control chars (zero-width space U+200B, ZWNJ/ZWJ, BOM, bidi marks) in addition to whitespace+lowercase. A paying customer was refused with "no account" (send-otp / check-email) although raw SQL `WHERE email = '...'` found his row: his (autofilled) login e-mail carried an invisible char that survived the old `.replace(/\s/g,'')`, so the exact `.eq('email', …)` no longer matched the clean stored value. Existing rows should also be normalized once in DB: `UPDATE users SET email = lower(trim(email)) WHERE email <> lower(trim(email));`.
 // fix74 (annual->monthly renewal, §309 Nr.9 BGB): after 12 months a yearly plan converts to a MONTHLY subscription (monthly-cancellable) at the pro-rated monthly price via a Stripe Subscription Schedule (phase 1 = annual x1yr, trial preserved; phase 2 = monthly renewal price, indefinite). Attached at checkout.session.completed for annual plans (best-effort, operator-alerted on failure). Renewal Price IDs read from env basic_renewal_monthly / premium_renewal_monthly. change-tier / in-app cancel / reactivate / widerruf release any attached schedule first (a scheduled sub rejects direct item/price updates); change-tier re-attaches for annual. Helpers: renewalPriceForTier, releaseScheduleIfAny, attachRenewalScheduleForAnnual, notifyOperator.
 // fix73 (CHRYOS email copy): brand name PEAK->CHRYOS in all visible email/page text + new footer tagline. Domain/addresses (peak-mj-performance.app, noreply@, support@) intentionally UNCHANGED (domain round).
 // fix72 (audit batch 3): #5 checkout-login single-use via consumed_checkout_sessions (atomic insert-first, 409 on replay, fail-open if table missing/DB hiccup) + weekly purge. Requires migration_consumed_checkout_sessions.sql. RLS (#1) handled separately in SQL.
@@ -496,7 +497,7 @@ const publicReadLimiter = rateLimit({
 // the existence check, and the webhook's deduplication broke the same way.
 // This helper iterates pages until the user is found or pages run out.
 async function findAuthUserByEmail(email) {
-  const target = String(email || '').toLowerCase().trim();
+  const target = normEmail(email);
   if (!target) return null;
   const PAGE_SIZE = 1000; // Supabase max — fewer round-trips
   let page = 1;
@@ -528,7 +529,7 @@ async function findAuthUserByEmail(email) {
     }
     const users = data?.users || [];
     if (users.length === 0) return null;
-    const match = users.find(u => (u.email || '').toLowerCase() === target);
+    const match = users.find(u => normEmail(u.email) === target);
     if (match) return match;
     if (users.length < PAGE_SIZE) return null; // last page, no match
     page++;
@@ -764,6 +765,19 @@ function sanitizeUserText(s, maxLen) {
   return s.replace(/[\p{C}]/gu, '').slice(0, cap).trim();
 }
 
+// fix75: robust e-mail normalization used for ALL e-mail lookups AND writes.
+// Beyond lowercase + whitespace, this strips invisible Unicode format/control
+// characters (zero-width space U+200B, ZWNJ/ZWJ, BOM U+FEFF, bidi marks, ...).
+// Such a character survives a plain .replace(/\s/g,'') and creates a byte
+// mismatch: an existing user then looks "not registered" because the app's
+// exact .eq() lookup no longer equals the (clean) stored e-mail — even though
+// a raw SQL WHERE email = '...' finds the row. \p{C} = Unicode "Other"
+// (control + format + ...); the u flag is required for \p{...}. Idempotent
+// for already-clean e-mails, so safe to apply everywhere.
+function normEmail(e) {
+  return String(e == null ? '' : e).replace(/[\p{C}\s]/gu, '').toLowerCase();
+}
+
 // Befund 3 (defence-in-depth): strip invisible / dangerous control characters
 // from a string while PRESERVING tab/newline so legitimate multi-line prompt
 // formatting stays intact. Used on the frontend-assembled /ai/generate prompt,
@@ -995,7 +1009,7 @@ app.post('/auth/check-email', enumLimiter, async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
 
-    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
+    const normalizedEmail = normEmail(email);
 
     // Check if a user profile exists for this email in our DB
     const { data: profile, error: profileErr } = await supabase
@@ -1027,7 +1041,7 @@ app.post('/auth/send-login-link', authLimiter, async (req, res) => {
     const { email, lang } = req.body;
     if (!email) return res.status(400).json({ error: 'Email required' });
 
-    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
+    const normalizedEmail = normEmail(email);
 
     // Audit Pass 4 #7.8 + Pass 6 #9.8: per-email rate limit, with a
     // pre-check that the account actually exists. authLimiter (20/10min/IP)
@@ -1170,7 +1184,7 @@ app.post('/auth/send-otp', authLimiter, async (req, res) => {
     if (!email || typeof email !== 'string' || !email.includes('@')) {
       return res.status(400).json({ error: 'Valid email required' });
     }
-    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
+    const normalizedEmail = normEmail(email);
     const emailLang = (lang === 'de' || lang === 'en') ? lang : 'en';
 
     // ── ACCOUNT EXISTENCE CHECK ────────────────────────────────────────
@@ -1362,7 +1376,7 @@ app.post('/auth/checkout-login', authLimiter, async (req, res) => {
       } catch (_) {}
     }
     if (!email) return res.status(404).json({ error: 'no_email' });
-    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
+    const normalizedEmail = normEmail(email);
 
     // Find or create the auth user (the webhook may not have run yet).
     let authUserId = null;
@@ -1430,7 +1444,7 @@ app.post('/auth/verify-otp', authLimiter, async (req, res) => {
     if (!email || !code) {
       return res.status(400).json({ error: 'Email and code required' });
     }
-    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
+    const normalizedEmail = normEmail(email);
     const normalizedCode = String(code).trim().replace(/\s/g, '');
     if (!/^\d{6}$/.test(normalizedCode)) {
       return res.status(400).json({ error: 'Invalid code format', code: 'INVALID_CODE' });
@@ -1617,7 +1631,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
       });
     }
 
-    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
+    const normalizedEmail = normEmail(email);
 
     // ── AUTH CHECK (audit Pass 4 #7.1, P0) ──────────────────────────────
     // Two scenarios reach this endpoint:
@@ -3645,7 +3659,7 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
       });
     }
 
-    const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
+    const normalizedEmail = normEmail(email);
 
     // ── AUTH CHECK (audit Pass 4 #7.1, P0) ──────────────────────────────
     // Same protection as /auth/signup-free. Two valid paths:
@@ -4023,7 +4037,7 @@ app.post('/voucher/validate', enumLimiter, async (req, res) => {
     }
     // ─── ABUSE CHECK: email already redeemed this code? ─────────────────
     if (email && typeof email === 'string') {
-      const normalizedEmail = String(email).replace(/\s/g, '').toLowerCase();
+      const normalizedEmail = normEmail(email);
       try {
         const { data: prior, error } = await supabase
           .from('voucher_redemptions')
@@ -5741,7 +5755,7 @@ app.post('/webhook', async (req, res) => {
       // Normalize email to lowercase — Supabase Auth stores emails lowercased,
       // and all our email lookups use .toLowerCase() too. Writing a mixed-case
       // email here creates a ghost row the app can never find.
-      email = email.toLowerCase().trim();
+      email = normEmail(email);
 
       const meta = session.metadata || {};
       // Pull real trial_end from the Stripe subscription instead of hardcoding
@@ -6108,7 +6122,7 @@ app.post('/webhook', async (req, res) => {
       if (email) {
         // Normalise to lowercase — DB stores normalised emails, Stripe may
         // hand us mixed case which would silently miss the row.
-        email = email.toLowerCase().trim();
+        email = normEmail(email);
         // Downgrade tier to free — prevents continued premium access after cancellation
         // Keep status history: if already blocked_voucher_abuse, don't overwrite
         // Also pull `lang` so we can pass it explicitly to sendEmail — without
@@ -6359,7 +6373,7 @@ app.post('/webhook', async (req, res) => {
           console.error('❌ Could not fetch customer for sub.updated:', err.message);
         }
         // Normalise to lowercase — see "Email-Case-Bug" notes
-        if (email) email = email.toLowerCase().trim();
+        if (email) email = normEmail(email);
         if (email && justCancelled) {
           // Email A: Cancellation confirmed — paid plan continues until period end
           const periodEnd = sub.cancel_at || sub.current_period_end;
@@ -6431,7 +6445,7 @@ app.post('/webhook', async (req, res) => {
           }
         }
         if (email) {
-          email = email.toLowerCase().trim();
+          email = normEmail(email);
           const { error } = await supabase.from('users').update({ status: 'active' }).eq('email', email);
           if (error) console.error('❌ Supabase update (active) failed:', error.message);
           else console.log(`✅ User renewed: ${mE(email)}`);
@@ -6455,7 +6469,7 @@ app.post('/webhook', async (req, res) => {
         }
       }
       if (email) {
-        email = email.toLowerCase().trim();
+        email = normEmail(email);
         // Mark as past_due so the app can show a banner / restrict access
         const { error: updErr } = await supabase
           .from('users')
@@ -6498,7 +6512,7 @@ app.post('/webhook', async (req, res) => {
         }
       }
       if (email) {
-        email = email.toLowerCase().trim();
+        email = normEmail(email);
         const { data: user } = await supabase
           .from('users')
           .select('name, lang')
