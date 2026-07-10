@@ -6630,8 +6630,8 @@ function emailFooter(email, lang) {
   // still render correctly.
   const taglineLang = (lang === 'de') ? 'de' : 'en';
   const taglineText = (taglineLang === 'de')
-    ? '„Disziplin gewinnt das Rennen."'
-    : '"Discipline wins the race."';
+    ? '„1% besser als gestern."'
+    : '"1% better than yesterday."';
   return `
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
     <tr>
@@ -6651,6 +6651,8 @@ function emailFooter(email, lang) {
           <a href="${FRONTEND_URL}/datenschutz" style="color:#AAA;text-decoration:none;">Datenschutz</a>
           <span style="color:#555;"> · </span>
           <a href="${FRONTEND_URL}/widerruf" style="color:#AAA;text-decoration:none;">Widerruf</a>
+          <span style="color:#555;"> · </span>
+          <a href="${FRONTEND_URL}/#kuendigen" style="color:#AAA;text-decoration:none;">Kündigen</a>
           <span style="color:#555;"> · </span>
           <a href="${unsub}" style="color:#AAA;text-decoration:none;">Unsubscribe</a>
         </p>
@@ -6704,9 +6706,7 @@ function buildOtpEmail(code, email, lang) {
     <p style="margin:0 0 10px;font-family:${FONT_BODY};font-size:12px;color:${BRAND.dim}">⏱ ${L.expiry}</p>
     <p style="margin:0;font-family:${FONT_BODY};font-size:11px;color:${BRAND.faint};line-height:1.5">${L.warning}</p>
   </td></tr>
-  <tr><td style="background:${BRAND.light};padding:18px 32px;border-top:1px solid ${BRAND.border}">
-    <div style="font-family:${FONT_BODY};font-size:10px;color:${BRAND.faint};letter-spacing:1.2px;text-align:center">${L.footer}</div>
-  </td></tr>
+  <tr><td>${emailFooter(email, lang)}</td></tr>
 </table></td></tr></table></body></html>`;
 
   const text = `${L.h1a} ${L.h1b}\n\n${L.intro}\n\n  ${codePretty}\n\n${L.expiry}\n\n${L.warning}\n\n— ${L.footer}`;
