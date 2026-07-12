@@ -1,4 +1,5 @@
-// fix75 (login lockout — invisible-char e-mail): all e-mail lookups + writes now go through normEmail(), which strips invisible Unicode format/control chars (zero-width space U+200B, ZWNJ/ZWJ, BOM, bidi marks) in addition to whitespace+lowercase. A paying customer was refused with "no account" (send-otp / check-email) although raw SQL `WHERE email = '...'` found his row: his (autofilled) login e-mail carried an invisible char that survived the old `.replace(/\s/g,'')`, so the exact `.eq('email', …)` no longer matched the clean stored value. Existing rows should also be normalized once in DB: `UPDATE users SET email = lower(trim(email)) WHERE email <> lower(trim(email));`.
+// fix76 (service-role hardening + self-check): (1) the Supabase client is now created with auth.persistSession=false/autoRefreshToken=false so DB calls always use SUPABASE_SERVICE_KEY and can't silently fall back to a user/anon token. (2) A boot + hourly serviceRoleSelfCheck() probe-writes an RLS-protected table; if writes are RLS-blocked (SUPABASE_SERVICE_KEY not honored as service_role → running as anon), it logs loudly and e-mails the operator — so a repeat of the week-long silent write-outage (users/webhook_events/login_codes all RLS-refused, Stripe retrying webhooks for days) is caught in ~60s instead of by chance. NOTE: the actual outage cause was a wrong/stale SUPABASE_SERVICE_KEY in Render (anon key or pre-rotation key), NOT the DB — verified via `SET ROLE service_role; SELECT count(*) FROM users;` returning all rows.
+// fix75 (login lockout — invisible-char e-mail): all e-mail lookups + writes now go through normEmail(), which strips invisible Unicode format/control chars (zero-width space U+200B, ZWNJ/ZWJ, BOM, bidi marks) in addition to whitespace+lowercase.
 // fix74 (annual->monthly renewal, §309 Nr.9 BGB): after 12 months a yearly plan converts to a MONTHLY subscription (monthly-cancellable) at the pro-rated monthly price via a Stripe Subscription Schedule (phase 1 = annual x1yr, trial preserved; phase 2 = monthly renewal price, indefinite). Attached at checkout.session.completed for annual plans (best-effort, operator-alerted on failure). Renewal Price IDs read from env basic_renewal_monthly / premium_renewal_monthly. change-tier / in-app cancel / reactivate / widerruf release any attached schedule first (a scheduled sub rejects direct item/price updates); change-tier re-attaches for annual. Helpers: renewalPriceForTier, releaseScheduleIfAny, attachRenewalScheduleForAnnual, notifyOperator.
 // fix73 (CHRYOS email copy): brand name PEAK->CHRYOS in all visible email/page text + new footer tagline. Domain/addresses (peak-mj-performance.app, noreply@, support@) intentionally UNCHANGED (domain round).
 // fix72 (audit batch 3): #5 checkout-login single-use via consumed_checkout_sessions (atomic insert-first, 409 on replay, fail-open if table missing/DB hiccup) + weekly purge. Requires migration_consumed_checkout_sessions.sql. RLS (#1) handled separately in SQL.
@@ -111,7 +112,14 @@ app.use(helmet({
   frameguard: { action: 'deny' },
 }));
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+// fix76: create the service-role client the correct server-side way —
+// persistSession + autoRefreshToken OFF so the client can NEVER swap the
+// service_role key for a user/session token on DB requests (a subtle way
+// service-role calls end up running as anon and getting RLS-blocked). It
+// always authenticates DB calls with SUPABASE_SERVICE_KEY.
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://peak-mj-performance.app';
@@ -8906,4 +8914,47 @@ const PORT = process.env.PORT || 3000;
 // Audit Pass 5 #8.7: assign to the forward-declared __peakServer (declared
 // near the uncaughtException handler) so the graceful-shutdown path can
 // call .close() to drain in-flight requests before process.exit.
-__peakServer = app.listen(PORT, () => console.log(`🚀 CHRYOS Backend on port ${PORT}`));
+// ── SERVICE-ROLE SELF-CHECK (fix76) ────────────────────────────────────
+// If SUPABASE_SERVICE_KEY ever stops being honored as service_role, EVERY DB
+// write is silently RLS-blocked (checkout provisioning, tier upgrades, login
+// codes) while the process still looks healthy — the exact week-long outage
+// we just had. This probe writes+deletes a throwaway row in an RLS-protected
+// table; if the write is refused with an RLS/permission error, the key is not
+// service_role → log loudly + e-mail the operator immediately.
+async function serviceRoleSelfCheck(ctx) {
+  const probeEmail = '__selfcheck__@internal.invalid';
+  try {
+    await supabase.from('login_codes').delete().eq('email', probeEmail); // clear any stale probe
+    const { error } = await supabase.from('login_codes').insert({
+      email: probeEmail, code_hash: 'selfcheck', expires_at: new Date(0).toISOString(),
+    });
+    if (error) {
+      const isRls = /row-level security|violates row-level|permission denied|42501/i.test(error.message || '');
+      if (isRls) {
+        console.error(`🚨 SERVICE-ROLE SELF-CHECK FAILED (${ctx}) — DB WRITES BLOCKED. SUPABASE_SERVICE_KEY is not honored as service_role (running as anon, RLS filters everything). Fix the key in Render + redeploy.`, error.message);
+        await notifyOperator('[KRITISCH] Backend schreibt nicht in die DB (service_role/RLS defekt)', [
+          'Der Self-Check konnte KEINE Zeile schreiben (RLS-Block).',
+          'Ursache: SUPABASE_SERVICE_KEY wird nicht als service_role akzeptiert — falscher, alter oder anon-Key in Render.',
+          'Folge: JEDER DB-Write scheitert still — Kauf-Freischaltung, Tier-Upgrade, Login-Codes.',
+          'Fehler: ' + (error.message || ''),
+          'Bitte SOFORT den korrekten service_role-Key in Render setzen und neu deployen.',
+        ]);
+      } else {
+        console.warn(`⚠️  Service-role self-check probe could not run (${ctx}), non-RLS error:`, error.message);
+      }
+      return false;
+    }
+    await supabase.from('login_codes').delete().eq('email', probeEmail);
+    console.log(`✅ Service-role self-check OK (${ctx}) — DB writes work.`);
+    return true;
+  } catch (e) {
+    console.error(`🚨 SERVICE-ROLE SELF-CHECK ERROR (${ctx}):`, e && e.message);
+    return false;
+  }
+}
+
+__peakServer = app.listen(PORT, () => {
+  console.log(`🚀 CHRYOS Backend on port ${PORT}`);
+  serviceRoleSelfCheck('boot');
+  setInterval(() => serviceRoleSelfCheck('hourly'), 60 * 60 * 1000);
+});
