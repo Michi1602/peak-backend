@@ -4240,6 +4240,56 @@ app.post('/voucher/apply-existing', authLimiter, async (req, res) => {
 // (plan, goal, sport, trial_end, status, etc.).
 // Uses the user's access token to validate identity, then looks up the
 // profile row via service role (bypasses RLS, safe because we verified first).
+// fix78 (§312j — Preisklarheit im Checkout): sagt dem CHECKOUT-SCREEN, ob
+// dieser Nutzer die 7-Tage-Testphase noch bekommt. Ohne das zeigte die App
+// IMMER "Kostenpflichtiges Abo nach der Testphase", während fix68 (Anti-Abuse:
+// Trial nur 1x pro Kunde) sie Wiederkehrern verweigert und Stripe dann
+// "Heute fällig: X €" anzeigt -> widersprüchlich und irreführend.
+//
+// BEWUSST AUTHENTIFIZIERT: ein offener Endpoint "hatte diese E-Mail je ein
+// Abo?" wäre ein Account-Enumeration-Orakel (man könnte fremde Adressen auf
+// Kundenstatus abklopfen). Der Nutzer ist im Checkout eingeloggt, also fragen
+// wir NUR seinen eigenen Status ab - die E-Mail kommt aus dem Token, NIE aus
+// dem Request-Body.
+//
+// Die Logik spiegelt /create-checkout EXAKT (inkl. fail-open): schlägt der
+// Stripe-Check dort fehl, wird der Trial GEWÄHRT - also melden wir hier
+// ebenfalls "berechtigt", sonst verspräche die Anzeige weniger als der Kunde
+// bekommt. Anzeige und Abbuchung können so nicht auseinanderlaufen.
+app.get('/user/trial-eligibility', userLimiter, async (req, res) => {
+  try {
+    const token = extractBearerToken(req);
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    const authUser = userData && userData.user;
+    if (userErr || !authUser || !authUser.email) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    const email = normEmail(authUser.email);
+
+    let eligible = true;
+    try {
+      const cust = await stripe.customers.list({ email, limit: 1 });
+      if (cust && cust.data && cust.data.length > 0) {
+        const subs = await stripe.subscriptions.list({ customer: cust.data[0].id, status: 'all', limit: 10 });
+        // Identisch zu /create-checkout: 'incomplete'/'incomplete_expired'
+        // zählen NICHT (abgebrochener Versuch = Trial nie verbraucht).
+        const used = ((subs && subs.data) || []).some(
+          s => s.status !== 'incomplete' && s.status !== 'incomplete_expired'
+        );
+        if (used) eligible = false;
+      }
+    } catch (e) {
+      console.warn('[trial-eligibility] Stripe-Check fehlgeschlagen (fail-open, zeige Trial):', e.message);
+    }
+
+    res.json({ trial_eligible: eligible, trial_days: eligible ? 7 : 0 });
+  } catch (err) {
+    console.error('[trial-eligibility] Fehler:', err.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 app.get('/user/profile', userLimiter, async (req, res) => {
   try {
     // Audit Pass 1 #4.1: shared bearer-token extractor.
