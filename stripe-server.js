@@ -3,7 +3,7 @@
 // fix76 (service-role hardening + self-check): (1) the Supabase client is now created with auth.persistSession=false/autoRefreshToken=false so DB calls always use SUPABASE_SERVICE_KEY and can't silently fall back to a user/anon token. (2) A boot + hourly serviceRoleSelfCheck() probe-writes an RLS-protected table; if writes are RLS-blocked (SUPABASE_SERVICE_KEY not honored as service_role → running as anon), it logs loudly and e-mails the operator — so a repeat of the week-long silent write-outage (users/webhook_events/login_codes all RLS-refused, Stripe retrying webhooks for days) is caught in ~60s instead of by chance. NOTE: the actual outage cause was a wrong/stale SUPABASE_SERVICE_KEY in Render (anon key or pre-rotation key), NOT the DB — verified via `SET ROLE service_role; SELECT count(*) FROM users;` returning all rows.
 // fix75 (login lockout — invisible-char e-mail): all e-mail lookups + writes now go through normEmail(), which strips invisible Unicode format/control chars (zero-width space U+200B, ZWNJ/ZWJ, BOM, bidi marks) in addition to whitespace+lowercase.
 // fix74 (annual->monthly renewal, §309 Nr.9 BGB): after 12 months a yearly plan converts to a MONTHLY subscription (monthly-cancellable) at the pro-rated monthly price via a Stripe Subscription Schedule (phase 1 = annual x1yr, trial preserved; phase 2 = monthly renewal price, indefinite). Attached at checkout.session.completed for annual plans (best-effort, operator-alerted on failure). Renewal Price IDs read from env basic_renewal_monthly / premium_renewal_monthly. change-tier / in-app cancel / reactivate / widerruf release any attached schedule first (a scheduled sub rejects direct item/price updates); change-tier re-attaches for annual. Helpers: renewalPriceForTier, releaseScheduleIfAny, attachRenewalScheduleForAnnual, notifyOperator.
-// fix73 (CHRYOS email copy): brand name PEAK->CHRYOS in all visible email/page text + new footer tagline. Domain/addresses (peak-mj-performance.app, noreply@, support@) intentionally UNCHANGED (domain round).
+// fix73 (Coeurance email copy): brand name PEAK->Coeurance in all visible email/page text + new footer tagline. Domain/addresses (peak-mj-performance.app, noreply@, support@) intentionally UNCHANGED (domain round).
 // fix72 (audit batch 3): #5 checkout-login single-use via consumed_checkout_sessions (atomic insert-first, 409 on replay, fail-open if table missing/DB hiccup) + weekly purge. Requires migration_consumed_checkout_sessions.sql. RLS (#1) handled separately in SQL.
 // fix71 (audit batch 2): #4 payment_method_collection:'always' (trial needs card) · #8 webhook 500-retry for checkout.session.completed with idempotency-unmark · Follow-up A generic webhook error body · Follow-up B update-profile field-min. #5/#7 intentionally not touched.
 // fix70 (audit safe-batch): #2 generic 500 errors · #3 profile field-min (keep stripe_customer_id) · #9 no email in 404 · #10 signup numeric clamps. No auth/payment/flow changes.
@@ -130,7 +130,7 @@ const BACKEND_URL = process.env.BACKEND_URL || 'https://peak-backend-u52q.onrend
 // peak-mj-performance.app domain. noreply@ is send-only — no mailbox needed.
 // If the user hits "Reply", their mail client routes to REPLY_TO instead
 // (support@), which is a real, monitored inbox that actually receives.
-const FROM_EMAIL = 'CHRYOS <noreply@peak-mj-performance.app>';
+const FROM_EMAIL = 'Coeurance <noreply@peak-mj-performance.app>';
 // REPLY_TO: real, monitored support inbox. Set as a header on every send
 // so user replies don't disappear into a non-existent mailbox.
 const REPLY_TO = 'support@peak-mj-performance.app';
@@ -369,7 +369,7 @@ app.use(cors({
     // rather than bubbling up as a generic 500.
     return callback(null, false);
   },
-  // Audit Befund 11: explicitly disable credentials. CHRYOS uses Bearer
+  // Audit Befund 11: explicitly disable credentials. Coeurance uses Bearer
   // tokens in the Authorization header, not cookies. Setting this to
   // false closes the door on future architecture drift accidentally
   // creating a CORS gap when cookies are introduced.
@@ -381,7 +381,7 @@ app.use('/webhook', express.raw({ type: 'application/json' }));
 // 10mb limit was generous to the point of being dangerous — every
 // endpoint inherited it, including /user/* writes that should never see
 // more than a few KB. Default is now 100kb (still very generous for any
-// JSON payload CHRYOS actually sends), with explicit larger limits for
+// JSON payload Coeurance actually sends), with explicit larger limits for
 // the image-upload endpoint only.
 //
 // Why not 1mb default: even 1mb is an order of magnitude more than any
@@ -634,7 +634,7 @@ async function resolveAuthAndTier(req, { requirePremium = false } = {}) {
 // monitors. Render's own /healthz endpoint is what handles actual
 // container health-checks.
 app.get('/', (req, res) => {
-  res.json({ status: 'CHRYOS Backend running' });
+  res.json({ status: 'Coeurance Backend running' });
 });
 
 // ── UNSUBSCRIBE ───────────────────────────────────────────────────────
@@ -907,7 +907,7 @@ const PEAK_NUMERIC_RANGES = {
 // or "gpt-4o" still fail the regex.
 //
 // The explicit Set is kept as a "known-known" list for documentation
-// — these are the models we've actually tested with CHRYOS. Models that
+// — these are the models we've actually tested with Coeurance. Models that
 // match the regex but aren't in the Set log a notice (not a warning)
 // so operators know they're trying something untested.
 const MODEL_WHITELIST = new Set([
@@ -994,7 +994,7 @@ app.get('/unsubscribe', async (req, res) => {
   </style>
   </head><body>
   <h1>Du wurdest abgemeldet</h1>
-  <p style="color:#6B5D4A">Du erhältst keine weiteren E-Mails von CHRYOS.<br><br>You have been unsubscribed from CHRYOS emails.</p>
+  <p style="color:#6B5D4A">Du erhältst keine weiteren E-Mails von Coeurance.<br><br>You have been unsubscribed from Coeurance emails.</p>
   <a href="${FRONTEND_URL}" class="btn">Zurück zur App</a>
   </body></html>`);
 });
@@ -1232,7 +1232,7 @@ app.post('/auth/send-otp', authLimiter, async (req, res) => {
       // Audit Pass 4 #7.7: account-enumeration trade-off documented.
       // Returning 404/no_account leaks which emails are registered. For
       // a health/fitness app, mere membership is sensitive (Art. 9 GDPR
-      // implies the user is health-conscious enough to use CHRYOS).
+      // implies the user is health-conscious enough to use Coeurance).
       //
       // We deliberately keep the explicit "no_account" response anyway
       // because:
@@ -1636,8 +1636,8 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
       return res.status(400).json({
         error: 'AGE_RESTRICTION',
         message: lang === 'de'
-          ? 'CHRYOS ist ab 18 Jahren verfügbar.'
-          : 'CHRYOS is available from age 18.'
+          ? 'Coeurance ist ab 18 Jahren verfügbar.'
+          : 'Coeurance is available from age 18.'
       });
     }
 
@@ -2166,7 +2166,7 @@ const reactivateLimiter = rateLimit({
 });
 
 function reactivatePage(bodyHtml) {
-  return `<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CHRYOS</title>
+  return `<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coeurance</title>
   <style>
     body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;max-width:480px;margin:80px auto;padding:0 20px;text-align:center;background:#F0EBE0;color:#1A1410}
     h1{font-family:'Cinzel','Georgia',serif;font-weight:600;letter-spacing:2px;text-transform:uppercase;font-size:18px;color:#0A1420}
@@ -2181,7 +2181,7 @@ app.get('/reactivate-subscription', reactivateLimiter, (req, res) => {
     return res.status(400).send(reactivatePage(`<h1>Link ungültig oder abgelaufen</h1><p>Bitte logge dich in der App ein.<br><br>This link is invalid or expired. Please log in to the app.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
   }
   const tok = htmlEsc(String(req.query.token || ''));
-  return res.send(reactivatePage(`<h1>Kündigung rückgängig machen</h1><p>Möchtest du deine CHRYOS-Mitgliedschaft fortsetzen? Die geplante Kündigung wird damit aufgehoben.<br><br>Resume your CHRYOS membership? This reverses the scheduled cancellation.</p><form method="POST" action="/reactivate-subscription/confirm"><input type="hidden" name="token" value="${tok}"><button type="submit" class="btn">Fortsetzen / Resume</button></form>`));
+  return res.send(reactivatePage(`<h1>Kündigung rückgängig machen</h1><p>Möchtest du deine Coeurance-Mitgliedschaft fortsetzen? Die geplante Kündigung wird damit aufgehoben.<br><br>Resume your Coeurance membership? This reverses the scheduled cancellation.</p><form method="POST" action="/reactivate-subscription/confirm"><input type="hidden" name="token" value="${tok}"><button type="submit" class="btn">Fortsetzen / Resume</button></form>`));
 });
 
 app.post('/reactivate-subscription/confirm', reactivateLimiter, express.urlencoded({ extended: false }), async (req, res) => {
@@ -2217,7 +2217,7 @@ app.post('/reactivate-subscription/confirm', reactivateLimiter, express.urlencod
       console.error('❌ reactivate DB update failed:', dbErr.message);
     }
     console.log(`↩️  §312k reactivation for ${mE(email)}`);
-    return res.send(reactivatePage(`<h1>Mitgliedschaft fortgesetzt</h1><p>Deine Kündigung wurde aufgehoben — deine CHRYOS-Mitgliedschaft läuft weiter.<br><br>Your cancellation has been reversed — your CHRYOS membership continues.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
+    return res.send(reactivatePage(`<h1>Mitgliedschaft fortgesetzt</h1><p>Deine Kündigung wurde aufgehoben — deine Coeurance-Mitgliedschaft läuft weiter.<br><br>Your cancellation has been reversed — your Coeurance membership continues.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
   } catch (err) {
     console.error('❌ reactivate-subscription error:', err.message);
     return res.status(500).send(reactivatePage(`<h1>Fehler</h1><p>Etwas ist schiefgelaufen. Bitte versuche es erneut.<br><br>Something went wrong. Please try again.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
@@ -3207,7 +3207,7 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
     // retryable error so the frontend can offer manual entry instead of a
     // dead end. (Not an AI call — model routing untouched.)
     const offUrl = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json`;
-    const OFF_UA = 'CHRYOS-by-MJ-Performance/1.0 (support@peak-mj-performance.app)';
+    const OFF_UA = 'Coeurance-by-MJ-Performance/1.0 (support@peak-mj-performance.app)';
     let offRes = null, lastStatus = 0;
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) await new Promise(r => setTimeout(r, 400 * attempt)); // backoff: 400ms, 800ms
@@ -3284,7 +3284,7 @@ app.post('/ai/scan-barcode', aiLimiter, async (req, res) => {
       nutri_score: estimated ? null : ((p.nutriscore_grade || '').toUpperCase() || null),
       estimated,
       image: p.image_small_url || p.image_thumb_url || null,
-      // v71: send raw ingredient text for CHRYOS-Score evaluation client-
+      // v71: send raw ingredient text for Coeurance-Score evaluation client-
       // side. OpenFoodFacts gives us both lang-specific (ingredients_text_de,
       // ingredients_text_en) and a generic ingredients_text. We prefer
       // lang-specific where available so PEAK_SCORE_PATTERNS can match
@@ -3664,8 +3664,8 @@ app.post('/create-checkout', authLimiter, mediumJson, async (req, res) => {
       return res.status(400).json({
         error: 'AGE_RESTRICTION',
         message: lang === 'de'
-          ? 'CHRYOS ist ab 18 Jahren verfügbar.'
-          : 'CHRYOS is available from age 18.'
+          ? 'Coeurance ist ab 18 Jahren verfügbar.'
+          : 'Coeurance is available from age 18.'
       });
     }
 
@@ -4943,7 +4943,7 @@ app.get('/user/export-data', userLimiter, async (req, res) => {
       // terms (no model-training on API inputs, but standard retention
       // applies). Datenschutzerklärung was corrected; this notice has to
       // match or we have a written inconsistency for a complainant.
-      _notice: 'This export contains the personal data MJ Performance / CHRYOS holds about you: your profile, food log, meals/plans, daily stats, body measurements, AI adaptations and family membership. Payment data is held by Stripe and not included here — see stripe.com/privacy. AI prompts sent to Anthropic are processed under their standard API terms and are not used to train the models. See peak-mj-performance.app/datenschutz for full details.'
+      _notice: 'This export contains the personal data MJ Performance / Coeurance holds about you: your profile, food log, meals/plans, daily stats, body measurements, AI adaptations and family membership. Payment data is held by Stripe and not included here — see stripe.com/privacy. AI prompts sent to Anthropic are processed under their standard API terms and are not used to train the models. See peak-mj-performance.app/datenschutz for full details.'
     };
 
     console.log(`📦 Data export generated for ${mE(email)}`);
@@ -6684,7 +6684,7 @@ const BRAND = {
   dim: '#6B5D4A',      // Secondary text
   faint: '#9B9285',    // Footer/meta
   border: '#DFD9CB',   // Marble-toned divider
-  // Aurum gold — CHRYOS's signature colour. Used for accents, bullets,
+  // Aurum gold — Coeurance's signature colour. Used for accents, bullets,
   // header underline, buttons. Same hue on cream body and on dark
   // header for brand consistency. The user explicitly preferred the
   // bright #E8B86B over a darker WCAG-stricter alternative; readability
@@ -6713,7 +6713,7 @@ function emailHeader() {
     <tr>
       <td align="center" style="padding:32px 20px 28px;">
         <div style="display:inline-block;text-align:center;">
-          <div style="font-family:${FONT_HEAD};font-weight:600;font-size:32px;letter-spacing:7px;color:${BRAND.white};line-height:1;">CHRYOS</div>
+          <div style="font-family:${FONT_HEAD};font-weight:600;font-size:32px;letter-spacing:7px;color:${BRAND.white};line-height:1;">Coeurance</div>
           <div style="width:60px;height:1px;background:${BRAND.redBright};margin:6px auto 4px;"></div>
           <div style="font-family:${FONT_BODY};font-size:9px;font-weight:500;letter-spacing:2.5px;color:#9B9285;text-transform:uppercase;">by MJ Performance</div>
         </div>
@@ -6757,7 +6757,7 @@ function emailFooter(email, lang) {
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.ink};">
     <tr>
       <td style="padding:28px 30px 12px;text-align:center;">
-        <div style="font-family:${FONT_HEAD};font-size:14px;font-weight:600;letter-spacing:5px;color:${BRAND.white};line-height:1;">CHRYOS</div>
+        <div style="font-family:${FONT_HEAD};font-size:14px;font-weight:600;letter-spacing:5px;color:${BRAND.white};line-height:1;">Coeurance</div>
         <div style="width:32px;height:1px;background:${BRAND.redBright};margin:6px auto 4px;"></div>
         <div style="font-family:${FONT_BODY};font-size:9px;font-weight:500;letter-spacing:2px;color:#9B9285;text-transform:uppercase;">by MJ Performance</div>
         <div style="font-family:Georgia,'Times New Roman',serif;font-style:italic;font-size:12px;color:#9B9285;margin-top:10px;letter-spacing:.3px;">${taglineText}</div>
@@ -6765,7 +6765,7 @@ function emailFooter(email, lang) {
     </tr>
     <tr>
       <td style="padding:14px 30px 32px;font-family:${FONT_BODY};font-size:11px;line-height:1.7;color:#888;text-align:center;">
-        <p style="margin:0 0 10px;">Du erhältst diese E-Mail, weil du dich bei CHRYOS registriert hast.<br>You're receiving this because you signed up for CHRYOS.</p>
+        <p style="margin:0 0 10px;">Du erhältst diese E-Mail, weil du dich bei Coeurance registriert hast.<br>You're receiving this because you signed up for Coeurance.</p>
         <p style="margin:0 0 14px;">
           <a href="${FRONTEND_URL}/impressum" style="color:#AAA;text-decoration:none;">Impressum</a>
           <span style="color:#555;"> · </span>
@@ -6787,13 +6787,13 @@ function emailFooter(email, lang) {
 function buildOtpEmail(code, email, lang) {
   const de = lang === 'de';
   const L = {
-    subject: de ? 'Dein CHRYOS Login-Code' : 'Your CHRYOS login code',
+    subject: de ? 'Dein Coeurance Login-Code' : 'Your Coeurance login code',
     label: de ? 'Login-Code' : 'Login code',
     h1a: de ? 'DEIN CODE' : 'YOUR CODE',
-    h1b: de ? 'FÜR CHRYOS' : 'FOR CHRYOS',
+    h1b: de ? 'FÜR COEURANCE' : 'FOR COEURANCE',
     intro: de
-      ? 'Gib diesen 6-stelligen Code in der CHRYOS-App ein, um dich anzumelden:'
-      : 'Enter this 6-digit code in the CHRYOS app to sign in:',
+      ? 'Gib diesen 6-stelligen Code in der Coeurance-App ein, um dich anzumelden:'
+      : 'Enter this 6-digit code in the Coeurance app to sign in:',
     expiry: de
       ? 'Der Code ist 10 Minuten gültig.'
       : 'The code expires in 10 minutes.',
@@ -6801,8 +6801,8 @@ function buildOtpEmail(code, email, lang) {
       ? 'Wenn du diesen Code nicht angefordert hast, ignoriere diese E-Mail.'
       : 'If you did not request this code, ignore this email.',
     footer: de
-      ? 'CHRYOS by MJ Performance · Impressum: ' + FRONTEND_URL + '/impressum'
-      : 'CHRYOS by MJ Performance · Legal: ' + FRONTEND_URL + '/impressum',
+      ? 'Coeurance by MJ Performance · Impressum: ' + FRONTEND_URL + '/impressum'
+      : 'Coeurance by MJ Performance · Legal: ' + FRONTEND_URL + '/impressum',
   };
 
   // Format code with middle space for readability: "123 456"
@@ -6813,7 +6813,7 @@ function buildOtpEmail(code, email, lang) {
 <table width="100%" cellpadding="0" cellspacing="0" style="background:${BRAND.light};padding:40px 20px"><tr><td align="center">
 <table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;background:${BRAND.white};border:1px solid ${BRAND.border}">
   <tr><td style="background:${BRAND.ink};padding:28px 32px">
-    <div style="color:${BRAND.white};font-family:${FONT_HEAD};font-weight:600;font-size:28px;letter-spacing:4px">CHRYOS</div>
+    <div style="color:${BRAND.white};font-family:${FONT_HEAD};font-weight:600;font-size:28px;letter-spacing:4px">Coeurance</div>
     <div style="width:48px;height:1px;background:${BRAND.red};margin:6px 0 4px"></div>
     <div style="color:#9B9285;font-weight:500;font-size:10px;letter-spacing:2.5px">BY MJ PERFORMANCE</div>
   </td></tr>
@@ -6848,13 +6848,13 @@ function magicLinkFromHashedToken(linkData){
 function buildMagicLinkEmail(magicLink, email, lang) {
   const de = lang === 'de';
   const L = {
-    subject: de ? 'Dein CHRYOS Login-Link' : 'Your CHRYOS login link',
+    subject: de ? 'Dein Coeurance Login-Link' : 'Your Coeurance login link',
     label: de ? '🔐 Login-Link' : '🔐 Login link',
     h1a: de ? 'DEIN LINK' : 'YOUR LINK',
-    h1b: de ? 'ZU CHRYOS' : 'TO CHRYOS',
+    h1b: de ? 'ZU COEURANCE' : 'TO COEURANCE',
     intro: de
-      ? 'Klick den Button unten, um dich bei CHRYOS einzuloggen. Kein Passwort nötig.'
-      : 'Click the button below to sign in to CHRYOS. No password needed.',
+      ? 'Klick den Button unten, um dich bei Coeurance einzuloggen. Kein Passwort nötig.'
+      : 'Click the button below to sign in to Coeurance. No password needed.',
     cta: de ? 'Jetzt einloggen' : 'Sign in now',
     expire: de
       ? 'Dieser Link ist 1 Stunde gültig. Falls du diesen Login nicht angefordert hast, ignoriere diese E-Mail.'
@@ -6896,7 +6896,7 @@ function emailShell(innerHTML) {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light only">
 <meta name="supported-color-schemes" content="light only">
-<title>CHRYOS</title>
+<title>Coeurance</title>
 </head>
 <body style="margin:0;padding:0;background:${BRAND.light};font-family:${FONT_BODY};">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.light};">
@@ -6975,7 +6975,7 @@ async function sendEmail(to, type, data) {
   const L = de ? {
     // Subject branches by tier — Basic and Premium share the "trial" subject;
     // Free uses the cross-device login subject.
-    welcomeSubject: (tier) => tier === 'free' ? 'Dein CHRYOS-Plan ist live — diese Mail ist dein Cross-Device-Login' : 'Willkommen bei CHRYOS — dein Plan ist bereit',
+    welcomeSubject: (tier) => tier === 'free' ? 'Dein Coeurance-Plan ist live — diese Mail ist dein Cross-Device-Login' : 'Willkommen bei Coeurance — dein Plan ist bereit',
     welcomeLabel: (n) => 'Willkommen' + (n ? ', ' + htmlEsc(n) : ''),
     welcomeH1a: 'Dein Plan',
     welcomeH1b: 'ist live.',
@@ -6987,7 +6987,7 @@ async function sendEmail(to, type, data) {
       const safeGoal = goal ? htmlEsc(goal) : '';
       const safeSport = sport ? htmlEsc(sport) : '';
       if (tier === 'free') {
-        return 'Du bist bereits eingeloggt — diese Mail ist dein Backup. Speicher sie, falls du CHRYOS auf einem anderen Gerät öffnen willst (Handy, Tablet). Klick einfach unten auf den Button und du landest direkt in deinem Plan, ohne Passwort.';
+        return 'Du bist bereits eingeloggt — diese Mail ist dein Backup. Speicher sie, falls du Coeurance auf einem anderen Gerät öffnen willst (Handy, Tablet). Klick einfach unten auf den Button und du landest direkt in deinem Plan, ohne Passwort.';
       }
       const days = trialDays && trialDays > 0 ? trialDays : 7;
       // Lead with the auto-login note — same logic as Free, just shorter.
@@ -7044,14 +7044,14 @@ async function sendEmail(to, type, data) {
     day6Subject: 'Letzter Tag — deine Testphase endet morgen',
     day6Label: 'Letzte 24 Stunden',
     day6H1: (n) => (n ? n + ',<br>' : '') + 'morgen<br>geht es los.',
-    day6Body: 'Deine kostenlose Testphase endet morgen. Dein CHRYOS-Abo startet automatisch — du musst nichts tun, um weiterzumachen.',
-    day6Box: '<strong>Kündigen:</strong> CHRYOS öffnen → Einstellungen → Abonnement → Testphase beenden. Du behältst die volle Kontrolle — Kündigung jederzeit direkt in der App.',
+    day6Body: 'Deine kostenlose Testphase endet morgen. Dein Coeurance-Abo startet automatisch — du musst nichts tun, um weiterzumachen.',
+    day6Box: '<strong>Kündigen:</strong> Coeurance öffnen → Einstellungen → Abonnement → Testphase beenden. Du behältst die volle Kontrolle — Kündigung jederzeit direkt in der App.',
     day6CTA: 'Plan behalten',
     // ── CANCELLATION EMAILS (DE) ──
     // Tier-aware: a Basic user shouldn't read "Premium ends" (was confusing
     // and wrong). Helper renders the correct plan label in either language.
     cancelTierLabel: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
-    cancelConfirmedSubject: 'Deine CHRYOS-Kündigung ist bestätigt',
+    cancelConfirmedSubject: 'Deine Coeurance-Kündigung ist bestätigt',
     cancelConfirmedLabel: 'Kündigung bestätigt',
     cancelConfirmedH1a: 'Schade,',
     cancelConfirmedH1b: 'dass du gehst.',
@@ -7059,9 +7059,9 @@ async function sendEmail(to, type, data) {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return `Deine Kündigung wurde registriert. Dein ${label}-Zugang bleibt bis zum <strong>${endDate}</strong> aktiv — dann wird dein Account automatisch auf den Free-Plan umgestellt.`;
     },
-    cancelConfirmedNote: 'Bis dahin kannst du CHRYOS in vollem Umfang nutzen. Deine Daten, Pläne und Fortschritte bleiben erhalten.',
-    cancelConfirmedReactivateBox: '<strong>Wieder aktivieren?</strong> Kein Problem — öffne einfach CHRYOS und wähle einen Plan. Dein Profil ist gespeichert.',
-    cancelConfirmedCTA: 'CHRYOS öffnen',
+    cancelConfirmedNote: 'Bis dahin kannst du Coeurance in vollem Umfang nutzen. Deine Daten, Pläne und Fortschritte bleiben erhalten.',
+    cancelConfirmedReactivateBox: '<strong>Wieder aktivieren?</strong> Kein Problem — öffne einfach Coeurance und wähle einen Plan. Dein Profil ist gespeichert.',
+    cancelConfirmedCTA: 'Coeurance öffnen',
     cancelReceivedSubject: 'Eingangsbestätigung deiner Kündigung',
     cancelReceivedLabel: 'Kündigung eingegangen',
     cancelReceivedH1a: 'Kündigung',
@@ -7079,8 +7079,8 @@ async function sendEmail(to, type, data) {
         + eff;
     },
     cancelReceivedNote: 'Deine Daten, Pläne und Fortschritte bleiben bis zum Ende des Zeitraums erhalten.',
-    cancelReceivedReactivateBox: '<strong>Doch weitermachen?</strong> Du kannst die Kündigung jederzeit rückgängig machen &ndash; öffne einfach CHRYOS und wähle einen Plan.',
-    cancelReceivedCTA: 'CHRYOS öffnen',
+    cancelReceivedReactivateBox: '<strong>Doch weitermachen?</strong> Du kannst die Kündigung jederzeit rückgängig machen &ndash; öffne einfach Coeurance und wähle einen Plan.',
+    cancelReceivedCTA: 'Coeurance öffnen',
     cancelReminderSubject: (days, tier) => {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return days === 3 ? `Dein ${label} endet in 3 Tagen` : `Dein ${label} endet bald`;
@@ -7096,10 +7096,10 @@ async function sendEmail(to, type, data) {
       return `Am <strong>${endDate}</strong> endet dein ${label}-Zugang. Bis dahin: volle Power — Pläne anpassen, Workouts tracken, Rezepte checken.`;
     },
     cancelReminderBox: '<strong>Noch nicht sicher?</strong> Du kannst jederzeit zurückkehren — dein Profil und deine Fortschritte bleiben 30 Tage erhalten.',
-    cancelReminderCTA: 'Jetzt CHRYOS nutzen',
+    cancelReminderCTA: 'Jetzt Coeurance nutzen',
     cancelFinalSubject: (tier) => {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
-      return `Dein CHRYOS ${label} ist beendet`;
+      return `Dein Coeurance ${label} ist beendet`;
     },
     cancelFinalLabel: (tier) => `${tier === 'basic' ? 'Basic' : 'Premium'} beendet`,
     cancelFinalH1a: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
@@ -7110,25 +7110,25 @@ async function sendEmail(to, type, data) {
     },
     cancelFinalReactivate: 'Plan vermissen? Hol ihn dir mit einem Klick zurück.',
     cancelFinalCTA: 'Plan zurückholen',
-    accountDeletedSubject: 'Dein CHRYOS-Konto wurde gelöscht',
+    accountDeletedSubject: 'Dein Coeurance-Konto wurde gelöscht',
     accountDeletedLabel: 'Konto gelöscht',
     accountDeletedH1a: 'Dein Konto',
     accountDeletedH1b: 'ist gelöscht.',
-    accountDeletedBody: (name) => (name ? name + ', d' : 'D') + 'ein CHRYOS-Konto wurde auf deinen Wunsch hin gelöscht. Profil, Ziele, Fortschritts- und Trainings-Daten wurden aus unserer Datenbank entfernt. Ein eventuelles Premium-Abo wurde beendet.',
+    accountDeletedBody: (name) => (name ? name + ', d' : 'D') + 'ein Coeurance-Konto wurde auf deinen Wunsch hin gelöscht. Profil, Ziele, Fortschritts- und Trainings-Daten wurden aus unserer Datenbank entfernt. Ein eventuelles Premium-Abo wurde beendet.',
     // Audit Nachtrag Thema 2: §147 AO deckt Rechnungen ab, nicht
     // Gesundheitsdaten. Wir behalten den Stripe-Customer-Record
     // (Buchhaltungs-Pflicht), löschen aber die sensiblen Metadata-
     // Felder bei Account-Delete (siehe Befund 4-Fix). Email-Text
     // beschreibt was tatsächlich passiert, kein DSGVO-Risiko.
     accountDeletedLegal: 'Hinweis: Aus handelsrechtlichen Gründen müssen wir Rechnungsdaten (Datum, Betrag, Stripe-Transaktions-ID) für 10 Jahre aufbewahren (§257 HGB, §147 AO). Diese Datensätze bleiben in unserer Zahlungsabwicklung. Alle sensiblen Profil- und Gesundheitsdaten wurden gelöscht.',
-    accountDeletedBye: 'Danke, dass du CHRYOS ausprobiert hast. Du bist jederzeit wieder willkommen.',
+    accountDeletedBye: 'Danke, dass du Coeurance ausprobiert hast. Du bist jederzeit wieder willkommen.',
     // ── PAYMENT FAILED (DE) ──
     paymentFailedSubject: 'Zahlung fehlgeschlagen — bitte Karte aktualisieren',
     paymentFailedLabel: 'Zahlung fehlgeschlagen',
     paymentFailedH1a: 'Deine Zahlung',
     paymentFailedH1b: 'ging schief.',
     paymentFailedBody: (name) => (name ? name + ', w' : 'W') + 'ir konnten deine letzte Abbuchung nicht durchführen. Häufigster Grund: abgelaufene Karte oder fehlendes Guthaben. Stripe versucht es in den nächsten Tagen automatisch erneut.',
-    paymentFailedBox: '<strong>Was du tun kannst:</strong> Öffne CHRYOS, gehe zu Einstellungen → Abonnement → Zahlungsmethode und hinterlege eine aktuelle Karte. Sobald die Zahlung durchgeht, läuft dein Abo nahtlos weiter.',
+    paymentFailedBox: '<strong>Was du tun kannst:</strong> Öffne Coeurance, gehe zu Einstellungen → Abonnement → Zahlungsmethode und hinterlege eine aktuelle Karte. Sobald die Zahlung durchgeht, läuft dein Abo nahtlos weiter.',
     paymentFailedCTA: 'Karte aktualisieren',
     // ── TRIAL ENDING (DE) — fired by Stripe 3 days before trial_end ──
     // Body uses actual trial length from Stripe sub, not a hardcoded "7"
@@ -7139,12 +7139,12 @@ async function sendEmail(to, type, data) {
     trialEndingH1b: 'startet dein Abo.',
     trialEndingBody: (name, dateStr, trialDays) => {
       const dur = trialDays && trialDays > 0 ? `${trialDays}-tägige` : '';
-      return (name ? name + ', d' : 'D') + 'eine ' + dur + ' Testphase endet ' + (dateStr ? 'am <strong>' + dateStr + '</strong>' : 'in 3 Tagen') + '. Danach startet dein CHRYOS-Abo automatisch — du musst nichts tun, um weiterzumachen.';
+      return (name ? name + ', d' : 'D') + 'eine ' + dur + ' Testphase endet ' + (dateStr ? 'am <strong>' + dateStr + '</strong>' : 'in 3 Tagen') + '. Danach startet dein Coeurance-Abo automatisch — du musst nichts tun, um weiterzumachen.';
     },
-    trialEndingBox: '<strong>Möchtest du nicht weitermachen?</strong> Öffne CHRYOS → Einstellungen → Abonnement → Testphase beenden. Du behältst die volle Kontrolle — Kündigung jederzeit direkt in der App.',
-    trialEndingCTA: 'CHRYOS öffnen',
+    trialEndingBox: '<strong>Möchtest du nicht weitermachen?</strong> Öffne Coeurance → Einstellungen → Abonnement → Testphase beenden. Du behältst die volle Kontrolle — Kündigung jederzeit direkt in der App.',
+    trialEndingCTA: 'Coeurance öffnen',
   } : {
-    welcomeSubject: (tier) => tier === 'free' ? 'Your CHRYOS plan is live — this email is your cross-device login' : 'Welcome to CHRYOS — your plan is ready',
+    welcomeSubject: (tier) => tier === 'free' ? 'Your Coeurance plan is live — this email is your cross-device login' : 'Welcome to Coeurance — your plan is ready',
     welcomeLabel: (n) => 'Welcome' + (n ? ', ' + htmlEsc(n) : ''),
     welcomeH1a: 'Your plan is',
     welcomeH1b: 'live.',
@@ -7154,7 +7154,7 @@ async function sendEmail(to, type, data) {
       const safeGoal = goal ? htmlEsc(goal) : '';
       const safeSport = sport ? htmlEsc(sport) : '';
       if (tier === 'free') {
-        return 'You\'re already logged in — this email is your backup. Save it if you ever want to open CHRYOS on another device (phone, tablet). Just tap the button below and you\'ll land straight in your plan, no password.';
+        return 'You\'re already logged in — this email is your backup. Save it if you ever want to open Coeurance on another device (phone, tablet). Just tap the button below and you\'ll land straight in your plan, no password.';
       }
       const days = trialDays && trialDays > 0 ? trialDays : 7;
       // Same auto-login framing as Free, just compact for paid tiers.
@@ -7196,15 +7196,15 @@ async function sendEmail(to, type, data) {
       return txt;
     },
     ctaOpen: 'Open my plan',
-    day6Subject: 'Final day — your CHRYOS trial ends tomorrow',
+    day6Subject: 'Final day — your Coeurance trial ends tomorrow',
     day6Label: 'Final 24 hours',
     day6H1: (n) => (n ? n + ',<br>' : '') + 'tomorrow<br>it begins.',
-    day6Body: 'Your free trial ends tomorrow. Your CHRYOS subscription begins automatically — no action needed to continue.',
-    day6Box: '<strong>To cancel:</strong> Open CHRYOS → Settings → Subscription → Cancel trial. You stay in full control — cancel anytime, right in the app.',
+    day6Body: 'Your free trial ends tomorrow. Your Coeurance subscription begins automatically — no action needed to continue.',
+    day6Box: '<strong>To cancel:</strong> Open Coeurance → Settings → Subscription → Cancel trial. You stay in full control — cancel anytime, right in the app.',
     day6CTA: 'Keep my plan',
     // ── CANCELLATION EMAILS (EN) ──
     cancelTierLabel: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
-    cancelConfirmedSubject: 'Your CHRYOS cancellation is confirmed',
+    cancelConfirmedSubject: 'Your Coeurance cancellation is confirmed',
     cancelConfirmedLabel: 'Cancellation confirmed',
     cancelConfirmedH1a: 'Sorry to',
     cancelConfirmedH1b: 'see you go.',
@@ -7212,9 +7212,9 @@ async function sendEmail(to, type, data) {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return `Your cancellation has been processed. Your ${label} access remains active until <strong>${endDate}</strong> — then your account switches to the Free plan automatically.`;
     },
-    cancelConfirmedNote: 'Until then, use CHRYOS to the fullest. Your data, plans and progress are safe.',
-    cancelConfirmedReactivateBox: '<strong>Changed your mind?</strong> No problem — open CHRYOS and pick a plan. Your profile is saved.',
-    cancelConfirmedCTA: 'Open CHRYOS',
+    cancelConfirmedNote: 'Until then, use Coeurance to the fullest. Your data, plans and progress are safe.',
+    cancelConfirmedReactivateBox: '<strong>Changed your mind?</strong> No problem — open Coeurance and pick a plan. Your profile is saved.',
+    cancelConfirmedCTA: 'Open Coeurance',
     cancelReceivedSubject: 'Confirmation of receipt of your cancellation',
     cancelReceivedLabel: 'Cancellation received',
     cancelReceivedH1a: 'Cancellation',
@@ -7232,8 +7232,8 @@ async function sendEmail(to, type, data) {
         + eff;
     },
     cancelReceivedNote: 'Your data, plans and progress are kept until the end of the period.',
-    cancelReceivedReactivateBox: '<strong>Changed your mind?</strong> You can reverse the cancellation anytime &ndash; just open CHRYOS and pick a plan.',
-    cancelReceivedCTA: 'Open CHRYOS',
+    cancelReceivedReactivateBox: '<strong>Changed your mind?</strong> You can reverse the cancellation anytime &ndash; just open Coeurance and pick a plan.',
+    cancelReceivedCTA: 'Open Coeurance',
     cancelReminderSubject: (days, tier) => {
       const label = tier === 'basic' ? 'Basic' : 'Premium';
       return days === 3 ? `Your ${label} ends in 3 days` : `Your ${label} ends soon`;
@@ -7249,8 +7249,8 @@ async function sendEmail(to, type, data) {
       return `Your ${label} access ends on <strong>${endDate}</strong>. Until then: full power — tune plans, track workouts, check recipes.`;
     },
     cancelReminderBox: '<strong>Still deciding?</strong> You can come back anytime — your profile and progress are kept for 30 days.',
-    cancelReminderCTA: 'Use CHRYOS now',
-    cancelFinalSubject: (tier) => `Your CHRYOS ${tier === 'basic' ? 'Basic' : 'Premium'} has ended`,
+    cancelReminderCTA: 'Use Coeurance now',
+    cancelFinalSubject: (tier) => `Your Coeurance ${tier === 'basic' ? 'Basic' : 'Premium'} has ended`,
     cancelFinalLabel: (tier) => `${tier === 'basic' ? 'Basic' : 'Premium'} ended`,
     cancelFinalH1a: (tier) => tier === 'basic' ? 'Basic' : 'Premium',
     cancelFinalH1b: 'has ended.',
@@ -7260,24 +7260,24 @@ async function sendEmail(to, type, data) {
     },
     cancelFinalReactivate: 'Missing your plan? Bring it back with one click.',
     cancelFinalCTA: 'Bring back my plan',
-    accountDeletedSubject: 'Your CHRYOS account has been deleted',
+    accountDeletedSubject: 'Your Coeurance account has been deleted',
     accountDeletedLabel: 'Account deleted',
     accountDeletedH1a: 'Your account',
     accountDeletedH1b: 'is deleted.',
-    accountDeletedBody: (name) => (name ? name + ', y' : 'Y') + 'our CHRYOS account has been deleted at your request. Profile, goals, progress and training data have been removed from our database. Any Premium subscription has been ended.',
+    accountDeletedBody: (name) => (name ? name + ', y' : 'Y') + 'our Coeurance account has been deleted at your request. Profile, goals, progress and training data have been removed from our database. Any Premium subscription has been ended.',
     // Audit Nachtrag Thema 2: §147 AO covers invoices, not health data.
     // The stripe-customer record stays (accounting obligation) but
     // sensitive metadata is scrubbed on delete (Befund 4 fix). Email
     // describes what actually happens — no GDPR mismatch.
     accountDeletedLegal: 'Note: under German commercial law we must retain invoice records (date, amount, Stripe transaction ID) for 10 years (§257 HGB, §147 AO). These records remain in our payment system. All sensitive profile and health data has been deleted.',
-    accountDeletedBye: 'Thanks for trying CHRYOS. You\'re always welcome back.',
+    accountDeletedBye: 'Thanks for trying Coeurance. You\'re always welcome back.',
     // ── PAYMENT FAILED (EN) ──
     paymentFailedSubject: 'Payment failed — please update your card',
     paymentFailedLabel: 'Payment failed',
     paymentFailedH1a: 'Your payment',
     paymentFailedH1b: 'didn\'t go through.',
     paymentFailedBody: (name) => (name ? name + ', w' : 'W') + 'e couldn\'t process your last payment. Most common reason: expired card or insufficient funds. Stripe will retry automatically over the next few days.',
-    paymentFailedBox: '<strong>What you can do:</strong> Open CHRYOS, go to Settings → Subscription → Payment method and add a current card. Once the charge goes through, your subscription continues without interruption.',
+    paymentFailedBox: '<strong>What you can do:</strong> Open Coeurance, go to Settings → Subscription → Payment method and add a current card. Once the charge goes through, your subscription continues without interruption.',
     paymentFailedCTA: 'Update card',
     // ── TRIAL ENDING (EN) — fired by Stripe 3 days before trial_end ──
     trialEndingSubject: 'Your trial ends in 3 days',
@@ -7286,10 +7286,10 @@ async function sendEmail(to, type, data) {
     trialEndingH1b: 'your plan starts.',
     trialEndingBody: (name, dateStr, trialDays) => {
       const dur = trialDays && trialDays > 0 ? `${trialDays}-day` : '';
-      return (name ? name + ', y' : 'Y') + 'our ' + dur + ' trial ends ' + (dateStr ? 'on <strong>' + dateStr + '</strong>' : 'in 3 days') + '. After that, your CHRYOS subscription starts automatically — you don\'t need to do anything to continue.';
+      return (name ? name + ', y' : 'Y') + 'our ' + dur + ' trial ends ' + (dateStr ? 'on <strong>' + dateStr + '</strong>' : 'in 3 days') + '. After that, your Coeurance subscription starts automatically — you don\'t need to do anything to continue.';
     },
-    trialEndingBox: '<strong>Don\'t want to continue?</strong> Open CHRYOS → Settings → Subscription → End trial. You stay in full control — cancel anytime, right in the app.',
-    trialEndingCTA: 'Open CHRYOS',
+    trialEndingBox: '<strong>Don\'t want to continue?</strong> Open Coeurance → Settings → Subscription → End trial. You stay in full control — cancel anytime, right in the app.',
+    trialEndingCTA: 'Open Coeurance',
   };
 
   // Responsive email CSS: proper mobile breakpoint + padding reduction
@@ -7522,7 +7522,7 @@ async function sendEmail(to, type, data) {
     },
 
     widerruf_received: {
-      subject: de ? 'Eingangsbestätigung Ihres Widerrufs – CHRYOS' : 'Withdrawal received – CHRYOS',
+      subject: de ? 'Eingangsbestätigung Ihres Widerrufs – Coeurance' : 'Withdrawal received – Coeurance',
       html: emailShell(RESPONSIVE_CSS + `
         <tr><td>${emailHeader()}</td></tr>
         <tr><td class="email-pad-big" style="padding:48px 40px 8px;">
@@ -7542,7 +7542,7 @@ async function sendEmail(to, type, data) {
           </table>
 
           ${(data && data.willDowngrade)
-            ? `<p style="margin:0 0 8px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">${de ? ('Dein Premium-Zugang ' + (data && data.endDate ? ('endet am ' + data.endDate + ' und wird danach') : 'bleibt bis zum Ende der laufenden Testphase bzw. Abrechnungsperiode aktiv und wird danach') + ' automatisch auf den kostenlosen CHRYOS-Tarif umgestellt. Es erfolgt keine weitere Abbuchung; eine etwaige bereits geleistete Zahlung erstatten wir dir unverzüglich.') : ('Your premium access ' + (data && data.endDate ? ('ends on ' + data.endDate + ', then') : 'stays active until the end of your current trial or billing period, then') + ' automatically switches to the free CHRYOS plan. You will not be charged again; any payment already made will be refunded promptly.')}</p>`
+            ? `<p style="margin:0 0 8px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">${de ? ('Dein Premium-Zugang ' + (data && data.endDate ? ('endet am ' + data.endDate + ' und wird danach') : 'bleibt bis zum Ende der laufenden Testphase bzw. Abrechnungsperiode aktiv und wird danach') + ' automatisch auf den kostenlosen Coeurance-Tarif umgestellt. Es erfolgt keine weitere Abbuchung; eine etwaige bereits geleistete Zahlung erstatten wir dir unverzüglich.') : ('Your premium access ' + (data && data.endDate ? ('ends on ' + data.endDate + ', then') : 'stays active until the end of your current trial or billing period, then') + ' automatically switches to the free Coeurance plan. You will not be charged again; any payment already made will be refunded promptly.')}</p>`
             : `<p style="margin:0 0 8px;font-family:${FONT_BODY};font-size:15px;line-height:1.65;color:${BRAND.ink2};">${de ? 'Dein Vertrag ist damit widerrufen. Es erfolgt keine Abbuchung.' : 'Your contract is hereby withdrawn. You will not be charged.'}</p>`}
         </td></tr>
 
@@ -8247,7 +8247,7 @@ app.post('/family/invite-info', userLimiter, async (req, res) => {
     }
     // Look up the inviter's first name for the consent dialog. Falls
     // through gracefully if absent. We DON'T expose email, age, or any
-    // health data — only the name as it appears in their CHRYOS profile.
+    // health data — only the name as it appears in their Coeurance profile.
     let inviterName = null;
     if (inv.created_by) {
       const { data: u } = await supabase
@@ -8455,7 +8455,7 @@ app.delete('/family/remove-member', userLimiter, async (req, res) => {
 // Update the group's default-shared-meals pattern (4×7 boolean matrix).
 // Body: { shared_meals_pattern: {...} }
 //
-// Audit Pass 4 #7.13: family trust model documented. CHRYOS family groups
+// Audit Pass 4 #7.13: family trust model documented. Coeurance family groups
 // are EGALITARIAN for shared data (any active member can edit the
 // shared-meals pattern, delete a shared meal, generate new shared meals)
 // and HIERARCHICAL for membership management (only the creator can
@@ -9067,7 +9067,7 @@ async function serviceRoleSelfCheck(ctx) {
 }
 
 __peakServer = app.listen(PORT, () => {
-  console.log(`🚀 CHRYOS Backend on port ${PORT}`);
+  console.log(`🚀 Coeurance Backend on port ${PORT}`);
   serviceRoleSelfCheck('boot');
   setInterval(() => serviceRoleSelfCheck('hourly'), 60 * 60 * 1000);
 });
