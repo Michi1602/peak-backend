@@ -1,3 +1,4 @@
+// fix79 (stale-webhook-retry guard): Stripe retries failed webhooks for up to 3 days. While the idempotency insert can't write (fail-open, e.g. during the RLS/key outage) NO event is ever marked processed, so Stripe retries everything. Real incident (14.07., staging): a 2-day-old checkout.session.completed arrived after the user had re-purchased in the meantime and overwrote the CURRENT stripe_customer_id with the old one — which had since been deleted in Stripe. Result: 'No such customer' -> account auto-reset to Free, tier switch impossible. Guard: for events older than 1h, verify the referenced Stripe customer/subscription still exists; a dead reference means the event is superseded -> skip with 200 (stops the retry) instead of destroying current data. Fresh events (<1h) are untouched, so no extra Stripe call in normal operation. Fail-open throughout: the guard must never block a legitimate event.
 // fix77 (§312k/§355 withdrawal-confirmation delivery): 'widerruf_received' added to sendEmail's ALWAYS_SEND allowlist next to 'cancellation_received', so the lawyer-recommended withdrawal (Widerruf) receipt confirmation is delivered even to users who opted out of marketing mail — same treatment as the cancellation confirmation. Both receipt-confirmation flows + templates already existed (cancel: /cancel-subscription→cancellation_received; withdrawal: →widerruf_received); this only closes the opt-out suppression gap for the Widerruf case.
 // fix76 (service-role hardening + self-check): (1) the Supabase client is now created with auth.persistSession=false/autoRefreshToken=false so DB calls always use SUPABASE_SERVICE_KEY and can't silently fall back to a user/anon token. (2) A boot + hourly serviceRoleSelfCheck() probe-writes an RLS-protected table; if writes are RLS-blocked (SUPABASE_SERVICE_KEY not honored as service_role → running as anon), it logs loudly and e-mails the operator — so a repeat of the week-long silent write-outage (users/webhook_events/login_codes all RLS-refused, Stripe retrying webhooks for days) is caught in ~60s instead of by chance. NOTE: the actual outage cause was a wrong/stale SUPABASE_SERVICE_KEY in Render (anon key or pre-rotation key), NOT the DB — verified via `SET ROLE service_role; SELECT count(*) FROM users;` returning all rows.
 // fix75 (login lockout — invisible-char e-mail): all e-mail lookups + writes now go through normEmail(), which strips invisible Unicode format/control chars (zero-width space U+200B, ZWNJ/ZWJ, BOM, bidi marks) in addition to whitespace+lowercase.
@@ -5788,6 +5789,67 @@ app.post('/webhook', async (req, res) => {
     }
   } catch (e) {
     console.warn('⚠️  Idempotency check threw (fail-open):', e.message);
+  }
+
+  // ── fix79: Schutz gegen VERALTETE Retries ───────────────────────────────
+  // Stripe wiederholt fehlgeschlagene Webhooks bis zu 3 Tage lang. Solange der
+  // Idempotenz-Insert oben nicht schreiben kann (fail-open, z. B. während des
+  // RLS-/Key-Ausfalls), gilt KEIN Event als verarbeitet -> Stripe retryt alles.
+  // Real passiert (14.07., Staging): ein 2 Tage alter checkout.session.completed
+  // kam durch, nachdem der Nutzer zwischenzeitlich neu gekauft hatte, und
+  // überschrieb die AKTUELLE stripe_customer_id mit der alten (inzwischen in
+  // Stripe gelöschten). Folge: "No such customer" -> Konto auf Free zurück-
+  // gesetzt, Tarifwechsel unmöglich.
+  //
+  // Schutz: Bei ALTEN Events (>1 Std) prüfen wir, ob die referenzierten
+  // Stripe-Objekte überhaupt noch existieren. Tote Referenz = das Event ist
+  // überholt -> verwerfen, statt aktuelle Daten zu zerstören.
+  // Frische Events (<1 Std) sind davon nicht betroffen -> kein Zusatz-Call im
+  // Normalbetrieb. Antwort ist 200, damit Stripe aufhört zu retryen.
+  try {
+    const eventAgeMs = Date.now() - ((event.created || 0) * 1000);
+    const STALE_AFTER_MS = 60 * 60 * 1000;
+    if (eventAgeMs > STALE_AFTER_MS) {
+      const obj = (event.data && event.data.object) || {};
+      const ageMin = Math.round(eventAgeMs / 60000);
+
+      // 1) Customer noch da?
+      const custId = typeof obj.customer === 'string' ? obj.customer : null;
+      if (custId) {
+        try {
+          const c = await stripe.customers.retrieve(custId);
+          if (c && c.deleted) {
+            console.warn(`⏭️  Veralteter Webhook ${event.id} (${ageMin} Min alt): Customer ${custId} ist gelöscht — übersprungen, um aktuelle Daten nicht zu überschreiben.`);
+            return res.status(200).json({ received: true, stale: true, reason: 'customer_deleted' });
+          }
+        } catch (e) {
+          if (e && e.message && e.message.includes('No such customer')) {
+            console.warn(`⏭️  Veralteter Webhook ${event.id} (${ageMin} Min alt): Customer ${custId} existiert nicht mehr — übersprungen.`);
+            return res.status(200).json({ received: true, stale: true, reason: 'customer_gone' });
+          }
+          console.warn(`[stale-guard] Customer-Check fehlgeschlagen (fail-open, verarbeite normal):`, e.message);
+        }
+      }
+
+      // 2) Subscription noch da? (verhindert, dass eine alte, gekündigte
+      //    Subscription-ID die aktuelle überschreibt -> "Wechsel fehlgeschlagen")
+      const subId = typeof obj.subscription === 'string' ? obj.subscription
+                  : (obj.object === 'subscription' && typeof obj.id === 'string' ? obj.id : null);
+      if (subId) {
+        try {
+          await stripe.subscriptions.retrieve(subId);
+        } catch (e) {
+          if (e && e.message && e.message.includes('No such subscription')) {
+            console.warn(`⏭️  Veralteter Webhook ${event.id} (${ageMin} Min alt): Subscription ${subId} existiert nicht mehr — übersprungen.`);
+            return res.status(200).json({ received: true, stale: true, reason: 'subscription_gone' });
+          }
+          console.warn(`[stale-guard] Subscription-Check fehlgeschlagen (fail-open, verarbeite normal):`, e.message);
+        }
+      }
+    }
+  } catch (e) {
+    // Guard darf niemals einen legitimen Event blockieren.
+    console.warn('[stale-guard] threw (fail-open):', e.message);
   }
 
   try {
