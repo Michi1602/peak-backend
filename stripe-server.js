@@ -1,4 +1,4 @@
-// fix125 (stiller Speicher-Ausfall): UPDATEs mit RLS-Filter werfen KEINEN Fehler — die WHERE-Klausel matcht dann einfach nichts, 0 Zeilen werden geändert, error bleibt null. POST /user/plan meldete deshalb `ok:true`, während plan_data in der DB NULL blieb: Frontend hielt den Plan für gespeichert, beim nächsten Login fehlte er, also wurde er für ~$0.05 neu generiert — und wieder nicht gespeichert. Endlosschleife, komplett lautlos, kein einziger Log-Eintrag. (Gegensatz: ein INSERT gegen RLS wirft 42501 — so wurde fix123 überhaupt gefunden.) Fix: .select('id') an den UPDATE hängen und die zurückgegebenen Zeilen prüfen; 0 Zeilen = lauter Fehler + HTTP 500. OFFEN: 26 weitere UPDATEs auf users haben dasselbe Muster (ohne .select()) und würden bei einem erneuten Rollen-Problem ebenso lautlos scheitern — s. Roadmap.
+// fix125 (stiller Speicher-Ausfall): UPDATEs mit RLS-Filter werfen KEINEN Fehler — die WHERE-Klausel matcht dann einfach nichts, 0 Zeilen werden geändert, error bleibt null. POST /user/plan meldete deshalb `ok:true`, während plan_data in der DB NULL blieb: Frontend hielt den Plan für gespeichert, beim nächsten Login fehlte er, also wurde er für ~$0.05 neu generiert — und wieder nicht gespeichert. Endlosschleife, komplett lautlos, kein einziger Log-Eintrag. (Gegensatz: ein INSERT gegen RLS wirft 42501 — so wurde fix123 überhaupt gefunden.) Fix: .select('id') an den UPDATE hängen und die zurückgegebenen Zeilen prüfen; 0 Zeilen = lauter Fehler + HTTP 500. ERLEDIGT: ALLE 26 UPDATEs auf users laufen jetzt über den zentralen Helfer checkedUpdate(builder, ctx) — er hängt .select('id') an, prüft die betroffenen Zeilen und schreibt bei 0 Zeilen einen lauten Log-Eintrag mit Kontextnamen. Damit kann kein users-UPDATE mehr lautlos ins Leere laufen: Tier-Wechsel, Voucher-Sperre, Dangling-Cleanup, Kontingent-Zähler, Pool-Anker (die den teuren Dauer-Refresh verhindern), Meal-Tracking, Training-State und alle Family-Operationen melden sich, wenn sie nichts schreiben.
 // fix123 (CRITICAL — OTP-Login seit 13.07. tot): supabase.auth.verifyOtp() sets a session on the client it is called on. Called on the shared DB client, every subsequent DB call authenticates with that user's token instead of SUPABASE_SERVICE_KEY — the process silently runs as 'authenticated'. login_codes has RLS on with no policy, so inserts die with 42501 'new row violates row-level security policy'. persistSession:false does NOT protect: it only prevents storing the session, not the in-memory auth state. The poisoned state persists until the next deploy and affects ALL requests, not just the triggering user. It went unnoticed for four days because the hourly service-role self-check ran BEFORE anyone logged in and correctly reported OK — on quiet days nobody used checkout/magic-link login, so the client stayed clean. Fix: freshAuthClient() hands every auth operation its own throwaway client; the DB client is never touched and stays service_role.
 // fix79 (stale-webhook-retry guard): Stripe retries failed webhooks for up to 3 days. While the idempotency insert can't write (fail-open, e.g. during the RLS/key outage) NO event is ever marked processed, so Stripe retries everything. Real incident (14.07., staging): a 2-day-old checkout.session.completed arrived after the user had re-purchased in the meantime and overwrote the CURRENT stripe_customer_id with the old one — which had since been deleted in Stripe. Result: 'No such customer' -> account auto-reset to Free, tier switch impossible. Guard: for events older than 1h, verify the referenced Stripe customer/subscription still exists; a dead reference means the event is superseded -> skip with 200 (stops the retry) instead of destroying current data. Fresh events (<1h) are untouched, so no extra Stripe call in normal operation. Fail-open throughout: the guard must never block a legitimate event.
 // fix77 (§312k/§355 withdrawal-confirmation delivery): 'widerruf_received' added to sendEmail's ALWAYS_SEND allowlist next to 'cancellation_received', so the lawyer-recommended withdrawal (Widerruf) receipt confirmation is delivered even to users who opted out of marketing mail — same treatment as the cancellation confirmation. Both receipt-confirmation flows + templates already existed (cancel: /cancel-subscription→cancellation_received; withdrawal: →widerruf_received); this only closes the opt-out suppression gap for the Widerruf case.
@@ -153,6 +153,39 @@ function freshAuthClient() {
   return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
+}
+
+// ── fix125: stille UPDATE-Ausfälle sichtbar machen ──────────────────────
+// Ein UPDATE, den RLS wegfiltert, wirft KEINEN Fehler: die WHERE-Klausel
+// matcht dann einfach nichts, 0 Zeilen ändern sich, `error` bleibt null.
+// (Ein INSERT gegen RLS wirft dagegen 42501 — deshalb fiel login_codes auf
+// und plan_data nicht.) Ergebnis war ein lautloser Totalausfall: Der Plan
+// wurde generiert (~$0.05), "gespeichert", war beim nächsten Login weg,
+// wurde neu generiert … monatelang, ohne eine einzige Fehlermeldung. Nur
+// die Abrechnung wusste Bescheid.
+//
+// Nutzung:  const r = await checkedUpdate(
+//             supabase.from('users').update({...}).eq('id', x), 'ctx-name');
+//           if (!r.ok) { ... }
+// `.select('id')` erzwingt, dass Supabase die betroffenen Zeilen zurückgibt
+// — nur so ist "0 Zeilen" überhaupt erkennbar.
+async function checkedUpdate(builder, ctx) {
+  try {
+    const { data, error } = await builder.select('id');
+    if (error) {
+      console.error(`❌ ${ctx}: UPDATE fehlgeschlagen — ${error.message}`);
+      return { ok: false, rows: 0, error };
+    }
+    const rows = Array.isArray(data) ? data.length : 0;
+    if (rows === 0) {
+      console.error(`🚨 ${ctx}: UPDATE hat 0 Zeilen geändert — ging ins Leere. Verdacht: DB-Client läuft nicht als service_role (RLS filtert lautlos) oder der Datensatz existiert nicht.`);
+      return { ok: false, rows: 0, noRows: true };
+    }
+    return { ok: true, rows };
+  } catch (e) {
+    console.error(`❌ ${ctx}: UPDATE warf eine Exception — ${e.message}`);
+    return { ok: false, rows: 0, error: e };
+  }
 }
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -1017,7 +1050,7 @@ app.get('/unsubscribe', async (req, res) => {
     <a href="${FRONTEND_URL}" class="btn">Zur App</a>
     </body></html>`);
   }
-  await supabase.from('users').update({ unsubscribed: true }).eq('email', email);
+  await checkedUpdate(supabase.from('users').update({ unsubscribed: true }).eq('email', email), 'unsubscribe (Abmeldung von Mails)');
   res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><title>Abgemeldet</title>
   <style>
     body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;max-width:480px;margin:80px auto;padding:0 20px;text-align:center;background:#F0EBE0;color:#1A1410}
@@ -2034,13 +2067,13 @@ app.post('/customer-portal', authLimiter, async (req, res) => {
       // Clean up the dangling reference + inform the user.
       if (stripeErr?.message?.includes('No such customer')) {
         console.warn(`⚠️  Dangling stripe_customer_id for ${mE(email)}: ${profile.stripe_customer_id}. Clearing.`);
-        await supabase.from('users').update({
+        await checkedUpdate(supabase.from('users').update({
           stripe_customer_id: null,
           stripe_subscription_id: null,
           tier: 'free',
           status: 'cancelled',
           trial_end: null,
-        }).eq('email', email.toLowerCase().trim());
+        }).eq('email', email.toLowerCase().trim()), 'dangling-customer-cleanup (Konto auf Free)');
         return res.status(410).json({
           error: 'subscription_not_found',
           code: 'SUBSCRIPTION_NOT_FOUND',
@@ -2148,11 +2181,11 @@ app.post('/cancel-subscription', cancelLimiter, async (req, res) => {
     // DB-Status spiegeln (der Webhook tut dies ebenfalls, aber wir setzen es
     // sofort, damit die App den Zustand direkt korrekt zeigt).
     try {
-      await supabase.from('users').update({
+      await checkedUpdate(supabase.from('users').update({
         status: 'cancelling',
         cancel_at: endTs ? new Date(endTs).toISOString() : null,
         cancel_reminder_sent: false,
-      }).eq('email', cleanEmail);
+      }).eq('email', cleanEmail), 'cancel-reminder (Erinnerung verschickt)');
     } catch (dbErr) {
       console.error('❌ cancel-subscription DB update failed:', dbErr.message);
     }
@@ -2244,7 +2277,7 @@ app.post('/reactivate-subscription/confirm', reactivateLimiter, express.urlencod
       return res.status(409).send(reactivatePage(`<h1>Reaktivierung nicht möglich</h1><p>Dein Abo ist möglicherweise bereits beendet. Bitte abonniere in der App erneut.<br><br>Your subscription may already have ended. Please re-subscribe in the app.</p><a href="${FRONTEND_URL}" class="btn">Zur App</a>`));
     }
     try {
-      await supabase.from('users').update({ status: 'active', cancel_at: null, cancel_reminder_sent: false }).eq('email', email);
+      await checkedUpdate(supabase.from('users').update({ status: 'active', cancel_at: null, cancel_reminder_sent: false }).eq('email', email), 'users-update@2280');
     } catch (dbErr) {
       console.error('❌ reactivate DB update failed:', dbErr.message);
     }
@@ -2812,13 +2845,13 @@ app.post('/ai/generate', aiLimiter, mediumJson, async (req, res) => {
     async function rollbackPlanCounter(reason) {
       if (!pendingPlanCounterUpdate || !pendingPlanCounterUpdate.reserved) return;
       try {
-        await supabase
+        await checkedUpdate(supabase
           .from('users')
           .update({
             plan_generations_used: pendingPlanCounterUpdate.previousUsed,
             plan_generations_window_start: pendingPlanCounterUpdate.windowStart,
           })
-          .eq('id', authUserId);
+          .eq('id', authUserId), 'plan-counter (Kontingent)');
         console.log(`↩️  Plan-counter rolled back for ${mE(userEmail)} (${reason}): ${pendingPlanCounterUpdate.used} → ${pendingPlanCounterUpdate.previousUsed}`);
       } catch (rbErr) {
         console.error(`⚠️  Counter rollback failed for ${mE(userEmail)}:`, rbErr.message);
@@ -3663,7 +3696,7 @@ app.post('/change-tier', authLimiter, mediumJson, async (req, res) => {
 
     // Reflect immediately for snappy UI; the webhook reconciles trial_end/status.
     try {
-      await supabase.from('users').update({ tier, plan }).eq('email', email);
+      await checkedUpdate(supabase.from('users').update({ tier, plan }).eq('email', email), 'users-update@3699');
     } catch (dbErr) {
       console.error('❌ change-tier DB update failed:', dbErr.message);
     }
@@ -4705,10 +4738,10 @@ app.delete('/user/account', userLimiter, async (req, res) => {
       // get an "account_deleted" email — i.e. two emails for one action.
       // The webhook checks this status and skips the email.
       try {
-        await supabase
+        await checkedUpdate(supabase
           .from('users')
           .update({ status: 'pending_deletion' })
-          .eq('id', userId);
+          .eq('id', userId), 'users-update@4741');
       } catch (err) {
         console.warn(`   ⚠ Failed to mark pending_deletion (continuing): ${err.message}`);
       }
@@ -5068,10 +5101,10 @@ app.post('/user/meal-track', userLimiter, async (req, res) => {
     }
 
     const payload = { date, checked: cleaned };
-    const { error } = await supabase
+    const { error } = await checkedUpdate(supabase
       .from('users')
       .update({ meal_track: payload, updated_at: new Date().toISOString() })
-      .eq('id', userData.user.id);
+      .eq('id', userData.user.id), '/user/meal-track');
 
     if (error) {
       console.error('❌ meal-track POST failed:', error.message);
@@ -5116,10 +5149,10 @@ app.post('/user/training-state', userLimiter, async (req, res) => {
       cleaned.planBuiltWeek = Math.max(1, Math.min(12, ts.planBuiltWeek));
     }
 
-    const { error } = await supabase
+    const { error } = await checkedUpdate(supabase
       .from('users')
       .update({ training_state: cleaned, updated_at: new Date().toISOString() })
-      .eq('id', userData.user.id);
+      .eq('id', userData.user.id), '/user/training-state');
 
     if (error) {
       console.error('❌ training-state POST failed:', error.message);
@@ -5215,7 +5248,7 @@ app.post('/user/meal-pool', userLimiter, mediumJson, async (req, res) => {
       ? Math.max(0, Math.min(1000, Math.floor(meal_pool_refresh_count)))
       : 0;
 
-    const { error } = await supabase
+    const { error } = await checkedUpdate(supabase
       .from('users')
       .update({
         meal_pool,
@@ -5225,7 +5258,7 @@ app.post('/user/meal-pool', userLimiter, mediumJson, async (req, res) => {
         meal_pool_updated_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
       })
-      .eq('id', userData.user.id);
+      .eq('id', userData.user.id), 'meal-pool-anchor (verhindert teuren Dauer-Refresh)');
 
     if (error) {
       console.error('❌ meal-pool POST failed:', error.message);
@@ -5479,10 +5512,10 @@ app.post('/user/lite-sync', userLimiter, mediumJson, async (req, res) => {
       return res.json({ ok: true, noop: true });
     }
 
-    const { error } = await supabase
+    const { error } = await checkedUpdate(supabase
       .from('users')
       .update(updates)
-      .eq('id', userData.user.id);
+      .eq('id', userData.user.id), 'users-update@5515');
 
     if (error) {
       console.error('❌ /user/lite-sync failed:', error.message);
@@ -5588,7 +5621,7 @@ app.post('/user/stretch-pool', userLimiter, mediumJson, async (req, res) => {
       ? Math.max(0, Math.min(1000, Math.floor(stretch_pool_refresh_count)))
       : 0;
 
-    const { error } = await supabase
+    const { error } = await checkedUpdate(supabase
       .from('users')
       .update({
         stretch_pool,
@@ -5598,7 +5631,7 @@ app.post('/user/stretch-pool', userLimiter, mediumJson, async (req, res) => {
         stretch_pool_updated_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
       })
-      .eq('id', userData.user.id);
+      .eq('id', userData.user.id), 'stretch-pool-anchor (verhindert teuren Dauer-Refresh)');
 
     if (error) {
       console.error('❌ stretch-pool POST failed:', error.message);
@@ -6227,12 +6260,12 @@ app.post('/webhook', async (req, res) => {
             console.log(`🛑 Subscription cancelled due to voucher abuse: ${session.subscription}`);
             // Mark user as blocked AND downgrade to free tier
             // This prevents continued access to premium features via existing OTP logins
-            await supabase.from('users').update({
+            await checkedUpdate(supabase.from('users').update({
               status: 'blocked_voucher_abuse',
               tier: 'free',
               stripe_subscription_id: null,
               trial_end: null,
-            }).eq('email', email);
+            }).eq('email', email), 'voucher-abuse-block (User sperren + auf Free)');
             console.log(`🔒 User downgraded to free + blocked: ${mE(email)}`);
           } catch (err) {
             console.error('❌ Could not cancel subscription after abuse detection:', err.message);
@@ -6397,9 +6430,9 @@ app.post('/webhook', async (req, res) => {
               await supabase.from('family_memberships')
                 .update({ status: 'suspended', left_at: new Date().toISOString() })
                 .eq('id', activeMembership.id);
-              await supabase.from('users')
+              await checkedUpdate(supabase.from('users')
                 .update({ family_group_id: null })
-                .eq('id', updated[0].id);
+                .eq('id', updated[0].id), 'users-update@6433');
               // Best-effort: clear stale meals so they regenerate without this user
               setImmediate(() => regenerateFutureMealsAfterMemberChange(activeMembership.group_id).catch(err => console.error('[family] regen failed:', err.message)));
               console.log(`👨‍👩‍👧 Family membership suspended for ${mE(email)} (group ${activeMembership.group_id})`);
@@ -6470,7 +6503,7 @@ app.post('/webhook', async (req, res) => {
             status: sub.status === 'trialing' ? 'trial' : 'active',
           };
           if (trialEndIso) updates.trial_end = trialEndIso;
-          const { error } = await supabase.from('users').update(updates).eq('email', email);
+          const { error } = await checkedUpdate(supabase.from('users').update(updates).eq('email', email), 'users-update@6506');
           if (error) console.error('❌ Plan-change DB update failed:', error.message);
           else console.log(`🔄 Plan changed: ${mE(email)} → ${newTier}/${newPlan} (trial_end=${trialEndIso || 'unchanged'})`);
           // ── New-tier welcome email ──────────────────────────────────
@@ -6520,9 +6553,9 @@ app.post('/webhook', async (req, res) => {
                 await supabase.from('family_memberships')
                   .update({ status: 'suspended', left_at: new Date().toISOString() })
                   .eq('id', activeMembership.id);
-                await supabase.from('users')
+                await checkedUpdate(supabase.from('users')
                   .update({ family_group_id: null })
-                  .eq('id', priorRow.id);
+                  .eq('id', priorRow.id), 'users-update@6556');
                 setImmediate(() => regenerateFutureMealsAfterMemberChange(activeMembership.group_id).catch(err => console.error('[family] regen failed:', err.message)));
                 console.log(`👨‍👩‍👧 Family membership suspended (downgrade): ${mE(email)}`);
               }
@@ -6562,11 +6595,11 @@ app.post('/webhook', async (req, res) => {
           // Mark in DB as pending cancellation + store end date for reminder cron.
           // Reset cancel_reminder_sent so a fresh reminder is queued for this
           // cancellation cycle (relevant if user previously reactivated).
-          await supabase.from('users').update({
+          await checkedUpdate(supabase.from('users').update({
             status: 'cancelling',
             cancel_at: endDate ? endDate.toISOString() : null,
             cancel_reminder_sent: false,
-          }).eq('email', email);
+          }).eq('email', email), 'users-update:status,cancel_at');
 
           try {
             const endDateStr = endDate
@@ -6593,11 +6626,11 @@ app.post('/webhook', async (req, res) => {
         if (email && wasReactivated) {
           // User clicked "Don't cancel" in portal → restore status + reset
           // the reminder flag (so a future cancel triggers a fresh reminder).
-          await supabase.from('users').update({
+          await checkedUpdate(supabase.from('users').update({
             status: 'active',
             cancel_at: null,
             cancel_reminder_sent: false,
-          }).eq('email', email);
+          }).eq('email', email), 'users-update:status,cancel_at');
           console.log(`✅ User un-cancelled (reactivated): ${mE(email)}`);
         }
       }
@@ -6615,7 +6648,7 @@ app.post('/webhook', async (req, res) => {
         }
         if (email) {
           email = normEmail(email);
-          const { error } = await supabase.from('users').update({ status: 'active' }).eq('email', email);
+          const { error } = await checkedUpdate(supabase.from('users').update({ status: 'active' }).eq('email', email), 'users-update@6651');
           if (error) console.error('❌ Supabase update (active) failed:', error.message);
           else console.log(`✅ User renewed: ${mE(email)}`);
         }
@@ -6640,10 +6673,10 @@ app.post('/webhook', async (req, res) => {
       if (email) {
         email = normEmail(email);
         // Mark as past_due so the app can show a banner / restrict access
-        const { error: updErr } = await supabase
+        const { error: updErr } = await checkedUpdate(supabase
           .from('users')
           .update({ status: 'past_due' })
-          .eq('email', email);
+          .eq('email', email), 'users-update@6676');
         if (updErr) console.error('❌ Supabase update (past_due) failed:', updErr.message);
 
         // Send email — but only on the first attempt to avoid spamming on
@@ -7841,9 +7874,9 @@ cron.schedule('0 10 * * *', async () => {
             tier: user.tier || 'premium',
           });
           // Mark as sent so we don't repeat
-          await supabase.from('users').update({
+          await checkedUpdate(supabase.from('users').update({
             cancel_reminder_sent: true,
-          }).eq('email', user.email);
+          }).eq('email', user.email), 'users-update:cancel_reminder_sent');
           console.log(`📧 Cancellation reminder → ${mE(user.email)} (${daysLeft}d left)`);
         } catch (err) {
           console.error(`⚠️  cancellation_reminder send failed for ${mE(user.email)}:`, err.message);
@@ -8150,7 +8183,7 @@ app.post('/family/create', userLimiter, async (req, res) => {
       return res.status(500).json({ error: 'create_membership_failed' });
     }
     // Maintain convenience pointer on users row
-    await supabase.from('users').update({ family_group_id: group.id }).eq('id', auth.userId);
+    await checkedUpdate(supabase.from('users').update({ family_group_id: group.id }).eq('id', auth.userId), 'users-update@8186');
     res.json({ ok: true, group_id: group.id });
   } catch (e) {
     console.error('[family/create] error:', e.message);
@@ -8402,7 +8435,7 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
         .eq('status', 'active');
       return res.status(409).json({ error: 'group_full', limit: 4 });
     }
-    await supabase.from('users').update({ family_group_id: inv.group_id }).eq('id', auth.userId);
+    await checkedUpdate(supabase.from('users').update({ family_group_id: inv.group_id }).eq('id', auth.userId), 'users-update@8438');
     res.json({ ok: true, group_id: inv.group_id });
   } catch (e) {
     console.error('[family/accept-invite] error:', e.message);
@@ -8428,7 +8461,7 @@ app.post('/family/leave', userLimiter, async (req, res) => {
       console.error('[family/leave] update failed:', error.message);
       return res.status(500).json({ error: 'leave_failed' });
     }
-    await supabase.from('users').update({ family_group_id: null }).eq('id', auth.userId);
+    await checkedUpdate(supabase.from('users').update({ family_group_id: null }).eq('id', auth.userId), 'users-update@8464');
     // Re-generate any future meals where this user was participating —
     // best-effort, done in background (no await on the response path).
     setImmediate(() => regenerateFutureMealsAfterMemberChange(groupId).catch(err => console.error('[family] regen failed:', err.message)));
@@ -8490,7 +8523,7 @@ app.delete('/family/remove-member', userLimiter, async (req, res) => {
       console.error('[family/remove-member] update failed:', error.message);
       return res.status(500).json({ error: 'remove_failed' });
     }
-    await supabase.from('users').update({ family_group_id: null }).eq('id', targetId);
+    await checkedUpdate(supabase.from('users').update({ family_group_id: null }).eq('id', targetId), 'users-update@8526');
     setImmediate(() => regenerateFutureMealsAfterMemberChange(groupId).catch(err => console.error('[family] regen failed:', err.message)));
     res.json({ ok: true });
   } catch (e) {
