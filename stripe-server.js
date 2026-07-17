@@ -1,3 +1,4 @@
+// fix123 (CRITICAL — OTP-Login seit 13.07. tot): supabase.auth.verifyOtp() sets a session on the client it is called on. Called on the shared DB client, every subsequent DB call authenticates with that user's token instead of SUPABASE_SERVICE_KEY — the process silently runs as 'authenticated'. login_codes has RLS on with no policy, so inserts die with 42501 'new row violates row-level security policy'. persistSession:false does NOT protect: it only prevents storing the session, not the in-memory auth state. The poisoned state persists until the next deploy and affects ALL requests, not just the triggering user. It went unnoticed for four days because the hourly service-role self-check ran BEFORE anyone logged in and correctly reported OK — on quiet days nobody used checkout/magic-link login, so the client stayed clean. Fix: freshAuthClient() hands every auth operation its own throwaway client; the DB client is never touched and stays service_role.
 // fix79 (stale-webhook-retry guard): Stripe retries failed webhooks for up to 3 days. While the idempotency insert can't write (fail-open, e.g. during the RLS/key outage) NO event is ever marked processed, so Stripe retries everything. Real incident (14.07., staging): a 2-day-old checkout.session.completed arrived after the user had re-purchased in the meantime and overwrote the CURRENT stripe_customer_id with the old one — which had since been deleted in Stripe. Result: 'No such customer' -> account auto-reset to Free, tier switch impossible. Guard: for events older than 1h, verify the referenced Stripe customer/subscription still exists; a dead reference means the event is superseded -> skip with 200 (stops the retry) instead of destroying current data. Fresh events (<1h) are untouched, so no extra Stripe call in normal operation. Fail-open throughout: the guard must never block a legitimate event.
 // fix77 (§312k/§355 withdrawal-confirmation delivery): 'widerruf_received' added to sendEmail's ALWAYS_SEND allowlist next to 'cancellation_received', so the lawyer-recommended withdrawal (Widerruf) receipt confirmation is delivered even to users who opted out of marketing mail — same treatment as the cancellation confirmation. Both receipt-confirmation flows + templates already existed (cancel: /cancel-subscription→cancellation_received; withdrawal: →widerruf_received); this only closes the opt-out suppression gap for the Widerruf case.
 // fix76 (service-role hardening + self-check): (1) the Supabase client is now created with auth.persistSession=false/autoRefreshToken=false so DB calls always use SUPABASE_SERVICE_KEY and can't silently fall back to a user/anon token. (2) A boot + hourly serviceRoleSelfCheck() probe-writes an RLS-protected table; if writes are RLS-blocked (SUPABASE_SERVICE_KEY not honored as service_role → running as anon), it logs loudly and e-mails the operator — so a repeat of the week-long silent write-outage (users/webhook_events/login_codes all RLS-refused, Stripe retrying webhooks for days) is caught in ~60s instead of by chance. NOTE: the actual outage cause was a wrong/stale SUPABASE_SERVICE_KEY in Render (anon key or pre-rotation key), NOT the DB — verified via `SET ROLE service_role; SELECT count(*) FROM users;` returning all rows.
@@ -122,6 +123,36 @@ app.use(helmet({
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
+
+// ── fix123: verifyOtp darf NIEMALS auf dem DB-Client laufen ──────────────
+// BUG (17.07., Prod): Der OTP-Login war seit dem 13.07. tot —
+//   ❌ OTP insert failed: new row violates row-level security policy
+//      for table "login_codes"
+// Ursache: supabase.auth.verifyOtp() SETZT eine Session auf dem Client.
+// Danach authentifiziert supabase-js jeden weiteren DB-Call mit dem
+// User-Token statt mit SUPABASE_SERVICE_KEY — der Prozess läuft als
+// 'authenticated'. Für diese Rolle existiert keine Policy auf
+// login_codes, also blockt RLS. persistSession:false schützt NICHT: es
+// verhindert nur das Speichern der Session, nicht den In-Memory-Auth-State.
+//
+// Zeitachse des Vorfalls:
+//   14:44 ✅ Self-check OK          (Client noch service_role)
+//   15:14 ✅ checkout-login         → verifyOtp() → Session gesetzt
+//   15:16 ❌ OTP insert failed      (Client jetzt 'authenticated')
+//
+// Der Zustand hält bis zum nächsten Deploy an und trifft ALLE Requests,
+// nicht nur den auslösenden Nutzer. Genau deshalb blieb es tagelang
+// unbemerkt: An ruhigen Tagen loggte sich niemand ein, der Client blieb
+// sauber, und der stündliche Self-Check meldete zu Recht "OK".
+//
+// Fix: Für jede Auth-Operation einen eigenen, wegwerfbaren Client. Der
+// darf seine Session behalten, wie er will — er wird sofort verworfen.
+// Der DB-Client bleibt unberührt und damit dauerhaft service_role.
+function freshAuthClient() {
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://peak-mj-performance.app';
@@ -1425,7 +1456,7 @@ app.post('/auth/checkout-login', authLimiter, async (req, res) => {
     if (!hashedToken) {
       return res.status(500).json({ error: 'session_token_missing' });
     }
-    const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
+    const { data: verifyData, error: verifyErr } = await freshAuthClient().auth.verifyOtp({
       type: 'magiclink',
       token_hash: hashedToken,
     });
@@ -1586,7 +1617,7 @@ app.post('/auth/verify-otp', authLimiter, async (req, res) => {
       return res.status(500).json({ error: 'Session token missing' });
     }
 
-    const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
+    const { data: verifyData, error: verifyErr } = await freshAuthClient().auth.verifyOtp({
       type: 'magiclink',
       token_hash: hashedToken,
     });
@@ -1889,7 +1920,7 @@ app.post('/auth/signup-free', authLimiter, mediumJson, async (req, res) => {
       } else {
         const hashedToken = linkAutoData?.properties?.hashed_token;
         if (hashedToken) {
-          const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
+          const { data: verifyData, error: verifyErr } = await freshAuthClient().auth.verifyOtp({
             type: 'magiclink',
             token_hash: hashedToken,
           });
