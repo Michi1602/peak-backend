@@ -1,3 +1,4 @@
+// fix125 (stiller Speicher-Ausfall): UPDATEs mit RLS-Filter werfen KEINEN Fehler — die WHERE-Klausel matcht dann einfach nichts, 0 Zeilen werden geändert, error bleibt null. POST /user/plan meldete deshalb `ok:true`, während plan_data in der DB NULL blieb: Frontend hielt den Plan für gespeichert, beim nächsten Login fehlte er, also wurde er für ~$0.05 neu generiert — und wieder nicht gespeichert. Endlosschleife, komplett lautlos, kein einziger Log-Eintrag. (Gegensatz: ein INSERT gegen RLS wirft 42501 — so wurde fix123 überhaupt gefunden.) Fix: .select('id') an den UPDATE hängen und die zurückgegebenen Zeilen prüfen; 0 Zeilen = lauter Fehler + HTTP 500. OFFEN: 26 weitere UPDATEs auf users haben dasselbe Muster (ohne .select()) und würden bei einem erneuten Rollen-Problem ebenso lautlos scheitern — s. Roadmap.
 // fix123 (CRITICAL — OTP-Login seit 13.07. tot): supabase.auth.verifyOtp() sets a session on the client it is called on. Called on the shared DB client, every subsequent DB call authenticates with that user's token instead of SUPABASE_SERVICE_KEY — the process silently runs as 'authenticated'. login_codes has RLS on with no policy, so inserts die with 42501 'new row violates row-level security policy'. persistSession:false does NOT protect: it only prevents storing the session, not the in-memory auth state. The poisoned state persists until the next deploy and affects ALL requests, not just the triggering user. It went unnoticed for four days because the hourly service-role self-check ran BEFORE anyone logged in and correctly reported OK — on quiet days nobody used checkout/magic-link login, so the client stayed clean. Fix: freshAuthClient() hands every auth operation its own throwaway client; the DB client is never touched and stays service_role.
 // fix79 (stale-webhook-retry guard): Stripe retries failed webhooks for up to 3 days. While the idempotency insert can't write (fail-open, e.g. during the RLS/key outage) NO event is ever marked processed, so Stripe retries everything. Real incident (14.07., staging): a 2-day-old checkout.session.completed arrived after the user had re-purchased in the meantime and overwrote the CURRENT stripe_customer_id with the old one — which had since been deleted in Stripe. Result: 'No such customer' -> account auto-reset to Free, tier switch impossible. Guard: for events older than 1h, verify the referenced Stripe customer/subscription still exists; a dead reference means the event is superseded -> skip with 200 (stops the retry) instead of destroying current data. Fresh events (<1h) are untouched, so no extra Stripe call in normal operation. Fail-open throughout: the guard must never block a legitimate event.
 // fix77 (§312k/§355 withdrawal-confirmation delivery): 'widerruf_received' added to sendEmail's ALWAYS_SEND allowlist next to 'cancellation_received', so the lawyer-recommended withdrawal (Widerruf) receipt confirmation is delivered even to users who opted out of marketing mail — same treatment as the cancellation confirmation. Both receipt-confirmation flows + templates already existed (cancel: /cancel-subscription→cancellation_received; withdrawal: →widerruf_received); this only closes the opt-out suppression gap for the Widerruf case.
@@ -5749,18 +5750,34 @@ app.post('/user/plan', userLimiter, mediumJson, async (req, res) => {
       return res.status(400).json({ error: 'plan_data too large' });
     }
 
-    const { error } = await supabase
+    // fix125: .select('id') erzwingt, dass Supabase die betroffenen Zeilen
+    // zurückgibt — sonst ist ein fehlgeschlagener UPDATE nicht erkennbar.
+    // WICHTIG (Unterschied zu INSERT): Blockt RLS einen INSERT, kommt ein
+    // Fehler 42501. Blockt RLS einen UPDATE, kommt KEIN Fehler — die WHERE-
+    // Klausel matcht einfach nichts, 0 Zeilen werden geändert, `error` bleibt
+    // null. Ohne diese Prüfung meldete der Endpoint fröhlich `ok: true`,
+    // während plan_data in der DB NULL blieb → das Frontend hielt den Plan
+    // für gespeichert → beim nächsten Login war er weg → teure Neu-
+    // Generierung (~$0.05), die wieder nicht gespeichert wurde. Endlosschleife.
+    const { data: updRows, error } = await supabase
       .from('users')
       .update({
         plan_data: cleanPlan,
         plan_updated_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
       })
-      .eq('id', userData.user.id);
+      .eq('id', userData.user.id)
+      .select('id');
 
     if (error) {
       console.error('❌ plan POST failed:', error.message);
       return res.status(500).json({ error: 'Failed to save plan' });
+    }
+    if (!updRows || updRows.length === 0) {
+      // Kein Fehler, aber nichts geschrieben: entweder RLS filtert (Client
+      // läuft nicht als service_role) oder die id existiert nicht.
+      console.error(`🚨 plan POST: 0 Zeilen aktualisiert für id=${userData.user.id} — Plan NICHT gespeichert. Verdacht: DB-Client läuft nicht als service_role (RLS filtert den UPDATE lautlos) oder die users-Zeile fehlt.`);
+      return res.status(500).json({ error: 'Failed to save plan', code: 'NO_ROWS_UPDATED' });
     }
     res.json({ ok: true });
   } catch (err) {
