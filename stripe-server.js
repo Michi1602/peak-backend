@@ -1546,10 +1546,10 @@ app.post('/auth/verify-otp', authLimiter, async (req, res) => {
 
     // Brute-force protection: 5 attempts per code
     if (row.attempts >= 5) {
-      await supabase
+      await checkedUpdate(supabase
         .from('login_codes')
         .update({ used_at: new Date().toISOString() }) // mark as dead
-        .eq('id', row.id);
+        .eq('id', row.id), 'login_codes@1549');
       return res.status(400).json({
         error: 'Too many attempts — request a new code',
         code: 'TOO_MANY_ATTEMPTS',
@@ -1573,10 +1573,10 @@ app.post('/auth/verify-otp', authLimiter, async (req, res) => {
       hashesMatch = false;
     }
     if (!hashesMatch) {
-      await supabase
+      await checkedUpdate(supabase
         .from('login_codes')
         .update({ attempts: row.attempts + 1 })
-        .eq('id', row.id);
+        .eq('id', row.id), 'login_codes@1576');
       return res.status(400).json({
         error: 'Wrong code',
         code: 'WRONG_CODE',
@@ -4864,9 +4864,9 @@ app.delete('/user/account', userLimiter, async (req, res) => {
         .eq('status', 'active')
         .maybeSingle();
       if (activeMembership) {
-        await supabase.from('family_memberships')
+        await checkedUpdate(supabase.from('family_memberships')
           .update({ status: 'left', left_at: new Date().toISOString() })
-          .eq('id', activeMembership.id);
+          .eq('id', activeMembership.id), 'family_memberships@4867');
         console.log(`   ✓ Family membership ended (group ${activeMembership.group_id})`);
         // Best-effort: clean stale future meals for the remaining members
         await regenerateFutureMealsAfterMemberChange(activeMembership.group_id).catch(err => console.error('[family] regen failed:', err.message));
@@ -6444,9 +6444,9 @@ app.post('/webhook', async (req, res) => {
               .eq('status', 'active')
               .maybeSingle();
             if (activeMembership) {
-              await supabase.from('family_memberships')
+              await checkedUpdate(supabase.from('family_memberships')
                 .update({ status: 'suspended', left_at: new Date().toISOString() })
-                .eq('id', activeMembership.id);
+                .eq('id', activeMembership.id), 'family_memberships@6447');
               await checkedUpdate(supabase.from('users')
                 .update({ family_group_id: null })
                 .eq('id', updated[0].id), 'users-update@6433');
@@ -6567,9 +6567,9 @@ app.post('/webhook', async (req, res) => {
                 .eq('status', 'active')
                 .maybeSingle();
               if (activeMembership) {
-                await supabase.from('family_memberships')
+                await checkedUpdate(supabase.from('family_memberships')
                   .update({ status: 'suspended', left_at: new Date().toISOString() })
-                  .eq('id', activeMembership.id);
+                  .eq('id', activeMembership.id), 'family_memberships@6570');
                 await checkedUpdate(supabase.from('users')
                   .update({ family_group_id: null })
                   .eq('id', priorRow.id), 'users-update@6556');
@@ -8416,13 +8416,13 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
       .eq('user_id', auth.userId)
       .maybeSingle();
     if (prior) {
-      await supabase.from('family_memberships')
+      await checkedUpdate(supabase.from('family_memberships')
         .update({
           status: 'active',
           left_at: null,
           consent_at: consent_at || new Date().toISOString(),
         })
-        .eq('id', prior.id);
+        .eq('id', prior.id), 'family_memberships:status,left_at');
     } else {
       const { error } = await supabase.from('family_memberships').insert({
         group_id: inv.group_id,
@@ -8445,11 +8445,11 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
       .from('family_groups').select('member_count').eq('id', inv.group_id).maybeSingle();
     if (gPost && gPost.member_count > 4) {
       // We overshot. Roll back the activation/insert and tell the client.
-      await supabase.from('family_memberships')
+      await checkedUpdate(supabase.from('family_memberships')
         .update({ status: 'left', left_at: new Date().toISOString() })
         .eq('group_id', inv.group_id)
         .eq('user_id', auth.userId)
-        .eq('status', 'active');
+        .eq('status', 'active'), 'family_memberships@8448');
       return res.status(409).json({ error: 'group_full', limit: 4 });
     }
     await checkedUpdate(supabase.from('users').update({ family_group_id: inv.group_id }).eq('id', auth.userId), 'users-update@8438');
@@ -8469,11 +8469,11 @@ app.post('/family/leave', userLimiter, async (req, res) => {
     if (!auth.ok) return res.status(auth.status).json(auth.body);
     const groupId = await getActiveFamilyGroupId(auth.userId);
     if (!groupId) return res.status(404).json({ error: 'no_active_group' });
-    const { error } = await supabase.from('family_memberships')
+    const { error } = await checkedUpdate(supabase.from('family_memberships')
       .update({ status: 'left', left_at: new Date().toISOString() })
       .eq('user_id', auth.userId)
       .eq('group_id', groupId)
-      .eq('status', 'active');
+      .eq('status', 'active'), 'family_memberships@8472');
     if (error) {
       console.error('[family/leave] update failed:', error.message);
       return res.status(500).json({ error: 'leave_failed' });
@@ -8531,11 +8531,11 @@ app.delete('/family/remove-member', userLimiter, async (req, res) => {
     // Verify target is in the same active group
     const targetActive = await isActiveMember(targetId, groupId);
     if (!targetActive) return res.status(404).json({ error: 'target_not_in_group' });
-    const { error } = await supabase.from('family_memberships')
+    const { error } = await checkedUpdate(supabase.from('family_memberships')
       .update({ status: 'left', left_at: new Date().toISOString() })
       .eq('user_id', targetId)
       .eq('group_id', groupId)
-      .eq('status', 'active');
+      .eq('status', 'active'), 'family_memberships@8534');
     if (error) {
       console.error('[family/remove-member] update failed:', error.message);
       return res.status(500).json({ error: 'remove_failed' });
@@ -8580,9 +8580,9 @@ app.patch('/family/shared-pattern', userLimiter, async (req, res) => {
         || Array.isArray(shared_meals_pattern)) {
       return res.status(400).json({ error: 'pattern_required' });
     }
-    const { error } = await supabase.from('family_groups')
+    const { error } = await checkedUpdate(supabase.from('family_groups')
       .update({ shared_meals_pattern })
-      .eq('id', groupId);
+      .eq('id', groupId), 'family_groups@8583');
     if (error) {
       console.error('[family/shared-pattern] update failed:', error.message);
       return res.status(500).json({ error: 'update_failed' });
