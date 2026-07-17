@@ -1,3 +1,4 @@
+// fix127 (Diagnose — Token-Verbrennung): Der AI-Log meldete `${tokens} tokens`, das ist aber max_tokens (der ANGEFORDERTE Wert), nie der verbrauchte — die Zahl stand auch dann da, wenn Claude mitten im Satz abgewürgt wurde. Zusätzlich wurde `stop_reason` NIRGENDS geprüft; genau dieses Feld unterscheidet 'end_turn' (fertig) von 'max_tokens' (abgeschnitten). Eine abgeschnittene Antwort ist zwangsläufig kaputtes JSON → das Frontend verwirft sie ([aiGenJSON] parse failed) → der Plan wird nie fertig → beim nächsten Öffnen wieder generiert. Die Tokens sind trotzdem bezahlt. Jetzt: stop_reason + usage.output_tokens/input_tokens werden geloggt, und ein Treffer auf 'max_tokens' schreibt einen lauten Fehler mit Zweck und Limit. Verdacht: der Plan-Call fordert nur 2200 Token an (index.html ~6460), während das Backend bis 12000 erlaubt.
 // fix125 (stiller Speicher-Ausfall): UPDATEs mit RLS-Filter werfen KEINEN Fehler — die WHERE-Klausel matcht dann einfach nichts, 0 Zeilen werden geändert, error bleibt null. POST /user/plan meldete deshalb `ok:true`, während plan_data in der DB NULL blieb: Frontend hielt den Plan für gespeichert, beim nächsten Login fehlte er, also wurde er für ~$0.05 neu generiert — und wieder nicht gespeichert. Endlosschleife, komplett lautlos, kein einziger Log-Eintrag. (Gegensatz: ein INSERT gegen RLS wirft 42501 — so wurde fix123 überhaupt gefunden.) Fix: .select('id') an den UPDATE hängen und die zurückgegebenen Zeilen prüfen; 0 Zeilen = lauter Fehler + HTTP 500. ERLEDIGT: ALLE 26 UPDATEs auf users laufen jetzt über den zentralen Helfer checkedUpdate(builder, ctx) — er hängt .select('id') an, prüft die betroffenen Zeilen und schreibt bei 0 Zeilen einen lauten Log-Eintrag mit Kontextnamen. Damit kann kein users-UPDATE mehr lautlos ins Leere laufen: Tier-Wechsel, Voucher-Sperre, Dangling-Cleanup, Kontingent-Zähler, Pool-Anker (die den teuren Dauer-Refresh verhindern), Meal-Tracking, Training-State und alle Family-Operationen melden sich, wenn sie nichts schreiben.
 // fix123 (CRITICAL — OTP-Login seit 13.07. tot): supabase.auth.verifyOtp() sets a session on the client it is called on. Called on the shared DB client, every subsequent DB call authenticates with that user's token instead of SUPABASE_SERVICE_KEY — the process silently runs as 'authenticated'. login_codes has RLS on with no policy, so inserts die with 42501 'new row violates row-level security policy'. persistSession:false does NOT protect: it only prevents storing the session, not the in-memory auth state. The poisoned state persists until the next deploy and affects ALL requests, not just the triggering user. It went unnoticed for four days because the hourly service-role self-check ran BEFORE anyone logged in and correctly reported OK — on quiet days nobody used checkout/magic-link login, so the client stayed clean. Fix: freshAuthClient() hands every auth operation its own throwaway client; the DB client is never touched and stays service_role.
 // fix79 (stale-webhook-retry guard): Stripe retries failed webhooks for up to 3 days. While the idempotency insert can't write (fail-open, e.g. during the RLS/key outage) NO event is ever marked processed, so Stripe retries everything. Real incident (14.07., staging): a 2-day-old checkout.session.completed arrived after the user had re-purchased in the meantime and overwrote the CURRENT stripe_customer_id with the old one — which had since been deleted in Stripe. Result: 'No such customer' -> account auto-reset to Free, tier switch impossible. Guard: for events older than 1h, verify the referenced Stripe customer/subscription still exists; a dead reference means the event is superseded -> skip with 200 (stops the retry) instead of destroying current data. Fresh events (<1h) are untouched, so no extra Stripe call in normal operation. Fail-open throughout: the guard must never block a legitimate event.
@@ -2879,10 +2880,26 @@ app.post('/ai/generate', aiLimiter, mediumJson, async (req, res) => {
     // Audit Pass 3 #6.4: consolidate success logging. One log line per
     // successful AI call regardless of purpose. The plan-counter info is
     // appended when relevant, so observability is uniform.
+    // fix127: stop_reason + echten Verbrauch auswerten.
+    // BUG: Der Log meldete `${tokens} tokens` — das ist aber max_tokens, also
+    // der ANGEFORDERTE Wert, nicht der verbrauchte. Er stand da auch dann,
+    // wenn Claude mitten im Satz abgewürgt wurde. Und stop_reason wurde
+    // nirgends geprüft. Genau dieses Feld sagt, ob die Antwort vollständig
+    // ist: 'end_turn' = fertig, 'max_tokens' = ABGESCHNITTEN.
+    // Eine abgeschnittene Antwort ist zwangsläufig kaputtes JSON → das
+    // Frontend wirft sie weg ([aiGenJSON] parse failed) → der Plan wird nie
+    // fertig → beim nächsten Öffnen neu generiert → dieselbe Schleife.
+    // Kosten laufen trotzdem, denn die Tokens sind verbraucht.
+    const stopReason = data?.stop_reason || 'unknown';
+    const usedOut = data?.usage?.output_tokens;
+    const usedIn = data?.usage?.input_tokens;
+    if (stopReason === 'max_tokens') {
+      console.error(`🚨 AI-Antwort ABGESCHNITTEN für ${mE(userEmail)}: purpose=${purpose||'unknown'} lief in das Limit max_tokens=${tokens} (${text.length} Zeichen). Das Ergebnis ist unvollständiges JSON und wird vom Frontend verworfen — die Tokens sind trotzdem bezahlt. Limit für diesen Zweck erhöhen.`);
+    }
     const counterTail = (pendingPlanCounterUpdate && pendingPlanCounterUpdate.reserved)
       ? ` [${pendingPlanCounterUpdate.tier} counter ${pendingPlanCounterUpdate.used}/${pendingPlanCounterUpdate.limit}]`
       : '';
-    console.log(`✅ AI call OK for ${mE(userEmail)} (${tokens} tokens, ${text.length} chars, purpose=${purpose||'unknown'})${counterTail}`);
+    console.log(`✅ AI call OK for ${mE(userEmail)} (max=${tokens}, verbraucht=${usedOut != null ? usedOut : '?'} out/${usedIn != null ? usedIn : '?'} in, ${text.length} chars, purpose=${purpose||'unknown'}, stop=${stopReason})${counterTail}`);
     res.json({ text });
   } catch (err) {
     console.error('❌ /ai/generate error:', err.message);
