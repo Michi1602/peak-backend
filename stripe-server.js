@@ -5269,8 +5269,11 @@ app.post('/user/meal-pool', userLimiter, mediumJson, async (req, res) => {
     // total. We cap the JSON serialisation at 64KB to catch pathological
     // pools (e.g. AI hallucinated 100 ingredients per meal) before they
     // bloat the row.
+    // fix151: 64KB → 256KB. Vorsorglich angehoben — der 14-Tage-Meal-Pool
+    // (7 Tage/Batch × 4 Mahlzeiten × Zutatenlisten) kann bei zutatenreichen
+    // Plänen an 64KB kratzen. 256KB gibt Luft, bleibt unter mediumJson (500KB).
     const serialised = JSON.stringify(meal_pool);
-    if (serialised.length > 64 * 1024) {
+    if (serialised.length > 256 * 1024) {
       return res.status(400).json({ error: 'meal_pool payload too large' });
     }
 
@@ -5640,11 +5643,14 @@ app.post('/user/stretch-pool', userLimiter, mediumJson, async (req, res) => {
       }
     }
 
-    // Size cap: with howTo (steps + cues + mistakes + why), each exercise
-    // is ~400 chars. 14 slots × ~10 exercises × 400 = ~56KB. Cap at 128KB
-    // to allow for legitimately large pools without rejecting legit cases.
+    // fix151: Cap von 128KB → 480KB. GEMESSEN: der reale Pool (14 Slots,
+    // jeder mit vollem howTo — steps + cues + mistakes + why, plus pre/post-
+    // Übungen an Trainingstagen) serialisiert auf ~130-150KB und wurde mit
+    // 400 abgelehnt. Das ist LEGITIMER Inhalt, kein Missbrauch. Der
+    // mediumJson-Parser erlaubt 500KB; wir bleiben knapp darunter, damit ein
+    // echter Ausreißer trotzdem noch gefangen wird.
     const serialised = JSON.stringify(stretch_pool);
-    if (serialised.length > 128 * 1024) {
+    if (serialised.length > 480 * 1024) {
       return res.status(400).json({ error: 'stretch_pool payload too large' });
     }
 
