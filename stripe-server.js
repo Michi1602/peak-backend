@@ -463,8 +463,23 @@ const imageJson = express.json({ limit: '8mb' });     // /ai/scan-menu only
 // route runs (its route-level imageJson never gets the body). All other routes
 // keep the tight 100kb global default. scan-meal still enforces its own 6mb
 // hard cap internally.
+// fix141: Routen mit größeren Payloads MÜSSEN hier ausgenommen werden — sonst
+// verarbeitet dieser globale Parser den Body zuerst mit smallJson (100kb) und
+// wirft 413, BEVOR die Route ihren eigenen mediumJson/imageJson bekommt.
+// Symptom war: Plan wird sauber generiert (stop=end_turn), aber POST /user/plan
+// scheiterte mit "PayloadTooLargeError: request entity too large" — der
+// komplette Plan mit 14-Slot-Stretch-Pool (howTo: steps/cues/mistakes/why)
+// überschreitet 100kb deutlich. Der Plan wurde nie gespeichert, der alte blieb
+// stehen (daher "3×Woche" und "fullbody" trotz Änderung).
+// Diese Routen deklarieren route-level mediumJson (500kb) bzw. imageJson (8mb):
+var LARGE_BODY_PATHS = {
+  '/ai/scan-meal': 1, '/ai/scan-menu': 1,        // 8mb (Foto-Base64)
+  '/user/plan': 1, '/user/meal-pool': 1,          // 500kb (Plan + Pools)
+  '/user/stretch-pool': 1, '/user/lite-sync': 1,  // 500kb
+  '/user/training-state': 1                        // 500kb
+};
 app.use(function(req, res, next){
-  if (req.path === '/ai/scan-meal' || req.path === '/ai/scan-menu') return next();
+  if (LARGE_BODY_PATHS[req.path]) return next();
   return smallJson(req, res, next);
 });
 
@@ -4523,9 +4538,14 @@ app.post('/user/update-profile', userLimiter, async (req, res) => {
         // We validate this BEFORE the generic length+string check so a bad
         // value gets a precise error message instead of a generic one.
         if (k === 'stretchAreas') {
-          const ALLOWED_AREAS = new Set(['hip','chest','upBack','lowBack','ham','calf','neck','knee','ankle']);
-          if (v.length > 3) {
-            return res.status(400).json({ error: 'stretchAreas: max 3 areas' });
+          const ALLOWED_AREAS = new Set(['fullbody','hip','chest','upBack','lowBack','ham','calf','neck','knee','ankle']);
+          // fix147: fullbody ist der Grundzustand, KEINE gezielte Zone — es
+          // zählt nicht gegen das Limit (spiegelt das Frontend, fix145/146).
+          // Vorher: v.length>3 zählte fullbody mit → "Ganzkörper + 3" wurde
+          // serverseitig mit 400 abgelehnt, obwohl das Frontend es erlaubte.
+          const specificAreas = v.filter(a => a !== 'fullbody');
+          if (specificAreas.length > 3) {
+            return res.status(400).json({ error: 'stretchAreas: max 3 targeted zones' });
           }
           for (const item of v) {
             if (typeof item !== 'string' || !ALLOWED_AREAS.has(item)) {
@@ -5134,7 +5154,7 @@ app.post('/user/meal-track', userLimiter, async (req, res) => {
   }
 });
 
-app.post('/user/training-state', userLimiter, async (req, res) => {
+app.post('/user/training-state', userLimiter, mediumJson, async (req, res) => {
   try {
     // Audit Pass 1 #4.1: shared bearer-token extractor.
     const token = extractBearerToken(req);
