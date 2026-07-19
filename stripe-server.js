@@ -2915,7 +2915,12 @@ app.post('/ai/generate', aiLimiter, mediumJson, async (req, res) => {
       ? ` [${pendingPlanCounterUpdate.tier} counter ${pendingPlanCounterUpdate.used}/${pendingPlanCounterUpdate.limit}]`
       : '';
     console.log(`✅ AI call OK for ${mE(userEmail)} (max=${tokens}, verbraucht=${usedOut != null ? usedOut : '?'} out/${usedIn != null ? usedIn : '?'} in, ${text.length} chars, purpose=${purpose||'unknown'}, stop=${stopReason})${counterTail}`);
-    res.json({ text });
+    // fix155: stop_reason mitgeben. Das Frontend sah bisher nur den Text und
+    // musste bei parse-Fehlern raten, ob abgeschnitten (max_tokens) oder echt
+    // kaputtes JSON. Mit diesem Feld kann aiGenJSON sofort "abgeschnitten —
+    // Limit erhöhen" loggen statt einen Zeichen-Fehler zu suchen, den es nicht
+    // gibt. (Genau diese Lücke kostete bei fix153/155 Zeit.)
+    res.json({ text, stop_reason: stopReason });
   } catch (err) {
     console.error('❌ /ai/generate error:', err.message);
     // Audit #5.2: also rollback on outer exception. We can't call the
