@@ -8100,7 +8100,7 @@ process.on('SIGINT', () => __gracefulShutdown('SIGINT'));
 // FAMILY PLAN (May 2026)
 // ════════════════════════════════════════════════════════════════════════
 //
-// Shared-meal feature for up to 4 Premium users. Concept:
+// Shared-meal feature for up to 6 Premium users. Concept:
 //   • Each user keeps their full INDIVIDUAL plan untouched
 //   • A separate set of family_meals lives in parallel
 //   • Tracking is bi-directional (handled in frontend / food_log)
@@ -8300,12 +8300,12 @@ app.post('/family/invite', userLimiter, async (req, res) => {
     if (!auth.ok) return res.status(auth.status).json(auth.body);
     const groupId = await getActiveFamilyGroupId(auth.userId);
     if (!groupId) return res.status(404).json({ error: 'no_active_group' });
-    // Refuse if already at the 4-person cap
+    // Refuse if already at the 6-person cap
     const { data: g } = await supabase
       .from('family_groups').select('member_count').eq('id', groupId).maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 4) {
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+    if (g.member_count >= 6) {
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     const token = generateInviteToken();
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -8371,8 +8371,8 @@ app.post('/family/invite-info', userLimiter, async (req, res) => {
       .eq('id', inv.group_id)
       .maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 4) {
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+    if (g.member_count >= 6) {
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     // Look up the inviter's first name for the consent dialog. Falls
     // through gracefully if absent. We DON'T expose email, age, or any
@@ -8436,8 +8436,8 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
     const { data: g } = await supabase
       .from('family_groups').select('member_count').eq('id', inv.group_id).maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 4) {
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+    if (g.member_count >= 6) {
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     // Check for prior membership (left/suspended) → re-activate that row
     const { data: prior } = await supabase
@@ -8468,20 +8468,20 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
       }
     }
     // Race-condition guard: between the pre-check and the insert, another
-    // user could have raced in and pushed us over the 4-person cap. The
+    // user could have raced in and pushed us over the 6-person cap. The
     // sync_family_member_count trigger has now updated the count — re-read
     // and roll back if we're over. Without this, 5+ users could theoretically
     // squeeze into a "full" group during a concurrent invite burst.
     const { data: gPost } = await supabase
       .from('family_groups').select('member_count').eq('id', inv.group_id).maybeSingle();
-    if (gPost && gPost.member_count > 4) {
+    if (gPost && gPost.member_count > 6) {
       // We overshot. Roll back the activation/insert and tell the client.
       await checkedUpdate(supabase.from('family_memberships')
         .update({ status: 'left', left_at: new Date().toISOString() })
         .eq('group_id', inv.group_id)
         .eq('user_id', auth.userId)
         .eq('status', 'active'), 'family_memberships@8448');
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     await checkedUpdate(supabase.from('users').update({ family_group_id: inv.group_id }).eq('id', auth.userId), 'users-update@8438');
     res.json({ ok: true, group_id: inv.group_id });
@@ -8591,7 +8591,7 @@ app.delete('/family/remove-member', userLimiter, async (req, res) => {
 // remove members; everyone can leave themselves via /family/leave —
 // see audit #7.6).
 //
-// Rationale: a family of 4-5 people where one chef plans for everyone
+// Rationale: a household of up to 6 people where one chef plans for everyone
 // works better with shared control of meal planning. Real-world abuse
 // (sibling deletes another sibling's meals, kid kicks parent out) is
 // mitigated by: (a) creator-only kick, (b) frontend confirm-dialogs
