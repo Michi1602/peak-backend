@@ -463,8 +463,23 @@ const imageJson = express.json({ limit: '8mb' });     // /ai/scan-menu only
 // route runs (its route-level imageJson never gets the body). All other routes
 // keep the tight 100kb global default. scan-meal still enforces its own 6mb
 // hard cap internally.
+// fix141: Routen mit größeren Payloads MÜSSEN hier ausgenommen werden — sonst
+// verarbeitet dieser globale Parser den Body zuerst mit smallJson (100kb) und
+// wirft 413, BEVOR die Route ihren eigenen mediumJson/imageJson bekommt.
+// Symptom war: Plan wird sauber generiert (stop=end_turn), aber POST /user/plan
+// scheiterte mit "PayloadTooLargeError: request entity too large" — der
+// komplette Plan mit 14-Slot-Stretch-Pool (howTo: steps/cues/mistakes/why)
+// überschreitet 100kb deutlich. Der Plan wurde nie gespeichert, der alte blieb
+// stehen (daher "3×Woche" und "fullbody" trotz Änderung).
+// Diese Routen deklarieren route-level mediumJson (500kb) bzw. imageJson (8mb):
+var LARGE_BODY_PATHS = {
+  '/ai/scan-meal': 1, '/ai/scan-menu': 1,        // 8mb (Foto-Base64)
+  '/user/plan': 1, '/user/meal-pool': 1,          // 500kb (Plan + Pools)
+  '/user/stretch-pool': 1, '/user/lite-sync': 1,  // 500kb
+  '/user/training-state': 1                        // 500kb
+};
 app.use(function(req, res, next){
-  if (req.path === '/ai/scan-meal' || req.path === '/ai/scan-menu') return next();
+  if (LARGE_BODY_PATHS[req.path]) return next();
   return smallJson(req, res, next);
 });
 
@@ -2900,7 +2915,12 @@ app.post('/ai/generate', aiLimiter, mediumJson, async (req, res) => {
       ? ` [${pendingPlanCounterUpdate.tier} counter ${pendingPlanCounterUpdate.used}/${pendingPlanCounterUpdate.limit}]`
       : '';
     console.log(`✅ AI call OK for ${mE(userEmail)} (max=${tokens}, verbraucht=${usedOut != null ? usedOut : '?'} out/${usedIn != null ? usedIn : '?'} in, ${text.length} chars, purpose=${purpose||'unknown'}, stop=${stopReason})${counterTail}`);
-    res.json({ text });
+    // fix155: stop_reason mitgeben. Das Frontend sah bisher nur den Text und
+    // musste bei parse-Fehlern raten, ob abgeschnitten (max_tokens) oder echt
+    // kaputtes JSON. Mit diesem Feld kann aiGenJSON sofort "abgeschnitten —
+    // Limit erhöhen" loggen statt einen Zeichen-Fehler zu suchen, den es nicht
+    // gibt. (Genau diese Lücke kostete bei fix153/155 Zeit.)
+    res.json({ text, stop_reason: stopReason });
   } catch (err) {
     console.error('❌ /ai/generate error:', err.message);
     // Audit #5.2: also rollback on outer exception. We can't call the
@@ -4523,9 +4543,14 @@ app.post('/user/update-profile', userLimiter, async (req, res) => {
         // We validate this BEFORE the generic length+string check so a bad
         // value gets a precise error message instead of a generic one.
         if (k === 'stretchAreas') {
-          const ALLOWED_AREAS = new Set(['hip','chest','upBack','lowBack','ham','calf','neck','knee','ankle']);
-          if (v.length > 3) {
-            return res.status(400).json({ error: 'stretchAreas: max 3 areas' });
+          const ALLOWED_AREAS = new Set(['fullbody','hip','chest','upBack','lowBack','ham','calf','neck','knee','ankle']);
+          // fix147: fullbody ist der Grundzustand, KEINE gezielte Zone — es
+          // zählt nicht gegen das Limit (spiegelt das Frontend, fix145/146).
+          // Vorher: v.length>3 zählte fullbody mit → "Ganzkörper + 3" wurde
+          // serverseitig mit 400 abgelehnt, obwohl das Frontend es erlaubte.
+          const specificAreas = v.filter(a => a !== 'fullbody');
+          if (specificAreas.length > 3) {
+            return res.status(400).json({ error: 'stretchAreas: max 3 targeted zones' });
           }
           for (const item of v) {
             if (typeof item !== 'string' || !ALLOWED_AREAS.has(item)) {
@@ -5134,7 +5159,7 @@ app.post('/user/meal-track', userLimiter, async (req, res) => {
   }
 });
 
-app.post('/user/training-state', userLimiter, async (req, res) => {
+app.post('/user/training-state', userLimiter, mediumJson, async (req, res) => {
   try {
     // Audit Pass 1 #4.1: shared bearer-token extractor.
     const token = extractBearerToken(req);
@@ -5249,8 +5274,11 @@ app.post('/user/meal-pool', userLimiter, mediumJson, async (req, res) => {
     // total. We cap the JSON serialisation at 64KB to catch pathological
     // pools (e.g. AI hallucinated 100 ingredients per meal) before they
     // bloat the row.
+    // fix151: 64KB → 256KB. Vorsorglich angehoben — der 14-Tage-Meal-Pool
+    // (7 Tage/Batch × 4 Mahlzeiten × Zutatenlisten) kann bei zutatenreichen
+    // Plänen an 64KB kratzen. 256KB gibt Luft, bleibt unter mediumJson (500KB).
     const serialised = JSON.stringify(meal_pool);
-    if (serialised.length > 64 * 1024) {
+    if (serialised.length > 256 * 1024) {
       return res.status(400).json({ error: 'meal_pool payload too large' });
     }
 
@@ -5620,11 +5648,14 @@ app.post('/user/stretch-pool', userLimiter, mediumJson, async (req, res) => {
       }
     }
 
-    // Size cap: with howTo (steps + cues + mistakes + why), each exercise
-    // is ~400 chars. 14 slots × ~10 exercises × 400 = ~56KB. Cap at 128KB
-    // to allow for legitimately large pools without rejecting legit cases.
+    // fix151: Cap von 128KB → 480KB. GEMESSEN: der reale Pool (14 Slots,
+    // jeder mit vollem howTo — steps + cues + mistakes + why, plus pre/post-
+    // Übungen an Trainingstagen) serialisiert auf ~130-150KB und wurde mit
+    // 400 abgelehnt. Das ist LEGITIMER Inhalt, kein Missbrauch. Der
+    // mediumJson-Parser erlaubt 500KB; wir bleiben knapp darunter, damit ein
+    // echter Ausreißer trotzdem noch gefangen wird.
     const serialised = JSON.stringify(stretch_pool);
-    if (serialised.length > 128 * 1024) {
+    if (serialised.length > 480 * 1024) {
       return res.status(400).json({ error: 'stretch_pool payload too large' });
     }
 
@@ -8069,7 +8100,7 @@ process.on('SIGINT', () => __gracefulShutdown('SIGINT'));
 // FAMILY PLAN (May 2026)
 // ════════════════════════════════════════════════════════════════════════
 //
-// Shared-meal feature for up to 4 Premium users. Concept:
+// Shared-meal feature for up to 6 Premium users. Concept:
 //   • Each user keeps their full INDIVIDUAL plan untouched
 //   • A separate set of family_meals lives in parallel
 //   • Tracking is bi-directional (handled in frontend / food_log)
@@ -8269,12 +8300,12 @@ app.post('/family/invite', userLimiter, async (req, res) => {
     if (!auth.ok) return res.status(auth.status).json(auth.body);
     const groupId = await getActiveFamilyGroupId(auth.userId);
     if (!groupId) return res.status(404).json({ error: 'no_active_group' });
-    // Refuse if already at the 4-person cap
+    // Refuse if already at the 6-person cap
     const { data: g } = await supabase
       .from('family_groups').select('member_count').eq('id', groupId).maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 4) {
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+    if (g.member_count >= 6) {
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     const token = generateInviteToken();
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -8340,8 +8371,8 @@ app.post('/family/invite-info', userLimiter, async (req, res) => {
       .eq('id', inv.group_id)
       .maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 4) {
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+    if (g.member_count >= 6) {
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     // Look up the inviter's first name for the consent dialog. Falls
     // through gracefully if absent. We DON'T expose email, age, or any
@@ -8405,8 +8436,8 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
     const { data: g } = await supabase
       .from('family_groups').select('member_count').eq('id', inv.group_id).maybeSingle();
     if (!g) return res.status(404).json({ error: 'group_gone' });
-    if (g.member_count >= 4) {
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+    if (g.member_count >= 6) {
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     // Check for prior membership (left/suspended) → re-activate that row
     const { data: prior } = await supabase
@@ -8437,20 +8468,20 @@ app.post('/family/accept-invite', userLimiter, async (req, res) => {
       }
     }
     // Race-condition guard: between the pre-check and the insert, another
-    // user could have raced in and pushed us over the 4-person cap. The
+    // user could have raced in and pushed us over the 6-person cap. The
     // sync_family_member_count trigger has now updated the count — re-read
     // and roll back if we're over. Without this, 5+ users could theoretically
     // squeeze into a "full" group during a concurrent invite burst.
     const { data: gPost } = await supabase
       .from('family_groups').select('member_count').eq('id', inv.group_id).maybeSingle();
-    if (gPost && gPost.member_count > 4) {
+    if (gPost && gPost.member_count > 6) {
       // We overshot. Roll back the activation/insert and tell the client.
       await checkedUpdate(supabase.from('family_memberships')
         .update({ status: 'left', left_at: new Date().toISOString() })
         .eq('group_id', inv.group_id)
         .eq('user_id', auth.userId)
         .eq('status', 'active'), 'family_memberships@8448');
-      return res.status(409).json({ error: 'group_full', limit: 4 });
+      return res.status(409).json({ error: 'group_full', limit: 6 });
     }
     await checkedUpdate(supabase.from('users').update({ family_group_id: inv.group_id }).eq('id', auth.userId), 'users-update@8438');
     res.json({ ok: true, group_id: inv.group_id });
@@ -8560,7 +8591,7 @@ app.delete('/family/remove-member', userLimiter, async (req, res) => {
 // remove members; everyone can leave themselves via /family/leave —
 // see audit #7.6).
 //
-// Rationale: a family of 4-5 people where one chef plans for everyone
+// Rationale: a household of up to 6 people where one chef plans for everyone
 // works better with shared control of meal planning. Real-world abuse
 // (sibling deletes another sibling's meals, kid kicks parent out) is
 // mitigated by: (a) creator-only kick, (b) frontend confirm-dialogs
