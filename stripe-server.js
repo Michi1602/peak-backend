@@ -1518,12 +1518,15 @@ app.post('/auth/checkout-login', authLimiter, async (req, res) => {
         email_confirm: true,
       });
       if (createErr) {
-        if (/already.*registered|already.*exists|exists/i.test(createErr.message)) {
-          const m2 = await findAuthUserByEmail(normalizedEmail);
-          if (!m2) return res.status(500).json({ error: 'auth_user_failed' });
+        // fix178: kein Regex auf den Fehlertext mehr. Wir kommen hier nur an,
+        // wenn die Suche oben NICHTS fand — schlaegt die Anlage trotzdem fehl,
+        // hat ein paralleler Request in der Zwischenzeit angelegt. Also
+        // schlicht nochmal nachsehen. Bleibt es leer, ist es ein echter Fehler.
+        const m2 = await findAuthUserByEmail(normalizedEmail);
+        if (m2) {
           authUserId = m2.id;
         } else {
-          console.error('❌ checkout-login createUser failed:', createErr.message);
+          console.error('checkout-login createUser failed:', createErr.message);
           return res.status(500).json({ error: 'auth_user_failed' });
         }
       } else {
@@ -1663,26 +1666,42 @@ app.post('/auth/verify-otp', authLimiter, async (req, res) => {
     }
 
     // Find or create Supabase auth user
+    // fix178: Reihenfolge umgedreht. VORHER wurde bei JEDEM Login zuerst
+    // createUser versucht und der Bestandsnutzer nur ueber einen REGEX auf
+    // Supabases Fehlermeldung erkannt (/already been registered|.../i).
+    // Das war doppelt unguenstig:
+    //  (a) Formuliert Supabase die Meldung eines Tages anders, greift der
+    //      Regex nicht mehr -> throw -> 500 bei JEDEM Login eines bestehenden
+    //      Nutzers. Ein fremder Textbaustein haette die Anmeldung ALLER
+    //      Nutzer lahmgelegt.
+    //  (b) Jeder Login startete mit einem Schreibversuch, der fast immer
+    //      scheitern musste.
+    // JETZT: erst nachsehen (findAuthUserByEmail paginiert sauber), nur bei
+    // echtem Fehlen anlegen. Der Wettlauf-Fall (parallele Anlage zwischen
+    // Nachsehen und Anlegen) wird durch eine zweite Suche abgefangen - ohne
+    // jede Abhaengigkeit vom Wortlaut einer Fehlermeldung.
     let authUserId = null;
     try {
-      const { data: created, error: createErr } = await supabase.auth.admin.createUser({
-        email: normalizedEmail,
-        email_confirm: true,
-      });
-      if (createErr) {
-        // Already exists — look up by email
-        if (/already been registered|already registered|exists/i.test(createErr.message)) {
-          const match = await findAuthUserByEmail(normalizedEmail);
-          if (!match) throw createErr;
-          authUserId = match.id;
-        } else {
-          throw createErr;
-        }
+      const existingAuth = await findAuthUserByEmail(normalizedEmail);
+      if (existingAuth) {
+        authUserId = existingAuth.id;
       } else {
-        authUserId = created.user.id;
+        const { data: created, error: createErr } = await supabase.auth.admin.createUser({
+          email: normalizedEmail,
+          email_confirm: true,
+        });
+        if (createErr) {
+          // Zwischen Suche und Anlage hat ein paralleler Request angelegt.
+          // Nochmal nachsehen statt den Fehlertext zu deuten.
+          const raced = await findAuthUserByEmail(normalizedEmail);
+          if (!raced) throw createErr;
+          authUserId = raced.id;
+        } else {
+          authUserId = created.user.id;
+        }
       }
     } catch (e) {
-      console.error('❌ Auth user lookup/create failed:', e.message);
+      console.error('Auth user lookup/create failed:', e.message);
       return res.status(500).json({ error: 'Auth error' });
     }
 
@@ -6134,15 +6153,16 @@ app.post('/webhook', async (req, res) => {
         });
 
         if (createErr) {
-          // "User already registered" is fine — look up the existing one
-          if (createErr.message?.toLowerCase().includes('already')) {
-            const match = await findAuthUserByEmail(email);
-            if (match) {
-              authUserId = match.id;
-              console.log(`ℹ️  Existing auth user found: ${mE(email)} (${authUserId})`);
-            } else {
-              throw new Error('Auth user reported as existing but not found in list');
-            }
+          // fix178: kein Textabgleich ('already') mehr. Schlaegt die Anlage
+          // fehl, sehen wir schlicht nach, ob der Nutzer existiert - das ist
+          // der einzige Fall, der uns interessiert, und er ist unabhaengig
+          // vom Wortlaut der Fehlermeldung. Wichtig gerade hier: dieser Pfad
+          // laeuft nach einer BEZAHLUNG. Ein geaenderter Textbaustein bei
+          // Supabase haette zahlende Kunden ohne Konto zurueckgelassen.
+          const match = await findAuthUserByEmail(email);
+          if (match) {
+            authUserId = match.id;
+            console.log(`Existing auth user found: ${mE(email)} (${authUserId})`);
           } else {
             throw createErr;
           }
