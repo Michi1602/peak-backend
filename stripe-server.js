@@ -1269,6 +1269,28 @@ function generateOTP() {
   return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
 }
 
+// ── PER-EMAIL SEND COOLDOWN (fix177) ──────────────────────────────────────
+// authLimiter deckelt 20 Anfragen pro 10 Minuten und IP. Das schuetzt gegen
+// eine einzelne laute Quelle, aber NICHT gegen das Zumuellen EINER Adresse
+// ueber wechselnde IPs. Genau dieses Loch wuerde ein "Mail erneut senden"-
+// Knopf weit aufmachen. Darum: harte Sperre pro Adresse, unabhaengig von der
+// IP. Sitzt bewusst in /auth/send-otp selbst, damit ALLE Pfade geschuetzt
+// sind (Login, Onboarding, Resend-Knopf) — nicht nur der neue Knopf.
+const __otpSentAt = new Map();          // normalisierte E-Mail -> Zeitstempel
+const OTP_RESEND_COOLDOWN_MS = 60 * 1000;
+function otpCooldownRemaining(email) {
+  const t = __otpSentAt.get(email);
+  if (!t) return 0;
+  const left = OTP_RESEND_COOLDOWN_MS - (Date.now() - t);
+  return left > 0 ? left : 0;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, t] of __otpSentAt) {
+    if (now - t > OTP_RESEND_COOLDOWN_MS * 5) __otpSentAt.delete(k);
+  }
+}, 10 * 60 * 1000).unref?.();
+
 app.post('/auth/send-otp', authLimiter, async (req, res) => {
   try {
     const { email, lang } = req.body || {};
@@ -1277,6 +1299,18 @@ app.post('/auth/send-otp', authLimiter, async (req, res) => {
     }
     const normalizedEmail = normEmail(email);
     const emailLang = (lang === 'de' || lang === 'en') ? lang : 'en';
+
+    // Abkuehlzeit pruefen. Die Antwort verraet NICHT, ob das Konto existiert —
+    // sie sagt nur "zu schnell hintereinander" und wie lange noch zu warten
+    // ist. Damit bleibt der Enumeration-Schutz (Audit #7.7) unangetastet.
+    const cooldownLeft = otpCooldownRemaining(normalizedEmail);
+    if (cooldownLeft > 0) {
+      return res.status(429).json({
+        error: 'cooldown',
+        code: 'RESEND_COOLDOWN',
+        retryAfterSec: Math.ceil(cooldownLeft / 1000)
+      });
+    }
 
     // ── ACCOUNT EXISTENCE CHECK ────────────────────────────────────────
     // Before sending an OTP we make sure an account actually exists for
@@ -1397,7 +1431,11 @@ app.post('/auth/send-otp', authLimiter, async (req, res) => {
     }
 
     console.log(`📧 OTP sent to ${mE(normalizedEmail)} (expires in 10min)`);
-    res.json({ ok: true, expiresIn: 600 });
+    // fix177: Abkuehlzeit ERST jetzt stempeln — nach erfolgreichem Versand.
+    // Waere sie vorher gesetzt, wuerde ein fehlgeschlagener Mailversand den
+    // Nutzer eine Minute aussperren, obwohl nie eine Mail ankam.
+    __otpSentAt.set(normalizedEmail, Date.now());
+    res.json({ ok: true, expiresIn: 600, resendAfterSec: Math.ceil(OTP_RESEND_COOLDOWN_MS / 1000) });
   } catch (err) {
     console.error('❌ /auth/send-otp error:', err.message);
     res.status(500).json({ error: 'internal_error' });
