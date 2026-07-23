@@ -5820,6 +5820,58 @@ app.post('/user/plan', userLimiter, mediumJson, async (req, res) => {
       version: clampString(plan_data.version, 20),
     };
 
+    // fix174: Drei Marker wurden bisher von der Whitelist verschluckt. Sie sind
+    // KEIN Beiwerk — an ihnen haengen Spar- und Reparaturmechanismen:
+    //  _lang       Sprache, in der der Plan erzeugt wurde. Ohne ihn greift die
+    //              Abkuerzung `if(plan._lang===lang) return false` nicht mehr,
+    //              die Heuristik looksEnglish() uebernimmt und uebersetzt bei
+    //              JEDEM Login korrektes Deutsch erneut (3x session_translate).
+    //  _isFallback Notfall-Plan-Kennzeichen. Ohne ihn gilt ein Notfall-Plan
+    //              nach dem Speichern als vollwertig und der eingebaute
+    //              "beim naechsten Mal richtig erzeugen"-Pfad greift NIE.
+    //  _driftRegenAt Abkuehlzeit nach einer Drift-Neugenerierung.
+    // Alle drei bleiben streng validiert (Whitelist-Prinzip aus Audit Befund 6):
+    // enge Zeichen-/Typ-Begrenzung, keine beliebigen Objekte.
+    if (typeof plan_data._lang === 'string') {
+      const lang = plan_data._lang.slice(0, 5).toLowerCase();
+      if (/^[a-z]{2}$/.test(lang)) cleanPlan._lang = lang;
+    }
+    if (plan_data._isFallback === true) {
+      cleanPlan._isFallback = true;
+    }
+    if (typeof plan_data._driftRegenAt === 'string') {
+      cleanPlan._driftRegenAt = clampString(plan_data._driftRegenAt, 40);
+    } else if (typeof plan_data._driftRegenAt === 'number' && isFinite(plan_data._driftRegenAt)) {
+      cleanPlan._driftRegenAt = plan_data._driftRegenAt;
+    }
+    // _profileSnapshot: Der Vergleichsstand, an dem die Drift-Erkennung haengt
+    // (planProfileDrifted steigt sofort mit `if(!snap) return false` aus).
+    // Ohne ihn konnte Drift NIE erkannt werden: Geraet A aendert die Sportart,
+    // Geraet B behaelt dauerhaft den alten Plan. Streng validiert: flaches
+    // Objekt, nur Strings/Zahlen/kurze String- oder Zahlen-Arrays, max 40 Keys.
+    if (plan_data._profileSnapshot && typeof plan_data._profileSnapshot === 'object'
+        && !Array.isArray(plan_data._profileSnapshot)) {
+      const snapIn = plan_data._profileSnapshot;
+      const snapOut = {};
+      let kept = 0;
+      for (const key of Object.keys(snapIn)) {
+        if (kept >= 40) break;
+        if (!/^[A-Za-z_][A-Za-z0-9_]{0,31}$/.test(key)) continue;
+        const v = snapIn[key];
+        if (typeof v === 'string') { snapOut[key] = v.slice(0, 200); kept++; }
+        else if (typeof v === 'number' && isFinite(v)) { snapOut[key] = v; kept++; }
+        else if (v === null) { snapOut[key] = null; kept++; }
+        else if (Array.isArray(v)) {
+          const arr = v.slice(0, 30).filter(x =>
+            (typeof x === 'string' && x.length <= 100) ||
+            (typeof x === 'number' && isFinite(x))
+          ).map(x => (typeof x === 'string' ? x.slice(0, 100) : x));
+          snapOut[key] = arr; kept++;
+        }
+      }
+      if (kept > 0) cleanPlan._profileSnapshot = snapOut;
+    }
+
     if (!cleanPlan.headline) {
       return res.status(400).json({ error: 'plan_data.headline required' });
     }
