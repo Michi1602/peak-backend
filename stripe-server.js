@@ -1,3 +1,4 @@
+// fix179 (spurious tier-switch welcome on every billing tick): customer.subscription.updated detected plan changes via priceChanged=!!prev.items. Newer Stripe API versions moved current_period_start/end INTO the subscription items, so previous_attributes.items now appears on EVERY billing-cycle tick (trial end + every monthly/annual renewal) with an UNCHANGED price — the handler then re-sent the 'welcome' mail (fresh magic link + '7 days trial' copy via wTrialDays), performed a redundant users write and logged a misleading 'Plan changed' on every tick. Proven live 24.07.2026 on the founder's own test sub at plain trial end (evt_1TwkoB4O1MJK24u61m45kHSB: identical price id, only items.current_period_* + status trialing->active in previous_attributes; founder had not touched the app). Fix: compare the previous items price id against the new one; a missing previous price id stays conservative (treated as change) so a genuine tier/interval switch can never be silently dropped. Pure period ticks are now silent — status->active at trial end is already covered by the invoice.payment_succeeded handler ('User renewed').
 // fix127 (Diagnose — Token-Verbrennung): Der AI-Log meldete `${tokens} tokens`, das ist aber max_tokens (der ANGEFORDERTE Wert), nie der verbrauchte — die Zahl stand auch dann da, wenn Claude mitten im Satz abgewürgt wurde. Zusätzlich wurde `stop_reason` NIRGENDS geprüft; genau dieses Feld unterscheidet 'end_turn' (fertig) von 'max_tokens' (abgeschnitten). Eine abgeschnittene Antwort ist zwangsläufig kaputtes JSON → das Frontend verwirft sie ([aiGenJSON] parse failed) → der Plan wird nie fertig → beim nächsten Öffnen wieder generiert. Die Tokens sind trotzdem bezahlt. Jetzt: stop_reason + usage.output_tokens/input_tokens werden geloggt, und ein Treffer auf 'max_tokens' schreibt einen lauten Fehler mit Zweck und Limit. Verdacht: der Plan-Call fordert nur 2200 Token an (index.html ~6460), während das Backend bis 12000 erlaubt.
 // fix125 (stiller Speicher-Ausfall): UPDATEs mit RLS-Filter werfen KEINEN Fehler — die WHERE-Klausel matcht dann einfach nichts, 0 Zeilen werden geändert, error bleibt null. POST /user/plan meldete deshalb `ok:true`, während plan_data in der DB NULL blieb: Frontend hielt den Plan für gespeichert, beim nächsten Login fehlte er, also wurde er für ~$0.05 neu generiert — und wieder nicht gespeichert. Endlosschleife, komplett lautlos, kein einziger Log-Eintrag. (Gegensatz: ein INSERT gegen RLS wirft 42501 — so wurde fix123 überhaupt gefunden.) Fix: .select('id') an den UPDATE hängen und die zurückgegebenen Zeilen prüfen; 0 Zeilen = lauter Fehler + HTTP 500. ERLEDIGT: ALLE 26 UPDATEs auf users laufen jetzt über den zentralen Helfer checkedUpdate(builder, ctx) — er hängt .select('id') an, prüft die betroffenen Zeilen und schreibt bei 0 Zeilen einen lauten Log-Eintrag mit Kontextnamen. Damit kann kein users-UPDATE mehr lautlos ins Leere laufen: Tier-Wechsel, Voucher-Sperre, Dangling-Cleanup, Kontingent-Zähler, Pool-Anker (die den teuren Dauer-Refresh verhindern), Meal-Tracking, Training-State und alle Family-Operationen melden sich, wenn sie nichts schreiben.
 // fix123 (CRITICAL — OTP-Login seit 13.07. tot): supabase.auth.verifyOtp() sets a session on the client it is called on. Called on the shared DB client, every subsequent DB call authenticates with that user's token instead of SUPABASE_SERVICE_KEY — the process silently runs as 'authenticated'. login_codes has RLS on with no policy, so inserts die with 42501 'new row violates row-level security policy'. persistSession:false does NOT protect: it only prevents storing the session, not the in-memory auth state. The poisoned state persists until the next deploy and affects ALL requests, not just the triggering user. It went unnoticed for four days because the hourly service-role self-check ran BEFORE anyone logged in and correctly reported OK — on quiet days nobody used checkout/magic-link login, so the client stayed clean. Fix: freshAuthClient() hands every auth operation its own throwaway client; the DB client is never touched and stays service_role.
@@ -6629,11 +6630,21 @@ app.post('/webhook', async (req, res) => {
           else if (newPriceId === PRICE_BASIC_ANNUAL) { newTier = 'basic'; newPlan = 'annual'; }
           else if (newPriceId === PRICE_PREMIUM_MONTHLY) { newTier = 'premium'; newPlan = 'monthly'; }
           else if (newPriceId === PRICE_PREMIUM_ANNUAL) { newTier = 'premium'; newPlan = 'annual'; }
-          // Only flag a change if items actually moved (Stripe sends
-          // subscription.updated for many reasons — cancellations, trial
-          // ending, billing-cycle ticks, metadata edits — and we don't
-          // want to redundantly write tier on every one of those events).
-          priceChanged = !!prev.items;
+          // Only flag a change if the PRICE actually moved — not merely the
+          // items object. Newer Stripe API versions carry
+          // current_period_start/end INSIDE the subscription items, so
+          // previous_attributes.items appears on EVERY billing-cycle tick
+          // (trial end, every monthly/annual renewal) even when the price
+          // never changed. Bare `!!prev.items` therefore re-sent the
+          // tier-switch welcome mail (fresh magic link + "7-day trial" copy)
+          // and did a redundant DB write on every tick — proven live
+          // 24.07.2026 (evt_1TwkoB4O1MJK24u61m45kHSB: identical price id,
+          // only items.current_period_* + status trialing->active moved).
+          // fix179: compare price ids. If the previous price id is missing
+          // from the delta, stay conservative and treat it as a change so a
+          // genuine tier/interval switch can never be dropped silently.
+          const prevPriceId = prev.items?.data?.[0]?.price?.id || null;
+          priceChanged = !!prev.items && (!prevPriceId || prevPriceId !== newPriceId);
         }
       } catch (err) {
         console.warn('⚠️  Plan-change parse failed:', err.message);
